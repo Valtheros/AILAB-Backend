@@ -1,6 +1,7 @@
 import docker
 import os
 from pathlib import Path
+import csv
 
 class TrainingService:
     def __init__(self):
@@ -11,10 +12,19 @@ class TrainingService:
             self.client = None
             
         self.base_dir = Path(os.getcwd()).absolute()
-        # We start looking search from backend/dataset
         self.dataset_root_search = self.base_dir / "dataset"
         self.runs_dir = self.base_dir / "runs"
         self.runs_dir.mkdir(exist_ok=True)
+
+    def _ensure_docker_client(self):
+        """Try to initialize docker client if it doesn't exist"""
+        if self.client is None:
+            try:
+                self.client = docker.from_env()
+            except Exception as e:
+                print(f"Error initializing Docker client: {e}")
+                self.client = None
+
 
     def _find_dataset_path(self):
         """
@@ -67,6 +77,7 @@ class TrainingService:
         return "data_docker.yaml"
 
     def start_training_container(self, model_name: str, epochs: int, batch_size: int, project_name: str):
+        self._ensure_docker_client()
         if not self.client:
             raise RuntimeError("Docker client not initialized. Is Docker running?")
 
@@ -111,6 +122,10 @@ class TrainingService:
             raise RuntimeError(f"Docker API Error: {e}")
 
     def get_container_status(self, container_id: str):
+        self._ensure_docker_client()
+        if not self.client:
+            return "docker_connection_error"
+            
         try:
             container = self.client.containers.get(container_id)
             return container.status
@@ -118,9 +133,53 @@ class TrainingService:
             return "not_found"
 
     def get_container_logs(self, container_id: str):
+        self._ensure_docker_client()
+        if not self.client:
+            return "Docker connection error: Is Docker running?"
+            
         try:
             container = self.client.containers.get(container_id)
             # return logs as string
             return container.logs()
         except docker.errors.NotFound:
             return ""
+
+    def get_training_metrics(self, project_name: str):
+        """
+        Reads the results.csv from the run folder and returns data for all epochs.
+        """
+        results_path = self.runs_dir / project_name / "results.csv"
+        if not results_path.exists():
+            return []
+            
+        try:
+            with open(results_path, 'r') as f:
+                # YOLO CSV headers often have leading spaces
+                reader = csv.DictReader(f)
+                rows = list(reader)
+                
+                if not rows:
+                    return []
+                
+                cleaned_rows = []
+                for row in rows:
+                     # Clean keys and values (remove extra whitespace)
+                    cleaned_rows.append({k.strip(): v.strip() for k, v in row.items()})
+                
+                return cleaned_rows
+        except Exception as e:
+            print(f"Error reading metrics: {e}")
+            return []
+    
+    def stop_training_container(self, container_id: str):
+        self._ensure_docker_client()
+        if not self.client:
+            raise RuntimeError("Docker connection error: Is Docker running?")
+
+        try:
+            container = self.client.containers.get(container_id)
+            container.stop()
+        except docker.errors.NotFound:
+            return "not_found"
+        except docker.errors.APIError as e:
+            raise RuntimeError(f"Docker API Error: {e}")
