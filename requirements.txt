@@ -3,3 +3,4 @@ uvicorn
 docker
 pyyaml
 pydantic
+python-multipart

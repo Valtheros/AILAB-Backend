@@ -76,7 +76,7 @@ class TrainingService:
             
         return "data_docker.yaml"
 
-    def start_training_container(self, model_name: str, epochs: int, batch_size: int, project_name: str):
+    def start_training_container(self, model_name: str, epochs: int, batch_size: int, project_name: str, extra_args: dict = None):
         self._ensure_docker_client()
         if not self.client:
             raise RuntimeError("Docker client not initialized. Is Docker running?")
@@ -88,7 +88,7 @@ class TrainingService:
         # Create the docker specific config
         docker_config_name = self._create_docker_config(original_yaml_path, dataset_folder)
 
-        # Prepare command
+        # Prepare base command
         cmd = (
             f"yolo train "
             f"model={model_name}.pt "
@@ -99,8 +99,16 @@ class TrainingService:
             f"name={project_name}"
         )
 
+        # Append all extra training arguments from config page
+        if extra_args:
+            for key, value in extra_args.items():
+                # Convert Python bools to lowercase for YOLO CLI
+                if isinstance(value, bool):
+                    value = str(value).lower()
+                cmd += f" {key}={value}"
+
         volumes = {
-            str(dataset_folder): {'bind': '/usr/src/dataset', 'mode': 'rw'}, # rw to allow writing the lock file if needed, though ro is safer
+            str(dataset_folder): {'bind': '/usr/src/dataset', 'mode': 'rw'},
             str(self.runs_dir): {'bind': '/usr/src/runs', 'mode': 'rw'}
         }
 
