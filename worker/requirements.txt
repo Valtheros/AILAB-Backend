@@ -1,0 +1,28 @@
+# ── Core ML Framework (pre-installed in base image, listed for clarity) ──
+torch
+torchvision
+
+# ── Computer Vision Models ───────────────────────────────────────────────
+# YOLO (v8, v9, v10, v11)
+ultralytics>=8.0.0
+
+# timm: pretrained models สำหรับ classification (EfficientNet, ViT, etc.)
+timm
+
+# transformers: HuggingFace → RT-DETR, DETR, Swin Transformer, ฯลฯ
+transformers
+
+# ── Image Processing ─────────────────────────────────────────────────────
+opencv-python-headless
+Pillow
+albumentations
+
+# ── Queue & Job Management ───────────────────────────────────────────────
+redis
+rq
+
+# ── Utilities ────────────────────────────────────────────────────────────
+pyyaml
+# NumPy 2.0 incompatible กับ PyTorch 2.2 → ต้อง pin ไว้ที่ <2.0
+numpy<2.0
+pandas

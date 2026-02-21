@@ -23,14 +23,15 @@ training_service = TrainingService()
 
 
 class TrainRequest(BaseModel):
-    model_size: str  # n, s, m, l, x
+    model_size: str   # n, s, m, l, x
+    model_type: str = "yolo"  # yolo | efficientdet | rtdetr | ... (เพิ่มได้เรื่อยๆ)
     epochs: int
     batch_size: int = 16
     project_name: str = "train_run"
     # Full config from /config page
     imgsz: int = 640
     device: str = "0"
-    workers: int = 8
+    workers: int = 2      # DataLoader workers — ลดถ้า OOM (0 = ใช้ main process)
     patience: int = 100
     pretrained: bool = True
     cache: bool = False
@@ -79,7 +80,11 @@ class TrainRequest(BaseModel):
 
 @app.post("/api/train")
 def start_train(request: TrainRequest):
-    model_name = f"yolo11{request.model_size}"
+    # สำหรับ YOLO ใช้ชื่อ model เต็ม สำหรับ model อื่นๆ ให้ส่ง model_size เป็นชื่อ model เลย
+    if request.model_type == "yolo":
+        model_name = f"yolo11{request.model_size}"
+    else:
+        model_name = request.model_size  # เช่น "efficientdet-d0", "rt-detr-l"
     try:
         # Build the full config dict to pass to training service
         extra_args = {
@@ -133,6 +138,7 @@ def start_train(request: TrainRequest):
             batch_size=request.batch_size,
             project_name=request.project_name,
             extra_args=extra_args,
+            model_type=request.model_type,
         )
         return {"status": "success", "container_id": container_id}
     except Exception as e:
@@ -174,8 +180,10 @@ def stop_train(container_id: str):
 
 # ── Dataset Management ──────────────────────────────────────────────
 
-DATASET_DIR = Path(os.getcwd()).absolute() / "dataset"
-DATASET_DIR.mkdir(exist_ok=True)
+# ใช้ /app/dataset ภายใน container (mount จาก docker-compose.yml)
+# Fallback เป็น ./dataset ถ้ารันนอก container (local dev)
+DATASET_DIR = Path("/app/dataset") if Path("/app").exists() else Path(os.getcwd()).absolute() / "dataset"
+DATASET_DIR.mkdir(exist_ok=True, parents=True)
 
 
 @app.get("/api/datasets")
@@ -286,15 +294,44 @@ async def upload_dataset(file: UploadFile = File(...)):
                 shutil.move(str(item), str(target_dir / item.name))
             single_dir.rmdir()
 
+        # Validate Dataset Structure (YOLO Format)
+        yaml_path = target_dir / "data.yaml"
+        dataset_yaml_path = target_dir / "dataset.yaml"
+        
+        # ต้องมีไฟล์ yaml อยู่หน้าสุด (root) ของโฟลเดอร์รหัส Dataset เลย ไม่ให้ซ่อนอยู่ข้างใน
+        yaml_found = yaml_path.is_file() or dataset_yaml_path.is_file()
+        images_found = False
+        allowed_img_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+
+        if yaml_found:
+            for root, _, files in os.walk(target_dir):
+                for f in files:
+                    if f.lower().endswith(tuple(allowed_img_exts)):
+                        images_found = True
+                        break
+                if images_found:
+                    break
+
+        if not yaml_found:
+            raise HTTPException(status_code=400, detail="รูปแบบไม่ถูกต้อง: ไม่พบไฟล์ data.yaml หรือ dataset.yaml ในโฟลเดอร์หลักของ zip (อาจอยู่ลึกเกินไปหรือไม่มีเลย)")
+        
+        if not images_found:
+            raise HTTPException(status_code=400, detail="รูปแบบไม่ถูกต้อง: ไม่พบรูปภาพ (.jpg, .png) ใน Dataset นี้")
+
         return {"status": "success", "dataset_name": dataset_name}
 
+    except HTTPException:
+        # Re-raise HTTPException to preserve 400 errors
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise
     except zipfile.BadZipFile:
         if target_dir.exists():
-            shutil.rmtree(target_dir)
-        raise HTTPException(status_code=400, detail="Invalid ZIP file")
+            shutil.rmtree(target_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="ไฟล์ ZIP ไม่ถูกต้องหรือไม่สามารถแตกไฟล์ได้")
     except Exception as e:
         if target_dir.exists():
-            shutil.rmtree(target_dir)
+            shutil.rmtree(target_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Clean up temp zip file
