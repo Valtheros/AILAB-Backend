@@ -1,6 +1,7 @@
 fastapi
-uvicorn
-docker
+uvicorn[standard]
 pyyaml
 pydantic
 python-multipart
+redis
+rq
