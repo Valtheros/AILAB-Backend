@@ -1,0 +1,29 @@
+FROM paddlepaddle/paddle:latest-dev
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    make \
+    wget \
+    unzip \
+    bc \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    libleptonica-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-ocr.txt .
+RUN pip install --no-cache-dir -r requirements-ocr.txt
+
+RUN git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git /opt/PaddleOCR \
+    && pip install --no-cache-dir -r /opt/PaddleOCR/requirements.txt \
+    && git clone --depth 1 https://github.com/tesseract-ocr/tesstrain.git /opt/tesstrain
+
+COPY . .
+
+ENV PADDLEOCR_ROOT=/opt/PaddleOCR
+ENV TESSTRAIN_DIR=/opt/tesstrain
+
+CMD ["rq", "worker", "--url", "redis://redis:6379", "ocr_training"]

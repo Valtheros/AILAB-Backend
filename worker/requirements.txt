@@ -16,6 +16,7 @@ transformers
 opencv-python-headless
 Pillow
 albumentations
+segmentation-models-pytorch
 
 # ── Queue & Job Management ───────────────────────────────────────────────
 redis

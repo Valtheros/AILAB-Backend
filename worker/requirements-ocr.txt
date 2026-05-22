@@ -1,0 +1,5 @@
+redis
+rq
+pyyaml
+Pillow
+numpy<2.0

@@ -1,102 +1,74 @@
-"""
-worker_app.py — CV Training Worker
+from __future__ import annotations
 
-ไฟล์นี้คือ entry point ของงาน training ทุกประเภท
-RQ Worker จะ import function `run_training` จากไฟล์นี้เพื่อรัน job
-
-วิธีเพิ่ม model type ใหม่:
-1. สร้าง <model>_trainer.py ใน trainers/ folder
-2. เพิ่ม entry ใน TRAINER_REGISTRY ด้านล่าง
-"""
-
-import os
+import json
 import traceback
 from pathlib import Path
-from typing import Optional
 
-import rq
 from rq import get_current_job
 
-# ── Trainer Registry ─────────────────────────────────────────────────────────
-# เพิ่ม model type ใหม่ที่นี่เพียงที่เดียว
-# key = ชื่อที่ส่งมาจาก backend ใน config["model_type"]
-# value = class ของ Trainer ที่ต้องการใช้
+
 def _build_registry():
+    from trainers.deeplabv3plus_trainer import DeepLabV3PlusTrainer
+    from trainers.efficientnet_trainer import EfficientNetTrainer
+    from trainers.faster_rcnn_trainer import FasterRCNNTrainer
+    from trainers.mask_rcnn_trainer import MaskRCNNTrainer
+    from trainers.paddleocr_trainer import PaddleOCRTrainer
+    from trainers.resnet_trainer import ResNetTrainer
+    from trainers.tesseract_trainer import TesseractTrainer
     from trainers.yolo_trainer import YOLOTrainer
-    registry = {
+
+    return {
         "yolo": YOLOTrainer,
-        # ── ตัวอย่างการเพิ่ม model ใหม่ในอนาคต ──────────────────────────────
-        # "efficientdet": EfficientDetTrainer,
-        # "rtdetr":       RTDETRTrainer,
-        # "detr":         DETRTrainer,
-        # "swin":         SwinTrainer,
+        "resnet": ResNetTrainer,
+        "efficientnet": EfficientNetTrainer,
+        "deeplabv3plus": DeepLabV3PlusTrainer,
+        "mask_rcnn": MaskRCNNTrainer,
+        "paddleocr": PaddleOCRTrainer,
+        "tesseract": TesseractTrainer,
+        "faster_rcnn": FasterRCNNTrainer,
     }
-    return registry
 
 
-# ── Main Training Function (called by RQ Worker) ──────────────────────────────
 def run_training(config: dict) -> dict:
-    """
-    Function หลักที่ RQ Worker จะเรียกเมื่อมี training job เข้ามา
-
-    Args:
-        config: dict ที่มี fields ต่อไปนี้
-            - model_type (str):      "yolo" | "efficientdet" | ...
-            - model_name (str):      ชื่อ model เช่น "yolo11n", "yolo11s"
-            - epochs (int):          จำนวน epochs
-            - batch_size (int):      batch size
-            - project_name (str):    ชื่อ project สำหรับบันทึกผล
-            - data_yaml_path (str):  absolute path ของ data.yaml ใน container
-            - extra_args (dict):     config เพิ่มเติมสำหรับ model นั้นๆ
-
-    Returns:
-        dict: { status, model_type, project_name, results_dir }
-    """
     job = get_current_job()
     runs_dir = Path("/app/runs")
     runs_dir.mkdir(parents=True, exist_ok=True)
 
-    # เตรียม log file ใน runs/<project_name>/train.log
     project_name = config.get("project_name", "train_run")
     log_dir = runs_dir / project_name
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "train.log"
+    (log_dir / "job_config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def log(msg: str):
-        print(msg, flush=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(msg + "\n")
-        # อัปเดต job meta เพื่อให้ backend ดึง log ได้ผ่าน RQ
+    def log(message: str) -> None:
+        print(message, flush=True)
+        with open(log_path, "a", encoding="utf-8") as file:
+            file.write(message + "\n")
         if job:
             job.meta["log_path"] = str(log_path)
+            job.meta["project_name"] = project_name
             job.save_meta()
 
     model_type = config.get("model_type", "yolo").lower()
+    task_type = config.get("task_type", "object_detection")
     log(f"[Worker] Job ID: {job.id if job else 'N/A'}")
+    log(f"[Worker] Task: {task_type}")
     log(f"[Worker] Model type: {model_type}")
-    log(f"[Worker] Config: {config}")
+    log(f"[Worker] Project: {project_name}")
 
-    # ── ดึง Trainer จาก Registry ─────────────────────────────────────────────
     registry = _build_registry()
-    TrainerClass = registry.get(model_type)
+    trainer_class = registry.get(model_type)
+    if trainer_class is None:
+        available = ", ".join(sorted(registry))
+        raise ValueError(f"Unknown model_type '{model_type}'. Available: {available}")
 
-    if TrainerClass is None:
-        error_msg = (
-            f"Unknown model_type '{model_type}'. "
-            f"Available: {list(registry.keys())}"
-        )
-        log(f"[Worker] ERROR: {error_msg}")
-        raise ValueError(error_msg)
-
-    # ── รัน Training ──────────────────────────────────────────────────────────
     try:
-        trainer = TrainerClass()
-        log(f"[Worker] Starting training with {TrainerClass.__name__}...")
+        trainer = trainer_class()
+        log(f"[Worker] Starting training with {trainer_class.__name__}")
         result = trainer.train(config=config, log_path=log_path)
         log(f"[Worker] Training completed: {result}")
         return result
-
-    except Exception as e:
+    except Exception:
         error_detail = traceback.format_exc()
         log(f"[Worker] FAILED:\n{error_detail}")
-        raise  # Re-raise เพื่อให้ RQ mark job เป็น failed
+        raise

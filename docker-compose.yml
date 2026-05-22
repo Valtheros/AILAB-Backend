@@ -1,7 +1,6 @@
 version: "3.9"
 
 services:
-  # ── FastAPI Backend ─────────────────────────────────────────────────
   backend:
     build:
       context: .
@@ -10,38 +9,34 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app              # live-reload ในตอน dev
-      - ./dataset:/app/dataset      # bind mount → เข้าถึงได้จาก host โดยตรง
-      - ./runs:/app/runs            # bind mount → results อยู่บน host จริงๆ
+      - .:/app
+      - ./dataset:/app/dataset
+      - ./runs:/app/runs
     environment:
       - REDIS_URL=redis://redis:6379
     depends_on:
       - redis
     restart: unless-stopped
 
-  # ── Redis (Message Queue + Job Store) ───────────────────────────────
   redis:
     image: redis:7-alpine
     container_name: cv_redis
     ports:
       - "6379:6379"
     volumes:
-      - redis_data:/data            # redis data ใช้ named volume โอเค
+      - redis_data:/data
     restart: unless-stopped
 
-  # ── Long-Running CV Worker ───────────────────────────────────────────
-  # รันค้างไว้ตลอด deps โหลดครั้งเดียวตอน build
-  # รองรับ GPU ผ่าน WSL2 (Windows) และ NVIDIA Container Toolkit (Ubuntu)
   worker:
     build:
       context: ./worker
       dockerfile: Dockerfile
     container_name: cv_worker
-    shm_size: '8gb'                 # PyTorch DataLoader ต้องการ shared memory เยอะ
+    shm_size: "8gb"
     volumes:
-      - ./dataset:/app/dataset      # bind mount → แชร์ dataset กับ backend
-      - ./runs:/app/runs            # bind mount → results เขียนลง host โดยตรง
-      - model_cache:/root/.cache    # named volume โอเค — cache model weights
+      - ./dataset:/app/dataset
+      - ./runs:/app/runs
+      - model_cache:/root/.cache
     environment:
       - REDIS_URL=redis://redis:6379
     deploy:
@@ -55,8 +50,22 @@ services:
       - redis
     restart: unless-stopped
 
-  # ── RQ Dashboard (Monitor jobs via browser) ──────────────────────────
-  # เข้าดูได้ที่ http://server-ip:9181
+  ocr-worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile.ocr
+    container_name: cv_ocr_worker
+    shm_size: "8gb"
+    volumes:
+      - ./dataset:/app/dataset
+      - ./runs:/app/runs
+      - ocr_model_cache:/root/.cache
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+    restart: unless-stopped
+
   rq-dashboard:
     image: eoranged/rq-dashboard:latest
     container_name: cv_rq_dashboard
@@ -70,5 +79,5 @@ services:
 
 volumes:
   redis_data:
-  model_cache:    # Persistent: model weights cache ไม่โหลดซ้ำเมื่อ restart
-                  # dataset/ และ runs/ ใช้ bind mount แทน → เข้าถึงได้จาก host โดยตรง
+  model_cache:
+  ocr_model_cache:
