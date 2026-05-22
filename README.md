@@ -1,94 +1,219 @@
-# 🚀 AI Training System with Docker & K8s-ready Architecture
+# Computer Vision Training Backend
 
-ระบบ Server สำหรับจัดการการเทรน Model Computer Vision ควบคู่กับ API (รองรับ YOLO, EfficientDet, RT-DETR ฯลฯ)
-ระบบนี้ถูกออกแบบเป็น **Long-Running Worker Container พร้อม Message Queue (Redis)** เพื่อยกระดับความสามารถในการสเกล (Scale) และการประมวลผลระยะยาว (Long-Running Tasks) อย่างเป็นระบบ
+FastAPI backend and Redis/RQ workers for the no-code Computer Vision training platform.
 
-> **💡 หมายเหตุ:** โค้ดที่เกี่ยวข้องกับฝั่ง Server ทั้งหมด (Backend API, Worker, Redis, Docker Compose) ถูกรวมกันไว้ในโฟลเดอร์ (Repository) นี้แล้ว เพียงแค่โคลน Repo นี้ไปรันที่เซิร์ฟเวอร์ ก็ถือว่าครบจบในที่เดียว
+The backend owns:
 
----
+- Dataset upload, extraction, format detection, and compatibility checks.
+- A model catalog consumed by the frontend.
+- Training job submission and queue routing.
+- Job status, logs, metrics, and result artifact downloads.
+- Docker services for the API, Redis, CV workers, OCR workers, and RQ dashboard.
 
-## 🏗️ โครงสร้างไฟล์ในโฟลเดอร์นี้ (Architecture)
+## Supported tasks and models
+
+| Task | Models | Primary dataset formats |
+| --- | --- | --- |
+| Image Classification | ResNet, EfficientNet | ImageFolder |
+| Semantic / Instance Segmentation | DeepLabV3+, Mask R-CNN | Semantic masks, COCO instances |
+| OCR / Document Vision | PaddleOCR, Tesseract | PaddleOCR labels, Tesseract ground truth |
+| Object Detection | YOLOv11, Faster R-CNN | YOLO detection |
+
+`model_catalog.py` is the backend source of truth for task IDs, model IDs, selectable parameters, and expected dataset formats.
+
+## Architecture
 
 ```text
-backend/ (หรือโฟลเดอร์ฝั่ง Server ของคุณ)
-├── docker-compose.yml       # ไฟล์หลัก ใช้รันได้ทั้ง Windows (WSL2) และ Ubuntu Server (รองรับ GPU)
-├── main.py                  # API กลางที่เขียนด้วย FastAPI (รับ Request, จัดการ Dataset)
-├── services/                # โค้ดส่วนบริการรวบรวมภาระงานเข้าสู่คิว (Redis Queue)
-├── worker/                  # โค้ดของ Worker (รันค้างไว้ตลอดเพื่อรับงานจาก Queue)
-├── dataset/                 # [Bind Mount] ที่เก็บ Dataset (.zip > folder > data.yaml)
-└── runs/                    # [Bind Mount] ที่เก็บผลลัพธ์จากการ Train (Model weights, CSV)
+backend/
+|-- main.py                    # FastAPI routes
+|-- model_catalog.py           # Task/model/parameter catalog
+|-- dataset_utils.py           # Dataset inspection and validation
+|-- services/
+|   `-- training_service.py    # RQ job orchestration and run metadata
+|-- worker/
+|   |-- worker_app.py          # RQ worker entry point and trainer registry
+|   |-- Dockerfile             # PyTorch/CUDA CV worker
+|   |-- Dockerfile.ocr         # PaddleOCR and Tesseract worker
+|   |-- requirements.txt
+|   |-- requirements-ocr.txt
+|   `-- trainers/
+|       |-- yolo_trainer.py
+|       |-- resnet_trainer.py
+|       |-- efficientnet_trainer.py
+|       |-- deeplabv3plus_trainer.py
+|       |-- mask_rcnn_trainer.py
+|       |-- faster_rcnn_trainer.py
+|       |-- paddleocr_trainer.py
+|       `-- tesseract_trainer.py
+|-- dataset/                    # Extracted uploaded datasets
+`-- runs/                       # Logs, weights, CSV metrics, job config files
 ```
 
----
+Training is queue-based:
 
-## 🚀 1. คำสั่งรัน Docker
+1. FastAPI validates the request and selected dataset.
+2. `TrainingService` enqueues the job into Redis.
+3. `cv_training` handles PyTorch/TorchVision/Ultralytics/SMP trainers.
+4. `ocr_training` handles PaddleOCR and Tesseract trainers.
+5. Workers write artifacts into `runs/<project_name>/`.
 
-ใช้คำสั่งนี้เพื่อ Build และรันทุกอย่าง (Backend, Redis, Worker, RQ Dashboard) ขึ้นมา
+## Run with Docker
 
-```bash
-# พิมพ์คำสั่งในโฟลเดอร์ที่มีไฟล์ docker-compose.yml
-cd backend/  # หรือโฟลเดอร์ที่คุณตั้งชื่อไว้
+From `backend/`:
 
-# สำหรับรันแบบทั่วไป (ใช้ได้กับทั้ง Windows WSL ที่อัปเดตแล้ว และ Ubuntu Server)
-# หากระบบรองรับและติดตั้งไดรเวอร์ NVIDIA ครบถ้วน Docker จะเชื่อมต่อเข้าการ์ดจอให้เองอัตโนมัติ
-docker compose up --build -d
+```powershell
+docker compose up --build
 ```
 
-> **ถ้ารันแบบดู Log แบบสดๆ** (ไม่รัน Background) ให้ตัด `-d` ออกจากคำสั่งด้านบน
+Docker Compose starts:
 
----
+| Service | Purpose | Port |
+| --- | --- | --- |
+| `backend` | FastAPI API | `8000` |
+| `redis` | Queue and job store | `6379` |
+| `worker` | CV training queue | none |
+| `ocr-worker` | OCR training queue | none |
+| `rq-dashboard` | Queue dashboard | `9181` |
 
-## 🔍 2. คำสั่งดู Logs
+Useful URLs:
 
-เพื่อเช็คว่าระบบทำงานปกติไหม หรือดูสถานะว่า Train ไปถึงไหนแล้ว:
+- API root: `http://localhost:8000`
+- Swagger UI: `http://localhost:8000/docs`
+- Model catalog: `http://localhost:8000/api/model-catalog`
+- RQ dashboard: `http://localhost:9181`
 
-```bash
-# ดู Log รวมทุก Services (Backend, Redis, Worker)
-docker compose logs -f
+The CV worker is configured for NVIDIA GPU reservations in `docker-compose.yml`. CPU-only environments can still use the API and may run compatible training jobs after adjusting Docker/GPU configuration and model parameters.
 
-# 🎯 ดู Log เฉพาะ Worker (สำคัญสุด เอาไว้ดูสถานะโมเดลตอน Train)
-docker compose logs -f worker
+## Local API development
 
-# ดู Log เฉพาะ Backend API
-docker compose logs -f backend
+Docker is the intended path because Redis and worker images are part of the runtime. For API-only local work:
 
-# กด CTRL+C เพื่อออกจากโหมดดู log
+```powershell
+python -m pip install -r requirements.txt
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
----
+Redis must be reachable through `REDIS_URL` for job submission.
 
-## 3. คำสั่งปิด / Restart Docker
+Default local value:
 
-```bash
-# ปิดทุก Services (ข้อมูลใน dataset/ และ runs/ จะไม่หาย)
-docker compose down
-
-# ตรวจสอบรายชื่อ Container ที่กำลังรัน และ Port ต่างๆ
-docker compose ps
-
-# Restart แค่ Worker (สมมติว่ามีการแก้โค้ดใน โฟลเดอร์ worker/)
-docker compose restart worker
-
-# Rebuild แค่ Worker (ถ้ามีการแก้ requirements.txt ใน worker/)
-docker compose up --build -d worker
+```text
+redis://localhost:6379
 ```
 
----
+Compose value:
 
-## 🌐 4. หน้าเว็บและพอร์ตที่ใช้งานได้
+```text
+redis://redis:6379
+```
 
-เมื่อรัน `docker compose up -d` เสร็จแล้ว ระบบและบริการเหล่านี้จะทำงาน (อ้างอิงรหัสไอพีเซิร์ฟเวอร์):
+## API contract
 
-- **Swagger UI (สำหรับเทสต์ระบบ API):** `http://<server-ip>:8000/docs`
-- **RQ Dashboard (สำหรับมอนิเตอร์คิว Job):** `http://<server-ip>:9181`
+### Start training
 
----
+`POST /api/train`
 
-## ⚠️ หมวดหมู่ข้อผิดพลาดที่พบบ่อย
+```json
+{
+  "task_type": "object_detection",
+  "model_type": "yolo",
+  "model_name": "yolo11n",
+  "dataset_name": "traffic_signs",
+  "project_name": "traffic_signs_run_001",
+  "epochs": 50,
+  "batch_size": 16,
+  "params": {
+    "device": "0",
+    "workers": 4,
+    "amp": true,
+    "imgsz": 640,
+    "optimizer": "auto"
+  }
+}
+```
 
-1. **OOM (Out Of Memory) หรือ DataLoader Semaphore Exception ของ PyTorch:**
-   - สาเหตุลึกๆ เกิดจากขนาดของ Shared Memory (shm) ของ Container ไม่เพียงพอ อาการนี้มักเกิดกับ Dataset ขนาดใหญ่
-   - **ทางแก้ไขเบื้องต้น:** ลดค่า `workers` สลับเป็นลดการแบ่ง Batch ตอนคอนฟิกการเทรน. (ในไฟล์ `docker-compose.yml` เราตั้งให้ `worker` ใช้แรมช่วยถึง `8gb` เพื่อแก้ปัญหาชั่วคราวแล้วให้ลองสังเกตดู)
+Response:
 
-2. **ระบบหา `data.yaml` ไม่เจอตอนสั่งรัน:**
-   - มั่นใจว่าไม่ได้เอาโฟลเดอร์ซ้อนโฟลเดอร์จนลึกเกินไปตอนทำการ ZIP ตัว Dataset ไฟล์ `data.yaml` (หรือ `dataset.yaml`) ควรจะอยู่หน้าสุดของ Root Directory เสมอ
+```json
+{
+  "status": "success",
+  "job_id": "rq-job-id",
+  "container_id": "rq-job-id"
+}
+```
+
+`container_id` is kept as a compatibility alias for older frontend code. New code should treat it as an RQ job ID.
+
+### Core routes
+
+| Route | Purpose |
+| --- | --- |
+| `GET /api/model-catalog` | Return tasks, models, and parameter specs |
+| `POST /api/train` | Enqueue a training job |
+| `GET /api/status/{job_id}` | Read normalized job status |
+| `GET /api/logs/{job_id}` | Read worker training logs |
+| `GET /api/metrics/{project_name}` | Read `results.csv` rows |
+| `POST /api/stop/{job_id}` | Cancel a queued or running job |
+| `GET /api/datasets` | List uploaded datasets and detected formats |
+| `POST /api/upload-dataset` | Upload a dataset ZIP |
+| `DELETE /api/datasets/{dataset_name}` | Delete a dataset directory |
+| `GET /api/datasets/{dataset_name}/metadata` | Inspect one dataset |
+| `GET /api/runs` | List run folders, artifacts, and latest metrics |
+| `GET /api/runs/{project_name}/files/{file_path}` | Download a run artifact |
+
+## Dataset formats
+
+Uploaded ZIP files are extracted into `dataset/<dataset_name>/`. The backend detects these formats:
+
+| Format ID | Expected shape | Typical model use |
+| --- | --- | --- |
+| `imagefolder` | `train/<class_name>/image.jpg` | ResNet, EfficientNet |
+| `yolo_detection` | `data.yaml`, image folders, YOLO box labels | YOLO, Faster R-CNN |
+| `yolo_segmentation` | YOLO polygon labels | YOLO segmentation compatibility |
+| `semantic_masks` | `train/images`, `train/masks` | DeepLabV3+ |
+| `coco_instances` | COCO JSON annotations and images | Mask R-CNN |
+| `paddleocr_labels` | OCR label text files | PaddleOCR |
+| `tesseract_ground_truth` | `*.gt.txt` files | Tesseract |
+
+The selected model must accept at least one detected dataset format before the job is queued.
+
+## Result files
+
+Workers write under:
+
+```text
+runs/<project_name>/
+```
+
+Depending on the trainer, a run can include:
+
+- `job_config.json`
+- `train.log`
+- `results.csv`
+- `best.pt`
+- `last.pt`
+- OCR-specific exported files such as `.traineddata`
+
+## Adding a model
+
+1. Add the model entry and parameter specs to `model_catalog.py`.
+2. Add a dedicated trainer file under `worker/trainers/`.
+3. Register the trainer in `worker/worker_app.py`.
+4. Declare dependencies in the correct worker requirements file.
+5. Set compatible `dataset_formats` so dataset validation remains explicit.
+
+Keep model-specific logic in its own trainer file. Shared data loading or optimization helpers belong in focused helper modules, not in one oversized base trainer.
+
+## Verification
+
+Syntax check used during development:
+
+```powershell
+python -m py_compile main.py model_catalog.py dataset_utils.py services\training_service.py worker\worker_app.py worker\trainers\*.py
+```
+
+For runtime verification, rebuild and start the Compose stack before submitting training jobs:
+
+```powershell
+docker compose up --build
+```
