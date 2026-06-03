@@ -68,7 +68,7 @@ def _text(key: str, label: str, default: str = "", description: str = "") -> dic
 
 COMMON_TRAINING_PARAMS = [
     _number("epochs", "Epochs", 50, 1, 2000, 1, "Maximum training epochs."),
-    _number("batch_size", "Batch size", 16, -1, 256, 1, "-1 lets compatible trainers auto-size."),
+    _number("batch_size", "Batch size", 16, 1, 256, 1, "Images processed in each training step."),
     _select(
         "device",
         "Device",
@@ -188,6 +188,7 @@ DEEPLAB_PARAMS = [
     ),
     _number("image_size", "Image size", 512, 128, 2048, 32),
     _number("num_classes", "Mask classes", 2, 1, 1000, 1),
+    _number("ignore_index", "Ignored mask value", 255, -1, 255, 1),
     _number("encoder_depth", "Encoder depth", 5, 3, 5, 1),
     _select(
         "encoder_output_stride",
@@ -220,7 +221,6 @@ OCR_COMMON_PARAMS = [
         [
             {"value": "det", "label": "Text detection"},
             {"value": "rec", "label": "Text recognition"},
-            {"value": "e2e", "label": "End-to-end OCR"},
         ],
     ),
     _number("learning_rate", "Learning rate", 0.001, 0.000001, 1, 0.0001),
@@ -231,7 +231,7 @@ OCR_COMMON_PARAMS = [
 
 
 CV_MODEL_CATALOG: dict[str, Any] = {
-    "version": "2026-05-18",
+    "version": "2026-05-31",
     "common_params": COMMON_TRAINING_PARAMS,
     "tasks": [
         {
@@ -264,7 +264,7 @@ CV_MODEL_CATALOG: dict[str, Any] = {
             "id": "segmentation",
             "label": "Semantic / Instance Segmentation",
             "description": "Train semantic masks or instance masks depending on the chosen model.",
-            "dataset_formats": ["semantic_masks", "coco_instances", "yolo_segmentation"],
+            "dataset_formats": ["semantic_masks", "coco_instances"],
             "models": [
                 {
                     "id": "deeplabv3plus",
@@ -298,7 +298,7 @@ CV_MODEL_CATALOG: dict[str, Any] = {
                     "model_name": "paddleocr",
                     "runtime": "paddlepaddle/paddle + PaddleOCR",
                     "dataset_formats": ["paddleocr_labels"],
-                    "reason": "PaddleOCR has an official Docker-based workflow and covers detection, recognition, and document OCR training.",
+                    "reason": "PaddleOCR has an official Docker-based workflow for text detection and recognition training.",
                     "params": [
                         _text("config_path", "PaddleOCR config path", "/opt/PaddleOCR/configs/rec/PP-OCRv4/ch_PP-OCRv4_rec.yml"),
                         _text("pretrained_model", "Pretrained model path", ""),
@@ -327,14 +327,14 @@ CV_MODEL_CATALOG: dict[str, Any] = {
             "id": "object_detection",
             "label": "Object Detection",
             "description": "Train bounding-box detectors. YOLO remains available, with Faster R-CNN added as the second detector family.",
-            "dataset_formats": ["yolo_detection", "coco_instances"],
+            "dataset_formats": ["yolo_detection"],
             "models": [
                 {
                     "id": "yolo",
                     "label": "YOLOv11",
                     "model_name": "yolo11n",
                     "runtime": "pytorch/pytorch + ultralytics",
-                    "dataset_formats": ["yolo_detection", "yolo_segmentation"],
+                    "dataset_formats": ["yolo_detection"],
                     "reason": "Existing platform model.",
                     "params": [
                         _select(
@@ -409,3 +409,35 @@ def flatten_models() -> dict[str, dict[str, Any]]:
 
 def get_model(model_type: str) -> dict[str, Any] | None:
     return flatten_models().get(model_type)
+
+
+def validate_model_params(model_type: str, params: dict[str, Any]) -> dict[str, Any]:
+    model = get_model(model_type)
+    if model is None:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    specs = {item["key"]: item for item in COMMON_TRAINING_PARAMS + model.get("params", [])}
+    unknown = sorted(set(params) - set(specs))
+    if unknown:
+        raise ValueError(f"Unsupported params for {model_type}: {', '.join(unknown)}")
+
+    validated: dict[str, Any] = {}
+    for key, value in params.items():
+        spec = specs[key]
+        if spec["type"] == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"Param '{key}' must be a number")
+            if "min" in spec and value < spec["min"]:
+                raise ValueError(f"Param '{key}' must be at least {spec['min']}")
+            if "max" in spec and value > spec["max"]:
+                raise ValueError(f"Param '{key}' must be at most {spec['max']}")
+        elif spec["type"] == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"Param '{key}' must be true or false")
+        elif spec["type"] == "select":
+            choices = {option["value"] for option in spec.get("options", [])}
+            if str(value) not in choices:
+                raise ValueError(f"Param '{key}' must be one of: {', '.join(sorted(choices))}")
+        elif spec["type"] == "text" and not isinstance(value, str):
+            raise ValueError(f"Param '{key}' must be text")
+        validated[key] = value
+    return validated

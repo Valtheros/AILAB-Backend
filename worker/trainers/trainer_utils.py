@@ -9,6 +9,7 @@ import yaml
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+MASK_EXTENSIONS = {".png", ".bmp", ".tif", ".tiff"}
 
 
 def extra(config: dict) -> dict[str, Any]:
@@ -55,9 +56,12 @@ def read_yaml(data_yaml_path: str | None) -> dict[str, Any]:
 
 def read_classes_from_yaml(data_yaml_path: str | None) -> list[str]:
     data = read_yaml(data_yaml_path)
+    if not isinstance(data, dict):
+        return []
     names = data.get("names", [])
     if isinstance(names, dict):
-        return [str(names[key]) for key in sorted(names, key=lambda item: int(item) if str(item).isdigit() else str(item))]
+        sort_key = lambda item: (0, int(item)) if str(item).isdigit() else (1, str(item))
+        return [str(names[key]) for key in sorted(names, key=sort_key)]
     if isinstance(names, list):
         return [str(item) for item in names]
     return []
@@ -117,6 +121,12 @@ def scheduler_for(optimizer, name: str, epochs: int):
     if lowered == "step":
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=max(epochs // 3, 1), gamma=0.1)
     return None
+
+
+def require_positive_batch_size(value: int, trainer_name: str) -> int:
+    if value < 1:
+        raise ValueError(f"{trainer_name} requires batch_size >= 1.")
+    return value
 
 
 def collate_detection(batch):

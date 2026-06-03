@@ -70,7 +70,7 @@ Docker Compose starts:
 | Service | Purpose | Port |
 | --- | --- | --- |
 | `backend` | FastAPI API | `8000` |
-| `redis` | Queue and job store | `6379` |
+| `redis` | Queue and job store on the internal Docker network | none |
 | `worker` | CV training queue | none |
 | `ocr-worker` | OCR training queue | none |
 | `rq-dashboard` | Queue dashboard | `9181` |
@@ -90,7 +90,7 @@ Docker is the intended path because Redis and worker images are part of the runt
 
 ```powershell
 python -m pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 Redis must be reachable through `REDIS_URL` for job submission.
@@ -153,6 +153,7 @@ Response:
 | `GET /api/status/{job_id}` | Read normalized job status |
 | `GET /api/logs/{job_id}` | Read worker training logs |
 | `GET /api/metrics/{project_name}` | Read `results.csv` rows |
+| `GET /api/jobs/{job_id}/events` | Stream SSE snapshots, incremental logs, metrics, and status |
 | `POST /api/stop/{job_id}` | Cancel a queued or running job |
 | `GET /api/datasets` | List uploaded datasets and detected formats |
 | `POST /api/upload-dataset` | Upload a dataset ZIP |
@@ -169,13 +170,45 @@ Uploaded ZIP files are extracted into `dataset/<dataset_name>/`. The backend det
 | --- | --- | --- |
 | `imagefolder` | `train/<class_name>/image.jpg` | ResNet, EfficientNet |
 | `yolo_detection` | `data.yaml`, image folders, YOLO box labels | YOLO, Faster R-CNN |
-| `yolo_segmentation` | YOLO polygon labels | YOLO segmentation compatibility |
+| `yolo_segmentation` | YOLO polygon labels | Metadata detection only; no segmentation trainer is exposed yet |
 | `semantic_masks` | `train/images`, `train/masks` | DeepLabV3+ |
 | `coco_instances` | COCO JSON annotations and images | Mask R-CNN |
 | `paddleocr_labels` | OCR label text files | PaddleOCR |
 | `tesseract_ground_truth` | `*.gt.txt` files | Tesseract |
 
 The selected model must accept at least one detected dataset format before the job is queued.
+
+## Safety limits
+
+Dataset ZIP uploads are extracted into a staging directory and replace an
+existing dataset only after validation succeeds. Uploads are bounded by file
+size, archive entry count, expanded size, per-entry size, and compression
+ratio. Dataset names, project names, archive members, and artifact downloads
+are validated before filesystem access.
+
+Redis is intentionally not published to the host by Docker Compose. FastAPI
+and RQ Dashboard are bound to `127.0.0.1` for local testing. Backend, workers,
+and RQ Dashboard reach Redis through `redis://redis:6379`.
+
+The OCR worker pins its Paddle base image and source revisions for PaddleOCR
+and tesstrain. RQ Dashboard also uses an explicit image version so rebuilds do
+not silently change runtime code.
+
+The API does not require authentication yet. Keep the stack on a trusted local
+network while testing and add authentication plus explicit CORS origins before
+external deployment.
+
+## Live monitoring
+
+The frontend opens one SSE connection after a job is queued:
+
+```text
+GET /api/jobs/{job_id}/events
+```
+
+The stream sends an initial snapshot, incremental log text, metrics changes,
+status changes, heartbeats, and a final terminal event. REST status, logs, and
+metrics routes remain available as snapshot endpoints.
 
 ## Result files
 
@@ -210,6 +243,12 @@ Syntax check used during development:
 
 ```powershell
 python -m py_compile main.py model_catalog.py dataset_utils.py services\training_service.py worker\worker_app.py worker\trainers\*.py
+```
+
+Lightweight backend logic tests:
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
 For runtime verification, rebuild and start the Compose stack before submitting training jobs:

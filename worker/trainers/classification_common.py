@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .trainer_utils import append_csv_row, extra, get_device, optimizer_for, scheduler_for, set_seed
+from .trainer_utils import append_csv_row, extra, get_device, optimizer_for, require_positive_batch_size, scheduler_for, set_seed
 
 
 def _weights_for(torchvision_models, architecture: str, pretrained: bool):
@@ -41,6 +41,10 @@ def _build_efficientnet(architecture: str, num_classes: int, pretrained: bool, d
     if len(model.classifier) > 1 and hasattr(model.classifier[0], "p"):
         model.classifier[0].p = dropout
     return model
+
+
+def _batch_size_for(config: dict, args: dict, family: str) -> int:
+    return require_positive_batch_size(int(config.get("batch_size", args.get("batch_size", 16))), family)
 
 
 def train_classifier(config: dict, family: str, log_path: Path | None, logger) -> dict:
@@ -112,7 +116,7 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     device = get_device(str(args.get("device", "0")))
     model.to(device)
 
-    batch_size = int(config.get("batch_size", args.get("batch_size", 16)))
+    batch_size = _batch_size_for(config, args, family)
     workers = int(args.get("workers", 4))
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers)
     val_loader = (

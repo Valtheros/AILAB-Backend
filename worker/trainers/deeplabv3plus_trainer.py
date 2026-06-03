@@ -4,7 +4,7 @@ from pathlib import Path
 
 from .base_trainer import BaseTrainer
 from .semantic_dataset import SemanticMaskDataset
-from .trainer_utils import append_csv_row, extra, get_device, optimizer_for, set_seed
+from .trainer_utils import append_csv_row, extra, get_device, optimizer_for, require_positive_batch_size, scheduler_for, set_seed
 
 
 class DeepLabV3PlusTrainer(BaseTrainer):
@@ -30,13 +30,14 @@ class DeepLabV3PlusTrainer(BaseTrainer):
         set_seed(int(args.get("seed", 0)))
 
         image_size = int(args.get("image_size", 512))
-        train_dataset = SemanticMaskDataset(config["dataset_path"], "train", image_size)
+        num_classes = int(args.get("num_classes", 2))
+        ignore_index = int(args.get("ignore_index", 255))
+        train_dataset = SemanticMaskDataset(config["dataset_path"], "train", image_size, num_classes, ignore_index)
         try:
-            val_dataset = SemanticMaskDataset(config["dataset_path"], "val", image_size)
+            val_dataset = SemanticMaskDataset(config["dataset_path"], "val", image_size, num_classes, ignore_index)
         except Exception:
             val_dataset = None
 
-        num_classes = int(args.get("num_classes", 2))
         encoder_weights = args.get("encoder_weights", "imagenet")
         if encoder_weights == "none":
             encoder_weights = None
@@ -60,7 +61,7 @@ class DeepLabV3PlusTrainer(BaseTrainer):
 
         device = get_device(str(args.get("device", "0")))
         model.to(device)
-        batch_size = int(config.get("batch_size", args.get("batch_size", 8)))
+        batch_size = require_positive_batch_size(int(config.get("batch_size", args.get("batch_size", 8))), "deeplabv3plus")
         workers = int(args.get("workers", 4))
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers)
         val_loader = (
@@ -69,7 +70,12 @@ class DeepLabV3PlusTrainer(BaseTrainer):
             else None
         )
 
-        criterion = nn.CrossEntropyLoss()
+        if str(args.get("loss", "cross_entropy")) == "dice":
+            from segmentation_models_pytorch.losses import DiceLoss
+
+            criterion = DiceLoss(mode="multiclass", ignore_index=ignore_index)
+        else:
+            criterion = nn.CrossEntropyLoss(ignore_index=ignore_index)
         optimizer = optimizer_for(
             model.parameters(),
             str(args.get("optimizer", "adamw")),
@@ -78,6 +84,7 @@ class DeepLabV3PlusTrainer(BaseTrainer):
             float(args.get("weight_decay", 0.0001)),
         )
         epochs = int(config.get("epochs", args.get("epochs", 50)))
+        scheduler = scheduler_for(optimizer, str(args.get("scheduler", "cosine")), epochs)
         amp = bool(args.get("amp", True)) and device.type == "cuda"
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
         results_dir = Path("/app/runs") / config.get("project_name", "train_run")
@@ -103,8 +110,9 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                 scaler.update()
                 total_loss += float(loss.item())
                 predictions = logits.argmax(dim=1)
-                correct_pixels += int((predictions == masks).sum().item())
-                total_pixels += int(masks.numel())
+                valid_pixels = masks != ignore_index
+                correct_pixels += int(((predictions == masks) & valid_pixels).sum().item())
+                total_pixels += int(valid_pixels.sum().item())
                 batches += 1
 
             val_loss = ""
@@ -122,8 +130,9 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                         logits = model(images)
                         loss = criterion(logits, masks)
                         total_val_loss += float(loss.item())
-                        val_correct += int((logits.argmax(dim=1) == masks).sum().item())
-                        val_pixels += int(masks.numel())
+                        valid_pixels = masks != ignore_index
+                        val_correct += int(((logits.argmax(dim=1) == masks) & valid_pixels).sum().item())
+                        val_pixels += int(valid_pixels.sum().item())
                         val_batches += 1
                 val_loss = total_val_loss / max(val_batches, 1)
                 val_pixel_accuracy = val_correct / max(val_pixels, 1)
@@ -142,6 +151,8 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                     "lr": optimizer.param_groups[0]["lr"],
                 },
             )
+            if scheduler is not None:
+                scheduler.step()
             self._write_log(
                 log_path,
                 f"[deeplabv3plus] epoch={epoch}/{epochs} train_loss={train_loss:.4f} val_loss={val_loss}",

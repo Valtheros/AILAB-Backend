@@ -5,6 +5,7 @@ import traceback
 from pathlib import Path
 
 from rq import get_current_job
+from security_utils import contained_path, validate_slug
 
 
 def _build_registry():
@@ -35,7 +36,8 @@ def run_training(config: dict) -> dict:
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     project_name = config.get("project_name", "train_run")
-    log_dir = runs_dir / project_name
+    validate_slug(project_name, "project name")
+    log_dir = contained_path(runs_dir, project_name)
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "train.log"
     (log_dir / "job_config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")

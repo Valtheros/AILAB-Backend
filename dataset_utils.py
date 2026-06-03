@@ -9,23 +9,15 @@ import yaml
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MASK_EXTENSIONS = {".png", ".bmp", ".tif", ".tiff"}
-OCR_LABEL_NAMES = {
-    "label.txt",
-    "labels.txt",
-    "train.txt",
-    "val.txt",
-    "valid.txt",
-    "test.txt",
+PADDLEOCR_TRAIN_LABEL_NAMES = {
     "rec_gt_train.txt",
-    "rec_gt_val.txt",
     "det_gt_train.txt",
-    "det_gt_val.txt",
 }
 
 
 def safe_dataset_name(filename: str) -> str:
     name = filename.rsplit(".", 1)[0]
-    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in name).strip("._") or "dataset"
+    return "".join(ch if ch.isascii() and (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in name).strip("._") or "dataset"
 
 
 def format_bytes(size: int) -> str:
@@ -74,10 +66,13 @@ def read_yaml_classes(yaml_path: Path | None) -> list[str]:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
     except Exception:
         return []
+    if not isinstance(data, dict):
+        return []
 
     names = data.get("names", [])
     if isinstance(names, dict):
-        return [str(names[k]) for k in sorted(names, key=lambda item: int(item) if str(item).isdigit() else str(item))]
+        sort_key = lambda item: (0, int(item)) if str(item).isdigit() else (1, str(item))
+        return [str(names[k]) for k in sorted(names, key=sort_key)]
     if isinstance(names, list):
         return [str(item) for item in names]
     return []
@@ -155,14 +150,18 @@ def _find_coco_files(dataset_dir: Path) -> list[str]:
     return sorted(files)
 
 
-def _has_ocr_labels(dataset_dir: Path) -> bool:
+def _has_paddleocr_labels(dataset_dir: Path) -> bool:
     for path in dataset_dir.rglob("*"):
         if not path.is_file():
             continue
         lowered = path.name.lower()
-        if lowered in OCR_LABEL_NAMES or lowered.endswith(".gt.txt"):
+        if lowered in PADDLEOCR_TRAIN_LABEL_NAMES:
             return True
     return False
+
+
+def _has_tesseract_ground_truth(dataset_dir: Path) -> bool:
+    return any(path.is_file() and path.name.lower().endswith(".gt.txt") for path in dataset_dir.rglob("*"))
 
 
 def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
@@ -181,12 +180,13 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     has_yolo_segmentation = _has_yolo_segmentation_labels(dataset_dir)
     has_semantic_masks = _has_semantic_masks(dataset_dir)
     coco_files = _find_coco_files(dataset_dir)
-    has_ocr_labels = _has_ocr_labels(dataset_dir)
+    has_paddleocr_labels = _has_paddleocr_labels(dataset_dir)
+    has_tesseract_ground_truth = _has_tesseract_ground_truth(dataset_dir)
 
     if imagefolder_classes:
         formats.append("imagefolder")
         tasks.append("image_classification")
-    if has_yolo_yaml and has_yolo_labels:
+    if has_yolo_yaml and has_yolo_labels and not has_yolo_segmentation:
         formats.append("yolo_detection")
         tasks.append("object_detection")
     if has_yolo_yaml and has_yolo_segmentation:
@@ -198,8 +198,11 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     if coco_files:
         formats.append("coco_instances")
         tasks.extend(["object_detection", "segmentation"])
-    if has_ocr_labels:
-        formats.extend(["paddleocr_labels", "tesseract_ground_truth"])
+    if has_paddleocr_labels:
+        formats.append("paddleocr_labels")
+        tasks.append("ocr")
+    if has_tesseract_ground_truth:
+        formats.append("tesseract_ground_truth")
         tasks.append("ocr")
 
     formats = sorted(set(formats))

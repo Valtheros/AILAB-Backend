@@ -1,4 +1,7 @@
-FROM paddlepaddle/paddle:latest-dev
+FROM paddlepaddle/paddle:3.3.0
+
+ARG PADDLEOCR_REF=33cbdd9deb2e00f61e7966db70669b249c005a37
+ARG TESSTRAIN_REF=405346a3a67d8e4e049341d1da6a4b752e0b8351
 
 WORKDIR /app
 
@@ -17,9 +20,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements-ocr.txt .
 RUN pip install --no-cache-dir -r requirements-ocr.txt
 
-RUN git clone --depth 1 https://github.com/PaddlePaddle/PaddleOCR.git /opt/PaddleOCR \
+RUN git init /opt/PaddleOCR \
+    && cd /opt/PaddleOCR \
+    && git remote add origin https://github.com/PaddlePaddle/PaddleOCR.git \
+    && git fetch --depth 1 origin ${PADDLEOCR_REF} \
+    && git checkout --detach FETCH_HEAD \
     && pip install --no-cache-dir -r /opt/PaddleOCR/requirements.txt \
-    && git clone --depth 1 https://github.com/tesseract-ocr/tesstrain.git /opt/tesstrain
+    && git init /opt/tesstrain \
+    && cd /opt/tesstrain \
+    && git remote add origin https://github.com/tesseract-ocr/tesstrain.git \
+    && git fetch --depth 1 origin ${TESSTRAIN_REF} \
+    && git checkout --detach FETCH_HEAD
 
 COPY . .
 

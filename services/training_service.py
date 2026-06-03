@@ -9,10 +9,12 @@ from typing import Any
 import yaml
 from redis import Redis
 from rq import Queue
+from rq.command import send_stop_job_command
 from rq.job import Job, JobStatus
 
 from dataset_utils import find_dataset_yaml, inspect_dataset
 from model_catalog import get_model
+from security_utils import contained_path, validate_slug
 
 
 OCR_MODEL_TYPES = {"paddleocr", "tesseract"}
@@ -49,12 +51,13 @@ class TrainingService:
 
     def _find_dataset_path(self, dataset_name: str | None = None) -> Path:
         if dataset_name:
-            dataset_path = self.dataset_dir / dataset_name
+            validate_slug(dataset_name, "dataset name")
+            dataset_path = contained_path(self.dataset_dir, dataset_name)
             if not dataset_path.exists() or not dataset_path.is_dir():
                 raise FileNotFoundError(f"Dataset '{dataset_name}' was not found in {self.dataset_dir}.")
             return dataset_path
 
-        candidates = [path for path in self.dataset_dir.iterdir() if path.is_dir()]
+        candidates = [path for path in self.dataset_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
         if not candidates:
             raise FileNotFoundError(f"No datasets found in {self.dataset_dir}. Please upload a dataset first.")
         return sorted(candidates, key=lambda path: path.stat().st_ctime, reverse=True)[0]
@@ -65,6 +68,8 @@ class TrainingService:
         expected_formats = set(model_entry.get("dataset_formats", [])) if model_entry else set()
         detected_formats = set(metadata["formats"])
 
+        if model_entry and task_type != model_entry["task_type"]:
+            raise ValueError(f"Model '{model_type}' belongs to task '{model_entry['task_type']}', not '{task_type}'.")
         if expected_formats and not expected_formats.intersection(detected_formats):
             raise ValueError(
                 f"Dataset '{dataset_path.name}' is not compatible with {model_type}. "
@@ -78,21 +83,36 @@ class TrainingService:
             )
         return metadata
 
+    def _find_latest_compatible_dataset_path(self, model_type: str, task_type: str) -> Path:
+        candidates = [path for path in self.dataset_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
+        for candidate in sorted(candidates, key=lambda path: path.stat().st_ctime, reverse=True):
+            try:
+                self._assert_dataset_matches_model(candidate, model_type, task_type)
+                return candidate
+            except ValueError:
+                continue
+        raise FileNotFoundError(f"No uploaded dataset is compatible with {model_type}. Please upload or select one first.")
+
     def _create_worker_yaml(self, original_yaml_path: Path, dataset_folder: Path) -> str:
         config = yaml.safe_load(original_yaml_path.read_text(encoding="utf-8")) or {}
+        if not isinstance(config, dict):
+            raise ValueError("YOLO YAML root must be an object")
+        if not isinstance(config.get("names"), (dict, list)) or not config["names"]:
+            raise ValueError("YOLO YAML requires a non-empty names list or mapping")
         config["path"] = str(dataset_folder)
-
-        path_map = {
-            "train": ["train", "training"],
-            "val": ["valid", "val", "validation"],
-            "test": ["test"],
-        }
-        for yaml_key, folder_candidates in path_map.items():
-            if yaml_key in config:
-                for candidate in folder_candidates:
-                    if (dataset_folder / candidate).exists():
-                        config[yaml_key] = f"{candidate}/images"
-                        break
+        for yaml_key in ("train", "val", "test"):
+            value = config.get(yaml_key)
+            if value is None:
+                continue
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if not isinstance(item, str) or not item.strip():
+                    raise ValueError(f"YOLO YAML '{yaml_key}' paths must be non-empty text")
+                candidate = contained_path(dataset_folder, item)
+                if not candidate.exists():
+                    raise ValueError(f"YOLO YAML '{yaml_key}' path was not found inside the dataset: {item}")
+        if "train" not in config:
+            raise ValueError("YOLO YAML requires a train path")
 
         worker_yaml_path = dataset_folder / "data_worker.yaml"
         worker_yaml_path.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
@@ -110,8 +130,13 @@ class TrainingService:
         extra_args: dict[str, Any] | None = None,
     ) -> str:
         self._ensure_redis()
+        validate_slug(project_name, "project name")
 
-        dataset_path = self._find_dataset_path(dataset_name)
+        dataset_path = (
+            self._find_dataset_path(dataset_name)
+            if dataset_name
+            else self._find_latest_compatible_dataset_path(model_type, task_type)
+        )
         dataset_metadata = self._assert_dataset_matches_model(dataset_path, model_type, task_type)
         data_yaml_path = None
         original_yaml = find_dataset_yaml(dataset_path)
@@ -131,6 +156,8 @@ class TrainingService:
             "dataset_metadata": dataset_metadata,
             "extra_args": extra_args or {},
         }
+        if model_type == "yolo":
+            job_config["task"] = "detect"
 
         queue_name = self._queue_name_for_model(model_type)
         queue = self.queues[queue_name]
@@ -179,7 +206,7 @@ class TrainingService:
             job = Job.fetch(job_id, connection=self.redis)
             log_path_str = job.meta.get("log_path")
             if log_path_str:
-                log_path = Path(log_path_str)
+                log_path = contained_path(self.runs_dir, Path(log_path_str))
                 if log_path.exists():
                     return log_path.read_text(encoding="utf-8")
 
@@ -191,8 +218,35 @@ class TrainingService:
         except Exception as exc:
             return f"Error fetching logs: {exc}"
 
+    def _job_log_path(self, job_id: str) -> Path | None:
+        if not self.redis:
+            return None
+        job = Job.fetch(job_id, connection=self.redis)
+        log_path_str = job.meta.get("log_path")
+        if not log_path_str:
+            return None
+        log_path = contained_path(self.runs_dir, Path(log_path_str))
+        return log_path if log_path.is_file() else None
+
+    def read_job_log_chunk(self, job_id: str, offset: int = 0) -> tuple[str, int, bool]:
+        if not self.redis:
+            return "", offset, False
+        try:
+            log_path = self._job_log_path(job_id)
+            if log_path is None:
+                return "", offset, False
+            size = log_path.stat().st_size
+            replace = size < offset
+            start = 0 if replace else offset
+            with open(log_path, "rb") as file:
+                file.seek(start)
+                return file.read().decode("utf-8", errors="replace"), size, replace
+        except Exception:
+            return "", offset, False
+
     def get_training_metrics(self, project_name: str) -> list[dict[str, str]]:
-        results_path = self.runs_dir / project_name / "results.csv"
+        validate_slug(project_name, "project name")
+        results_path = contained_path(self.runs_dir, project_name, "results.csv")
         if not results_path.exists():
             return []
         try:
@@ -204,10 +258,42 @@ class TrainingService:
             print(f"[TrainingService] Error reading metrics: {exc}")
             return []
 
+    def get_job_snapshot(self, job_id: str) -> dict[str, Any]:
+        status = self.get_container_status(job_id)
+        if status == "not_found":
+            return {"job_id": job_id, "status": status, "project_name": None, "logs": "", "metrics": []}
+        project_name = None
+        if self.redis:
+            try:
+                job = Job.fetch(job_id, connection=self.redis)
+                project_name = job.meta.get("project_name")
+            except Exception:
+                pass
+        metrics = self.get_training_metrics(project_name) if project_name else []
+        log_path = None
+        try:
+            log_path = self._job_log_path(job_id)
+        except Exception:
+            pass
+        return {
+            "job_id": job_id,
+            "status": status,
+            "project_name": project_name,
+            "logs": self.get_container_logs(job_id),
+            "log_offset": log_path.stat().st_size if log_path else 0,
+            "metrics": metrics,
+        }
+
     def stop_training_container(self, job_id: str) -> str:
         self._ensure_redis()
         try:
             job = Job.fetch(job_id, connection=self.redis)
+            status = job.get_status()
+            status_str = status.value if isinstance(status, JobStatus) else str(status)
+            if status_str == "started":
+                send_stop_job_command(self.redis, job_id)
+                print(f"[TrainingService] Stop command sent for running job {job_id}")
+                return "stopping"
             job.cancel()
             print(f"[TrainingService] Job {job_id} cancelled")
             return "cancelled"
@@ -217,7 +303,7 @@ class TrainingService:
     def list_runs(self) -> list[dict[str, Any]]:
         runs = []
         for project_dir in sorted(self.runs_dir.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
-            if not project_dir.is_dir():
+            if not project_dir.is_dir() or project_dir.name.startswith("."):
                 continue
             config_path = project_dir / "job_config.json"
             config: dict[str, Any] = {}

@@ -4,6 +4,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from security_utils import validate_slug
 from .base_trainer import BaseTrainer
 from .trainer_utils import extra
 
@@ -25,6 +26,8 @@ class TesseractTrainer(BaseTrainer):
 
         model_name = str(args.get("model_name", "custom"))
         start_model = str(args.get("start_model", "eng"))
+        validate_slug(model_name, "Tesseract model name")
+        validate_slug(start_model, "Tesseract start model")
         dataset_path = Path(config["dataset_path"]).resolve()
         output_dir = Path("/app/runs") / config.get("project_name", "train_run")
         output_dir.mkdir(parents=True, exist_ok=True)

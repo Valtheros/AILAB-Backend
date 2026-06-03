@@ -5,6 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from security_utils import contained_path
 from .trainer_utils import IMAGE_EXTENSIONS, list_images, read_classes_from_yaml, read_yaml, split_image_dir
 
 
@@ -17,6 +18,8 @@ class YoloBoxDataset:
         if not self.images:
             raise ValueError(f"No images found for split '{split}' in {self.images_dir}")
         self.classes = read_classes_from_yaml(data_yaml_path)
+        if not self.classes:
+            raise ValueError("YOLO YAML requires at least one class name")
 
     def __len__(self) -> int:
         return len(self.images)
@@ -38,6 +41,8 @@ class YoloBoxDataset:
                 if len(parts) < 5:
                     continue
                 class_id = int(float(parts[0]))
+                if class_id < 0 or class_id >= len(self.classes):
+                    raise ValueError(f"YOLO class ID {class_id} is outside 0..{len(self.classes) - 1} in {label_path}")
                 x_center, y_center, box_width, box_height = [float(value) for value in parts[1:5]]
                 x1 = (x_center - box_width / 2) * width
                 y1 = (y_center - box_height / 2) * height
@@ -81,9 +86,10 @@ class CocoInstanceDataset:
         data = json.loads(annotation_path.read_text(encoding="utf-8"))
         self.annotation_root = annotation_path.parent
         self.images_by_id = {image["id"]: image for image in data.get("images", [])}
-        category_ids = sorted(category["id"] for category in data.get("categories", []))
+        categories = sorted(data.get("categories", []), key=lambda category: category["id"])
+        category_ids = [category["id"] for category in categories]
         self.category_to_label = {category_id: index + 1 for index, category_id in enumerate(category_ids)}
-        self.classes = [category.get("name", str(category.get("id"))) for category in data.get("categories", [])]
+        self.classes = [category.get("name", str(category.get("id"))) for category in categories]
         annotations_by_image: dict[int, list[dict]] = {}
         for annotation in data.get("annotations", []):
             annotations_by_image.setdefault(annotation["image_id"], []).append(annotation)
@@ -154,11 +160,11 @@ class CocoInstanceDataset:
         return None
 
     def _resolve_image_path(self, file_name: str) -> Path:
-        direct = self.dataset_path / file_name
+        direct = contained_path(self.dataset_path, file_name)
         if direct.exists():
             return direct
         for folder in ("images", self.split, f"{self.split}/images", "train/images", "valid/images", "val/images"):
-            candidate = self.dataset_path / folder / file_name
+            candidate = contained_path(self.dataset_path, folder, file_name)
             if candidate.exists():
                 return candidate
         matches = list(self.dataset_path.rglob(Path(file_name).name))
@@ -174,7 +180,16 @@ class CocoInstanceDataset:
         segmentation = annotation.get("segmentation", [])
         if isinstance(segmentation, list):
             for polygon in segmentation:
-                if len(polygon) >= 6:
+                if len(polygon) >= 6 and len(polygon) % 2 == 0:
                     points = [(polygon[i], polygon[i + 1]) for i in range(0, len(polygon), 2)]
                     draw.polygon(points, outline=1, fill=1)
+        elif isinstance(segmentation, dict):
+            try:
+                from pycocotools import mask as coco_mask
+            except ImportError as exc:
+                raise RuntimeError("pycocotools is required for COCO RLE masks") from exc
+            decoded = coco_mask.decode(segmentation)
+            if getattr(decoded, "ndim", 0) == 3:
+                decoded = decoded[:, :, 0]
+            return torch.as_tensor(decoded, dtype=torch.uint8)
         return torch.as_tensor(mask_image, dtype=torch.uint8)

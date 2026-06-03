@@ -36,21 +36,7 @@ class PaddleOCRTrainer(BaseTrainer):
         output_dir = Path("/app/runs") / project_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        overrides = [
-            f"Global.epoch_num={int(config.get('epochs', args.get('epochs', 50)))}",
-            f"Global.save_model_dir={output_dir}",
-            f"Global.eval_batch_step=[0,1000]",
-            f"Optimizer.lr.learning_rate={float(args.get('learning_rate', 0.001))}",
-        ]
-        if args.get("pretrained_model"):
-            overrides.append(f"Global.pretrained_model={args['pretrained_model']}")
-        if args.get("character_dict_path"):
-            overrides.append(f"Global.character_dict_path={args['character_dict_path']}")
-        if "use_space_char" in args:
-            overrides.append(f"Global.use_space_char={bool(args['use_space_char'])}")
-        if "batch_size_per_card" in args:
-            overrides.append(f"Train.loader.batch_size_per_card={int(args['batch_size_per_card'])}")
-
+        overrides = self._build_overrides(config, args, output_dir)
         command = [sys.executable, str(train_script), "-c", str(config_path), "-o", *overrides]
         self._write_log(log_path, "[PaddleOCR] Running: " + " ".join(command))
 
@@ -67,3 +53,36 @@ class PaddleOCRTrainer(BaseTrainer):
             "project_name": project_name,
             "results_dir": str(output_dir),
         }
+
+    def _build_overrides(self, config: dict, args: dict, output_dir: Path) -> list[str]:
+        dataset_path = Path(config["dataset_path"]).resolve()
+        task = str(args.get("ocr_task", "rec"))
+        if task not in {"det", "rec"}:
+            raise ValueError("PaddleOCR ocr_task must be either 'det' or 'rec'")
+        prefix = task
+        train_labels = sorted(dataset_path.rglob(f"{prefix}_gt_train.txt"))
+        val_labels = sorted(dataset_path.rglob(f"{prefix}_gt_val.txt"))
+        if not train_labels:
+            raise ValueError(f"PaddleOCR {task} training requires {prefix}_gt_train.txt")
+
+        overrides = [
+            f"Global.epoch_num={int(config.get('epochs', args.get('epochs', 50)))}",
+            f"Global.save_model_dir={output_dir}",
+            f"Global.eval_batch_step=[0,1000]",
+            f"Optimizer.lr.learning_rate={float(args.get('learning_rate', 0.001))}",
+            f"Global.max_text_length={int(args.get('max_text_length', 25))}",
+            f"Train.dataset.data_dir={dataset_path}",
+            f"Train.dataset.label_file_list=[{train_labels[0]}]",
+        ]
+        if val_labels:
+            overrides.extend([f"Eval.dataset.data_dir={dataset_path}", f"Eval.dataset.label_file_list=[{val_labels[0]}]"])
+        if args.get("pretrained_model"):
+            overrides.append(f"Global.pretrained_model={args['pretrained_model']}")
+        if args.get("character_dict_path"):
+            overrides.append(f"Global.character_dict_path={args['character_dict_path']}")
+        if "use_space_char" in args:
+            overrides.append(f"Global.use_space_char={bool(args['use_space_char'])}")
+        if "batch_size_per_card" in args:
+            overrides.append(f"Train.loader.batch_size_per_card={int(args['batch_size_per_card'])}")
+
+        return overrides

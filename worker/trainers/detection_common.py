@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .detection_datasets import CocoInstanceDataset, YoloBoxDataset
-from .trainer_utils import append_csv_row, collate_detection, extra, get_device, optimizer_for, set_seed
+from .trainer_utils import append_csv_row, collate_detection, extra, get_device, optimizer_for, require_positive_batch_size, scheduler_for, set_seed
 
 
 def _num_classes_from_dataset(dataset, fallback: int = 2) -> int:
@@ -18,7 +18,7 @@ def build_faster_rcnn(config: dict, num_classes: int):
     args = extra(config)
     pretrained = bool(args.get("pretrained", True))
     weights = "DEFAULT" if pretrained else None
-    weights_backbone = None if pretrained else "DEFAULT"
+    weights_backbone = None
     model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(
         weights=weights,
         weights_backbone=weights_backbone,
@@ -43,7 +43,7 @@ def build_mask_rcnn(config: dict, num_classes: int):
     args = extra(config)
     pretrained = bool(args.get("pretrained", True))
     weights = "DEFAULT" if pretrained else None
-    weights_backbone = None if pretrained else "DEFAULT"
+    weights_backbone = None
     model = torchvision.models.detection.maskrcnn_resnet50_fpn_v2(
         weights=weights,
         weights_backbone=weights_backbone,
@@ -92,7 +92,7 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
     device = get_device(str(args.get("device", "0")))
     model.to(device)
 
-    batch_size = int(config.get("batch_size", args.get("batch_size", 4)))
+    batch_size = require_positive_batch_size(int(config.get("batch_size", args.get("batch_size", 4))), model_kind)
     workers = int(args.get("workers", 4))
     train_loader = DataLoader(
         train_dataset,
@@ -115,6 +115,7 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
         float(args.get("weight_decay", 0.0005)),
     )
     epochs = int(config.get("epochs", args.get("epochs", 20)))
+    scheduler = scheduler_for(optimizer, str(args.get("scheduler", "cosine")), epochs)
     amp = bool(args.get("amp", True)) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
@@ -158,6 +159,8 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
         score_loss = float(val_loss) if val_loss != "" else avg_train_loss
         row = {"epoch": epoch, "train/loss": avg_train_loss, "val/loss": val_loss, "lr": optimizer.param_groups[0]["lr"]}
         append_csv_row(metrics_path, row)
+        if scheduler is not None:
+            scheduler.step()
         logger(log_path, f"[{model_kind}] epoch={epoch}/{epochs} train_loss={avg_train_loss:.4f} val_loss={val_loss}")
 
         if score_loss <= best_loss:
