@@ -1,79 +1,36 @@
-# Computer Vision Training Backend
+# AILAB Backend
 
-FastAPI backend and Redis/RQ workers for the no-code Computer Vision training platform.
+FastAPI backend for AILAB, a no-code Computer Vision training platform. It
+accepts uploaded datasets, detects supported formats, queues training jobs with
+Redis/RQ, streams progress, and serves trained artifacts back to the frontend.
 
-The backend owns:
+## What It Does
 
-- Dataset upload, extraction, format detection, and compatibility checks.
-- A model catalog consumed by the frontend.
-- Training job submission and queue routing.
-- Job status, logs, metrics, and result artifact downloads.
-- Docker services for the API, Redis, CV workers, OCR workers, and RQ dashboard.
+- Upload and validate dataset ZIP files.
+- Expose the model catalog used by the UI.
+- Queue training jobs for CV and OCR workers.
+- Stream live logs, metrics, status, and heartbeats through SSE.
+- Store run outputs such as logs, metrics, weights, and OCR artifacts.
+- Protect user-owned datasets and runs when requests include authenticated user
+  headers from the frontend proxy.
 
-## Supported tasks and models
+## Supported Tasks
 
-| Task | Models | Primary dataset formats |
+| Task | Models | Dataset formats |
 | --- | --- | --- |
 | Image Classification | ResNet, EfficientNet | ImageFolder |
-| Semantic / Instance Segmentation | DeepLabV3+, Mask R-CNN | Semantic masks, COCO instances |
-| OCR / Document Vision | PaddleOCR, Tesseract | PaddleOCR labels, Tesseract ground truth |
+| Segmentation | DeepLabV3+, Mask R-CNN | semantic masks, COCO instances |
+| OCR / Document Vision | PaddleOCR, Tesseract | PaddleOCR labels, `.gt.txt` |
 | Object Detection | YOLOv11, Faster R-CNN | YOLO detection |
 
-`model_catalog.py` is the backend source of truth for task IDs, model IDs, selectable parameters, and expected dataset formats.
+## Run Locally
 
-## Architecture
-
-```text
-backend/
-|-- main.py                    # FastAPI routes
-|-- model_catalog.py           # Task/model/parameter catalog
-|-- dataset_utils.py           # Dataset inspection and validation
-|-- services/
-|   `-- training_service.py    # RQ job orchestration and run metadata
-|-- worker/
-|   |-- worker_app.py          # RQ worker entry point and trainer registry
-|   |-- Dockerfile             # PyTorch/CUDA CV worker
-|   |-- Dockerfile.ocr         # PaddleOCR and Tesseract worker
-|   |-- requirements.txt
-|   |-- requirements-ocr.txt
-|   `-- trainers/
-|       |-- yolo_trainer.py
-|       |-- resnet_trainer.py
-|       |-- efficientnet_trainer.py
-|       |-- deeplabv3plus_trainer.py
-|       |-- mask_rcnn_trainer.py
-|       |-- faster_rcnn_trainer.py
-|       |-- paddleocr_trainer.py
-|       `-- tesseract_trainer.py
-|-- dataset/                    # Extracted uploaded datasets
-`-- runs/                       # Logs, weights, CSV metrics, job config files
-```
-
-Training is queue-based:
-
-1. FastAPI validates the request and selected dataset.
-2. `TrainingService` enqueues the job into Redis.
-3. `cv_training` handles PyTorch/TorchVision/Ultralytics/SMP trainers.
-4. `ocr_training` handles PaddleOCR and Tesseract trainers.
-5. Workers write artifacts into `runs/<project_name>/`.
-
-## Run with Docker
-
-From `backend/`:
+Docker Compose is the recommended local runtime because the API depends on
+Redis, PostgreSQL, and worker services.
 
 ```powershell
 docker compose up --build
 ```
-
-Docker Compose starts:
-
-| Service | Purpose | Port |
-| --- | --- | --- |
-| `backend` | FastAPI API | `8000` |
-| `redis` | Queue and job store on the internal Docker network | none |
-| `worker` | CV training queue | none |
-| `ocr-worker` | OCR training queue | none |
-| `rq-dashboard` | Queue dashboard | `9181` |
 
 Useful URLs:
 
@@ -82,177 +39,46 @@ Useful URLs:
 - Model catalog: `http://localhost:8000/api/model-catalog`
 - RQ dashboard: `http://localhost:9181`
 
-The CV worker is configured for NVIDIA GPU reservations in `docker-compose.yml`. CPU-only environments can still use the API and may run compatible training jobs after adjusting Docker/GPU configuration and model parameters.
+## Environment
 
-## Local API development
-
-Docker is the intended path because Redis and worker images are part of the runtime. For API-only local work:
-
-```powershell
-python -m pip install -r requirements.txt
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Redis must be reachable through `REDIS_URL` for job submission.
-
-Default local value:
+Copy `.env.example` and adjust values when needed.
 
 ```text
-redis://localhost:6379
+APP_BASE_DIR=/app
+STORAGE_DIR=/app/storage
+DATASET_DIR=/app/dataset
+RUNS_DIR=/app/runs
+REDIS_URL=redis://redis:6379
+DATABASE_URL=postgresql://ailab:ailab_dev_password@postgres:5432/ailab
+BACKEND_INTERNAL_TOKEN=
+CORS_ORIGINS=http://localhost:3000
 ```
 
-Compose value:
+Set the same `BACKEND_INTERNAL_TOKEN` in the frontend and backend for
+production-like deployments so browser traffic goes through the authenticated
+Next.js proxy instead of calling FastAPI directly.
 
-```text
-redis://redis:6379
-```
-
-## API contract
-
-### Start training
-
-`POST /api/train`
-
-```json
-{
-  "task_type": "object_detection",
-  "model_type": "yolo",
-  "model_name": "yolo11n",
-  "dataset_name": "traffic_signs",
-  "project_name": "traffic_signs_run_001",
-  "epochs": 50,
-  "batch_size": 16,
-  "params": {
-    "device": "0",
-    "workers": 4,
-    "amp": true,
-    "imgsz": 640,
-    "optimizer": "auto"
-  }
-}
-```
-
-Response:
-
-```json
-{
-  "status": "success",
-  "job_id": "rq-job-id",
-  "container_id": "rq-job-id"
-}
-```
-
-`container_id` is kept as a compatibility alias for older frontend code. New code should treat it as an RQ job ID.
-
-### Core routes
+## Important Routes
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/model-catalog` | Return tasks, models, and parameter specs |
-| `POST /api/train` | Enqueue a training job |
-| `GET /api/status/{job_id}` | Read normalized job status |
-| `GET /api/logs/{job_id}` | Read worker training logs |
-| `GET /api/metrics/{project_name}` | Read `results.csv` rows |
-| `GET /api/jobs/{job_id}/events` | Stream SSE snapshots, incremental logs, metrics, and status |
-| `POST /api/stop/{job_id}` | Cancel a queued or running job |
-| `GET /api/datasets` | List uploaded datasets and detected formats |
+| `GET /api/model-catalog` | Tasks, models, and parameter specs |
 | `POST /api/upload-dataset` | Upload a dataset ZIP |
-| `DELETE /api/datasets/{dataset_name}` | Delete a dataset directory |
-| `GET /api/datasets/{dataset_name}/metadata` | Inspect one dataset |
-| `GET /api/runs` | List run folders, artifacts, and latest metrics |
-| `GET /api/runs/{project_name}/files/{file_path}` | Download a run artifact |
-
-## Dataset formats
-
-Uploaded ZIP files are extracted into `dataset/<dataset_name>/`. The backend detects these formats:
-
-| Format ID | Expected shape | Typical model use |
-| --- | --- | --- |
-| `imagefolder` | `train/<class_name>/image.jpg` | ResNet, EfficientNet |
-| `yolo_detection` | `data.yaml`, image folders, YOLO box labels | YOLO, Faster R-CNN |
-| `yolo_segmentation` | YOLO polygon labels | Metadata detection only; no segmentation trainer is exposed yet |
-| `semantic_masks` | `train/images`, `train/masks` | DeepLabV3+ |
-| `coco_instances` | COCO JSON annotations and images | Mask R-CNN |
-| `paddleocr_labels` | OCR label text files | PaddleOCR |
-| `tesseract_ground_truth` | `*.gt.txt` files | Tesseract |
-
-The selected model must accept at least one detected dataset format before the job is queued.
-
-## Safety limits
-
-Dataset ZIP uploads are extracted into a staging directory and replace an
-existing dataset only after validation succeeds. Uploads are bounded by file
-size, archive entry count, expanded size, per-entry size, and compression
-ratio. Dataset names, project names, archive members, and artifact downloads
-are validated before filesystem access.
-
-Redis is intentionally not published to the host by Docker Compose. FastAPI
-and RQ Dashboard are bound to `127.0.0.1` for local testing. Backend, workers,
-and RQ Dashboard reach Redis through `redis://redis:6379`.
-
-The OCR worker pins its Paddle base image and source revisions for PaddleOCR
-and tesstrain. RQ Dashboard also uses an explicit image version so rebuilds do
-not silently change runtime code.
-
-The API does not require authentication yet. Keep the stack on a trusted local
-network while testing and add authentication plus explicit CORS origins before
-external deployment.
-
-## Live monitoring
-
-The frontend opens one SSE connection after a job is queued:
-
-```text
-GET /api/jobs/{job_id}/events
-```
-
-The stream sends an initial snapshot, incremental log text, metrics changes,
-status changes, heartbeats, and a final terminal event. REST status, logs, and
-metrics routes remain available as snapshot endpoints.
-
-## Result files
-
-Workers write under:
-
-```text
-runs/<project_name>/
-```
-
-Depending on the trainer, a run can include:
-
-- `job_config.json`
-- `train.log`
-- `results.csv`
-- `best.pt`
-- `last.pt`
-- OCR-specific exported files such as `.traineddata`
-
-## Adding a model
-
-1. Add the model entry and parameter specs to `model_catalog.py`.
-2. Add a dedicated trainer file under `worker/trainers/`.
-3. Register the trainer in `worker/worker_app.py`.
-4. Declare dependencies in the correct worker requirements file.
-5. Set compatible `dataset_formats` so dataset validation remains explicit.
-
-Keep model-specific logic in its own trainer file. Shared data loading or optimization helpers belong in focused helper modules, not in one oversized base trainer.
+| `GET /api/datasets` | List visible datasets |
+| `POST /api/train` | Queue a training job |
+| `GET /api/jobs/{job_id}/events` | Live SSE updates |
+| `GET /api/status/{job_id}` | Job snapshot |
+| `GET /api/logs/{job_id}` | Training logs |
+| `GET /api/metrics/{project_name}` | Metrics rows |
+| `GET /api/runs` | Run artifacts |
 
 ## Verification
 
-Syntax check used during development:
-
-```powershell
-python -m py_compile main.py model_catalog.py dataset_utils.py services\training_service.py worker\worker_app.py worker\trainers\*.py
-```
-
-Lightweight backend logic tests:
-
 ```powershell
 python -m unittest discover -s tests -v
+python -m py_compile main.py security_utils.py sse_utils.py model_catalog.py dataset_utils.py services\training_service.py worker\worker_app.py worker\security_utils.py worker\trainers\*.py
 ```
 
-For runtime verification, rebuild and start the Compose stack before submitting training jobs:
-
-```powershell
-docker compose up --build
-```
+Keep Redis internal to Docker Compose and bind local-only services to
+`127.0.0.1` unless the stack is behind proper authentication and network
+controls.
