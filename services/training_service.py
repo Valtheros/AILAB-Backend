@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,7 @@ from rq.job import Job, JobStatus
 from dataset_utils import find_dataset_yaml, inspect_dataset
 from model_catalog import get_model
 from security_utils import contained_path, validate_slug
+from settings import DATASET_DIR, REDIS_URL, RUNS_DIR, ensure_runtime_dirs
 
 
 OCR_MODEL_TYPES = {"paddleocr", "tesseract"}
@@ -22,25 +22,22 @@ OCR_MODEL_TYPES = {"paddleocr", "tesseract"}
 
 class TrainingService:
     def __init__(self):
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
         try:
-            self.redis = Redis.from_url(redis_url)
+            self.redis = Redis.from_url(REDIS_URL)
             self.redis.ping()
             self.queues = {
                 "cv_training": Queue("cv_training", connection=self.redis),
                 "ocr_training": Queue("ocr_training", connection=self.redis),
             }
-            print(f"[TrainingService] Connected to Redis at {redis_url}")
+            print(f"[TrainingService] Connected to Redis at {REDIS_URL}")
         except Exception as exc:
             print(f"[TrainingService] ERROR: Cannot connect to Redis: {exc}")
             self.redis = None
             self.queues = {}
 
-        self.base_dir = Path("/app") if Path("/app").exists() else Path(os.getcwd()).absolute()
-        self.dataset_dir = self.base_dir / "dataset"
-        self.runs_dir = self.base_dir / "runs"
-        self.dataset_dir.mkdir(parents=True, exist_ok=True)
-        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_dirs()
+        self.dataset_dir = DATASET_DIR
+        self.runs_dir = RUNS_DIR
 
     def _ensure_redis(self) -> None:
         if self.redis is None or not self.queues:
@@ -49,15 +46,41 @@ class TrainingService:
     def _queue_name_for_model(self, model_type: str) -> str:
         return "ocr_training" if model_type in OCR_MODEL_TYPES else "cv_training"
 
-    def _find_dataset_path(self, dataset_name: str | None = None) -> Path:
+    def _dataset_meta_path(self, dataset_path: Path) -> Path:
+        return dataset_path / ".ailab_dataset.json"
+
+    def _dataset_owner(self, dataset_path: Path) -> str | None:
+        try:
+            metadata = json.loads(self._dataset_meta_path(dataset_path).read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(metadata, dict):
+            return None
+        owner = metadata.get("created_by")
+        return str(owner) if owner else None
+
+    def _is_dataset_visible(self, dataset_path: Path, owner_id: str | None = None) -> bool:
+        dataset_owner = self._dataset_owner(dataset_path)
+        return not owner_id or not dataset_owner or dataset_owner == owner_id
+
+    def _assert_dataset_visible(self, dataset_path: Path, owner_id: str | None = None) -> None:
+        if not self._is_dataset_visible(dataset_path, owner_id):
+            raise FileNotFoundError(f"Dataset '{dataset_path.name}' was not found in {self.dataset_dir}.")
+
+    def _find_dataset_path(self, dataset_name: str | None = None, owner_id: str | None = None) -> Path:
         if dataset_name:
             validate_slug(dataset_name, "dataset name")
             dataset_path = contained_path(self.dataset_dir, dataset_name)
             if not dataset_path.exists() or not dataset_path.is_dir():
                 raise FileNotFoundError(f"Dataset '{dataset_name}' was not found in {self.dataset_dir}.")
+            self._assert_dataset_visible(dataset_path, owner_id)
             return dataset_path
 
-        candidates = [path for path in self.dataset_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
+        candidates = [
+            path
+            for path in self.dataset_dir.iterdir()
+            if path.is_dir() and not path.name.startswith(".") and self._is_dataset_visible(path, owner_id)
+        ]
         if not candidates:
             raise FileNotFoundError(f"No datasets found in {self.dataset_dir}. Please upload a dataset first.")
         return sorted(candidates, key=lambda path: path.stat().st_ctime, reverse=True)[0]
@@ -83,9 +106,11 @@ class TrainingService:
             )
         return metadata
 
-    def _find_latest_compatible_dataset_path(self, model_type: str, task_type: str) -> Path:
+    def _find_latest_compatible_dataset_path(self, model_type: str, task_type: str, owner_id: str | None = None) -> Path:
         candidates = [path for path in self.dataset_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
         for candidate in sorted(candidates, key=lambda path: path.stat().st_ctime, reverse=True):
+            if not self._is_dataset_visible(candidate, owner_id):
+                continue
             try:
                 self._assert_dataset_matches_model(candidate, model_type, task_type)
                 return candidate
@@ -128,14 +153,16 @@ class TrainingService:
         project_name: str,
         dataset_name: str | None = None,
         extra_args: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        owner_email: str | None = None,
     ) -> str:
         self._ensure_redis()
         validate_slug(project_name, "project name")
 
         dataset_path = (
-            self._find_dataset_path(dataset_name)
+            self._find_dataset_path(dataset_name, owner_id=owner_id)
             if dataset_name
-            else self._find_latest_compatible_dataset_path(model_type, task_type)
+            else self._find_latest_compatible_dataset_path(model_type, task_type, owner_id=owner_id)
         )
         dataset_metadata = self._assert_dataset_matches_model(dataset_path, model_type, task_type)
         data_yaml_path = None
@@ -155,6 +182,8 @@ class TrainingService:
             "data_yaml_path": data_yaml_path,
             "dataset_metadata": dataset_metadata,
             "extra_args": extra_args or {},
+            "created_by": owner_id,
+            "created_by_email": owner_email,
         }
         if model_type == "yolo":
             job_config["task"] = "detect"
@@ -173,6 +202,10 @@ class TrainingService:
         job.meta["model_type"] = model_type
         job.meta["task_type"] = task_type
         job.meta["queue"] = queue_name
+        if owner_id:
+            job.meta["created_by"] = owner_id
+        if owner_email:
+            job.meta["created_by_email"] = owner_email
         job.save_meta()
 
         print(f"[TrainingService] Job enqueued: {job.id} ({queue_name}: {task_type}/{model_type}/{model_name})")
@@ -217,6 +250,16 @@ class TrainingService:
             return "No logs available yet. Training may not have started."
         except Exception as exc:
             return f"Error fetching logs: {exc}"
+
+    def get_job_owner(self, job_id: str) -> str | None:
+        if not self.redis:
+            return None
+        try:
+            job = Job.fetch(job_id, connection=self.redis)
+            owner = job.meta.get("created_by")
+            return str(owner) if owner else None
+        except Exception:
+            return None
 
     def _job_log_path(self, job_id: str) -> Path | None:
         if not self.redis:
@@ -300,7 +343,7 @@ class TrainingService:
         except Exception as exc:
             raise RuntimeError(f"Could not stop job {job_id}: {exc}")
 
-    def list_runs(self) -> list[dict[str, Any]]:
+    def list_runs(self, owner_id: str | None = None) -> list[dict[str, Any]]:
         runs = []
         for project_dir in sorted(self.runs_dir.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
             if not project_dir.is_dir() or project_dir.name.startswith("."):
@@ -312,6 +355,9 @@ class TrainingService:
                     config = json.loads(config_path.read_text(encoding="utf-8"))
                 except Exception:
                     config = {}
+            run_owner = config.get("created_by")
+            if owner_id and run_owner and run_owner != owner_id:
+                continue
 
             files = []
             for path in project_dir.rglob("*"):
@@ -338,6 +384,7 @@ class TrainingService:
                     "model_type": config.get("model_type"),
                     "model_name": config.get("model_name"),
                     "dataset_name": config.get("dataset_name"),
+                    "created_by": run_owner,
                     "epochs": config.get("epochs"),
                     "files": files,
                     "latest_metrics": latest_metrics,

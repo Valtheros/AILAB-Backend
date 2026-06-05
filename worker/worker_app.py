@@ -6,6 +6,7 @@ from pathlib import Path
 
 from rq import get_current_job
 from security_utils import contained_path, validate_slug
+from trainers.trainer_utils import runs_root
 
 
 def _build_registry():
@@ -32,7 +33,7 @@ def _build_registry():
 
 def run_training(config: dict) -> dict:
     job = get_current_job()
-    runs_dir = Path("/app/runs")
+    runs_dir = runs_root()
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     project_name = config.get("project_name", "train_run")

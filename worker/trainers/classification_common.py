@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .trainer_utils import append_csv_row, extra, get_device, optimizer_for, require_positive_batch_size, scheduler_for, set_seed
+from .trainer_utils import (
+    append_csv_row,
+    extra,
+    get_device,
+    optimizer_for,
+    require_positive_batch_size,
+    runs_root,
+    scheduler_for,
+    set_seed,
+)
 
 
 def _weights_for(torchvision_models, architecture: str, pretrained: bool):
@@ -138,7 +147,7 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     amp = bool(args.get("amp", True)) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
-    results_dir = Path("/app/runs") / config.get("project_name", "train_run")
+    results_dir = runs_root() / config.get("project_name", "train_run")
     results_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = results_dir / "results.csv"
     best_accuracy = -1.0

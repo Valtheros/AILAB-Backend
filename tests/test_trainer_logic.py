@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import sys
 import types
@@ -10,12 +11,21 @@ if "yaml" not in sys.modules:
     sys.modules["yaml"] = types.SimpleNamespace(safe_load=lambda *_args, **_kwargs: {})
 if "PIL" not in sys.modules:
     sys.modules["PIL"] = types.SimpleNamespace(Image=types.SimpleNamespace(), ImageDraw=types.SimpleNamespace())
+if "redis" not in sys.modules:
+    sys.modules["redis"] = types.SimpleNamespace(Redis=types.SimpleNamespace)
+if "rq" not in sys.modules:
+    sys.modules["rq"] = types.SimpleNamespace(Queue=types.SimpleNamespace)
+if "rq.command" not in sys.modules:
+    sys.modules["rq.command"] = types.SimpleNamespace(send_stop_job_command=lambda *_args, **_kwargs: None)
+if "rq.job" not in sys.modules:
+    sys.modules["rq.job"] = types.SimpleNamespace(Job=types.SimpleNamespace, JobStatus=types.SimpleNamespace)
 
 from dataset_utils import inspect_dataset
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers.detection_datasets import CocoInstanceDataset
 from worker.trainers.paddleocr_trainer import PaddleOCRTrainer
 from worker.trainers.trainer_utils import require_positive_batch_size
+from services.training_service import TrainingService
 
 
 class TrainerLogicTests(unittest.TestCase):
@@ -83,6 +93,48 @@ class TrainerLogicTests(unittest.TestCase):
             dataset.split = "train"
             with self.assertRaises(ValueError):
                 dataset._resolve_image_path("../outside.png")
+
+
+class TrainingServiceOwnershipTests(unittest.TestCase):
+    def _service(self, root: Path) -> TrainingService:
+        service = TrainingService.__new__(TrainingService)
+        service.dataset_dir = root
+        service.runs_dir = root / "runs"
+        return service
+
+    def _imagefolder_dataset(self, root: Path, name: str, owner_id: str | None = None) -> Path:
+        dataset = root / name
+        image = dataset / "train" / "class_a" / "sample.jpg"
+        image.parent.mkdir(parents=True)
+        image.write_bytes(b"not-an-image")
+        if owner_id:
+            (dataset / ".ailab_dataset.json").write_text(
+                json.dumps({"created_by": owner_id}),
+                encoding="utf-8",
+            )
+        return dataset
+
+    def test_named_dataset_rejects_other_owner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._service(root)
+            self._imagefolder_dataset(root, "private_dataset", owner_id="owner-a")
+
+            with self.assertRaises(FileNotFoundError):
+                service._find_dataset_path("private_dataset", owner_id="owner-b")
+
+    def test_latest_compatible_dataset_skips_other_owner(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._service(root)
+            self._imagefolder_dataset(root, "other_dataset", owner_id="owner-b")
+
+            with self.assertRaises(FileNotFoundError):
+                service._find_latest_compatible_dataset_path(
+                    "resnet",
+                    "image_classification",
+                    owner_id="owner-a",
+                )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from security_utils import validate_slug
 from .base_trainer import BaseTrainer
-from .trainer_utils import extra
+from .trainer_utils import extra, runs_root
 
 
 class TesseractTrainer(BaseTrainer):
@@ -29,7 +29,7 @@ class TesseractTrainer(BaseTrainer):
         validate_slug(model_name, "Tesseract model name")
         validate_slug(start_model, "Tesseract start model")
         dataset_path = Path(config["dataset_path"]).resolve()
-        output_dir = Path("/app/runs") / config.get("project_name", "train_run")
+        output_dir = runs_root() / config.get("project_name", "train_run")
         output_dir.mkdir(parents=True, exist_ok=True)
 
         command = [

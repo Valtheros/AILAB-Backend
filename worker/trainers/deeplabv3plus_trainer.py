@@ -4,7 +4,16 @@ from pathlib import Path
 
 from .base_trainer import BaseTrainer
 from .semantic_dataset import SemanticMaskDataset
-from .trainer_utils import append_csv_row, extra, get_device, optimizer_for, require_positive_batch_size, scheduler_for, set_seed
+from .trainer_utils import (
+    append_csv_row,
+    extra,
+    get_device,
+    optimizer_for,
+    require_positive_batch_size,
+    runs_root,
+    scheduler_for,
+    set_seed,
+)
 
 
 class DeepLabV3PlusTrainer(BaseTrainer):
@@ -87,7 +96,7 @@ class DeepLabV3PlusTrainer(BaseTrainer):
         scheduler = scheduler_for(optimizer, str(args.get("scheduler", "cosine")), epochs)
         amp = bool(args.get("amp", True)) and device.type == "cuda"
         scaler = torch.cuda.amp.GradScaler(enabled=amp)
-        results_dir = Path("/app/runs") / config.get("project_name", "train_run")
+        results_dir = runs_root() / config.get("project_name", "train_run")
         results_dir.mkdir(parents=True, exist_ok=True)
         metrics_path = results_dir / "results.csv"
         best_loss = float("inf")

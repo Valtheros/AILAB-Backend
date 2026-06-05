@@ -10,10 +10,17 @@ services:
       - .:/app
       - ./dataset:/app/dataset
       - ./runs:/app/runs
+      - ./storage:/app/storage
     environment:
-      - REDIS_URL=redis://redis:6379
+      APP_BASE_DIR: /app
+      STORAGE_DIR: /app/storage
+      DATASET_DIR: /app/dataset
+      RUNS_DIR: /app/runs
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://ailab:ailab_dev_password@postgres:5432/ailab
     depends_on:
       - redis
+      - postgres
     restart: unless-stopped
 
   redis:
@@ -34,7 +41,8 @@ services:
       - ./runs:/app/runs
       - model_cache:/root/.cache
     environment:
-      - REDIS_URL=redis://redis:6379
+      RUNS_DIR: /app/runs
+      REDIS_URL: redis://redis:6379
     deploy:
       resources:
         reservations:
@@ -57,9 +65,23 @@ services:
       - ./runs:/app/runs
       - ocr_model_cache:/root/.cache
     environment:
-      - REDIS_URL=redis://redis:6379
+      RUNS_DIR: /app/runs
+      REDIS_URL: redis://redis:6379
     depends_on:
       - redis
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: cv_postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: ailab
+      POSTGRES_USER: ailab
+      POSTGRES_PASSWORD: ailab_dev_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
   rq-dashboard:
@@ -75,5 +97,6 @@ services:
 
 volumes:
   redis_data:
+  postgres_data:
   model_cache:
   ocr_model_cache:

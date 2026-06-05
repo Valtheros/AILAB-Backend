@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
-from .trainer_utils import extra
+from .trainer_utils import extra, runs_root
 
 
 class PaddleOCRTrainer(BaseTrainer):
@@ -33,7 +33,7 @@ class PaddleOCRTrainer(BaseTrainer):
             raise RuntimeError(f"PaddleOCR config file was not found at {config_path}.")
 
         project_name = config.get("project_name", "train_run")
-        output_dir = Path("/app/runs") / project_name
+        output_dir = runs_root() / project_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         overrides = self._build_overrides(config, args, output_dir)

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
+from .trainer_utils import runs_root
 
 
 class YOLOTrainer(BaseTrainer):
@@ -44,14 +45,15 @@ class YOLOTrainer(BaseTrainer):
             data=data_yaml,
             epochs=epochs,
             batch=batch_size,
-            project="/app/runs",
+            project=str(runs_root()),
             name=project_name,
             exist_ok=True,
             task=config.get("task", "detect"),
             **extra_args,
         )
 
-        results_dir = str(results.save_dir) if results and hasattr(results, "save_dir") else f"/app/runs/{project_name}"
+        fallback_dir = runs_root() / project_name
+        results_dir = str(results.save_dir) if results and hasattr(results, "save_dir") else str(fallback_dir)
         self._write_log(log_path, f"[YOLOTrainer] results={results_dir}")
 
         return {

@@ -3,7 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 
 from .detection_datasets import CocoInstanceDataset, YoloBoxDataset
-from .trainer_utils import append_csv_row, collate_detection, extra, get_device, optimizer_for, require_positive_batch_size, scheduler_for, set_seed
+from .trainer_utils import (
+    append_csv_row,
+    collate_detection,
+    extra,
+    get_device,
+    optimizer_for,
+    require_positive_batch_size,
+    runs_root,
+    scheduler_for,
+    set_seed,
+)
 
 
 def _num_classes_from_dataset(dataset, fallback: int = 2) -> int:
@@ -119,7 +129,7 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
     amp = bool(args.get("amp", True)) and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
-    results_dir = Path("/app/runs") / config.get("project_name", "train_run")
+    results_dir = runs_root() / config.get("project_name", "train_run")
     results_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = results_dir / "results.csv"
     best_loss = float("inf")

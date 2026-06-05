@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import os
 import random
 from pathlib import Path
 from typing import Any, Iterable
@@ -10,6 +11,10 @@ import yaml
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MASK_EXTENSIONS = {".png", ".bmp", ".tif", ".tiff"}
+
+
+def runs_root() -> Path:
+    return Path(os.getenv("RUNS_DIR", "/app/runs")).resolve()
 
 
 def extra(config: dict) -> dict[str, Any]:

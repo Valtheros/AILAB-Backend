@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import shutil
 import time
 import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from dataset_utils import (
@@ -31,6 +30,7 @@ from security_utils import (
     validate_slug,
 )
 from services.training_service import TrainingService
+from settings import BACKEND_INTERNAL_TOKEN, CORS_ORIGINS, DATASET_DIR, RUNS_DIR, ensure_runtime_dirs
 from sse_utils import TERMINAL_STATUSES, heartbeat, sse_event
 
 
@@ -38,19 +38,23 @@ app = FastAPI(title="No-Code Computer Vision Training Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-training_service = TrainingService()
 
-BASE_DIR = Path("/app") if Path("/app").exists() else Path(os.getcwd()).absolute()
-DATASET_DIR = BASE_DIR / "dataset"
-RUNS_DIR = BASE_DIR / "runs"
-DATASET_DIR.mkdir(exist_ok=True, parents=True)
-RUNS_DIR.mkdir(exist_ok=True, parents=True)
+@app.middleware("http")
+async def require_internal_token(request: Request, call_next):
+    if BACKEND_INTERNAL_TOKEN and request.url.path.startswith("/api"):
+        provided = request.headers.get("x-internal-token")
+        if provided != BACKEND_INTERNAL_TOKEN:
+            return JSONResponse({"detail": "Unauthorized backend request"}, status_code=401)
+    return await call_next(request)
+
+ensure_runtime_dirs()
+training_service = TrainingService()
 
 
 class TrainRequest(BaseModel):
@@ -68,6 +72,67 @@ class TrainRequest(BaseModel):
 
     class Config:
         extra = "forbid"
+
+
+def _request_user_id(request: Request) -> str | None:
+    value = request.headers.get("x-user-id")
+    return value.strip() if value and value.strip() else None
+
+
+def _request_user_email(request: Request) -> str | None:
+    value = request.headers.get("x-user-email")
+    return value.strip() if value and value.strip() else None
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _dataset_meta_path(dataset_dir: Path) -> Path:
+    return dataset_dir / ".ailab_dataset.json"
+
+
+def _dataset_owner(dataset_dir: Path) -> str | None:
+    owner = _read_json_file(_dataset_meta_path(dataset_dir)).get("created_by")
+    return str(owner) if owner else None
+
+
+def _write_dataset_owner(dataset_dir: Path, request: Request) -> None:
+    owner_id = _request_user_id(request)
+    if not owner_id:
+        return
+    metadata = {
+        "created_by": owner_id,
+        "created_by_email": _request_user_email(request),
+        "created_at": int(time.time()),
+    }
+    _dataset_meta_path(dataset_dir).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+
+def _assert_owned_resource_visible(owner_id: str | None, request: Request) -> None:
+    request_owner = _request_user_id(request)
+    if request_owner and owner_id and owner_id != request_owner:
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+
+def _run_owner(project_name: str) -> str | None:
+    config_path = contained_path(RUNS_DIR, project_name, "job_config.json")
+    owner = _read_json_file(config_path).get("created_by")
+    return str(owner) if owner else None
+
+
+def _assert_run_visible(project_name: str, request: Request) -> None:
+    _assert_owned_resource_visible(_run_owner(project_name), request)
+
+
+def _assert_job_visible(job_id: str, request: Request) -> None:
+    _assert_owned_resource_visible(training_service.get_job_owner(job_id), request)
 
 
 def _model_name_from_request(request: TrainRequest, model_entry: dict[str, Any] | None) -> str:
@@ -135,42 +200,44 @@ def model_catalog():
 
 
 @app.post("/api/train")
-def start_train(request: TrainRequest):
-    model_entry = get_model(request.model_type)
+def start_train(train_request: TrainRequest, request: Request):
+    model_entry = get_model(train_request.model_type)
     if model_entry is None:
-        raise HTTPException(status_code=400, detail=f"Unsupported model_type: {request.model_type}")
+        raise HTTPException(status_code=400, detail=f"Unsupported model_type: {train_request.model_type}")
 
-    task_type = request.task_type or model_entry["task_type"]
+    task_type = train_request.task_type or model_entry["task_type"]
     if task_type != model_entry["task_type"]:
         raise HTTPException(
             status_code=400,
-            detail=f"Model '{request.model_type}' belongs to task '{model_entry['task_type']}', not '{task_type}'.",
+            detail=f"Model '{train_request.model_type}' belongs to task '{model_entry['task_type']}', not '{task_type}'.",
         )
     try:
-        validate_slug(request.project_name, "project name")
-        if request.dataset_name:
-            validate_slug(request.dataset_name, "dataset name")
+        validate_slug(train_request.project_name, "project name")
+        if train_request.dataset_name:
+            validate_slug(train_request.dataset_name, "dataset name")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    for key, value in {"epochs": request.epochs, "batch_size": request.batch_size}.items():
-        if key in request.params and request.params[key] != value:
+    for key, value in {"epochs": train_request.epochs, "batch_size": train_request.batch_size}.items():
+        if key in train_request.params and train_request.params[key] != value:
             raise HTTPException(status_code=400, detail=f"Param '{key}' must match top-level '{key}'.")
-    model_name = _model_name_from_request(request, model_entry)
+    model_name = _model_name_from_request(train_request, model_entry)
     try:
-        extra_args = _extra_args_from_request(request)
+        extra_args = _extra_args_from_request(train_request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         job_id = training_service.start_training_container(
             task_type=task_type,
-            model_type=request.model_type,
+            model_type=train_request.model_type,
             model_name=model_name,
-            epochs=request.epochs,
-            batch_size=request.batch_size,
-            project_name=request.project_name,
-            dataset_name=request.dataset_name,
+            epochs=train_request.epochs,
+            batch_size=train_request.batch_size,
+            project_name=train_request.project_name,
+            dataset_name=train_request.dataset_name,
             extra_args=extra_args,
+            owner_id=_request_user_id(request),
+            owner_email=_request_user_email(request),
         )
         return {"status": "success", "job_id": job_id, "container_id": job_id}
     except FileNotFoundError as exc:
@@ -185,20 +252,24 @@ def start_train(request: TrainRequest):
 
 
 @app.get("/api/status/{job_id}")
-def get_status(job_id: str):
+def get_status(job_id: str, request: Request):
+    _assert_job_visible(job_id, request)
     status = training_service.get_container_status(job_id)
     return {"job_id": job_id, "container_id": job_id, "status": status}
 
 
 @app.get("/api/logs/{job_id}")
-def get_logs(job_id: str):
+def get_logs(job_id: str, request: Request):
+    _assert_job_visible(job_id, request)
     logs = training_service.get_container_logs(job_id)
     return {"job_id": job_id, "container_id": job_id, "logs": logs}
 
 
 @app.get("/api/metrics/{project_name}")
-def get_metrics(project_name: str):
+def get_metrics(project_name: str, request: Request):
     try:
+        validate_slug(project_name, "project name")
+        _assert_run_visible(project_name, request)
         metrics = training_service.get_training_metrics(project_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -208,7 +279,8 @@ def get_metrics(project_name: str):
 
 
 @app.post("/api/stop/{job_id}")
-def stop_train(job_id: str):
+def stop_train(job_id: str, request: Request):
+    _assert_job_visible(job_id, request)
     try:
         training_service.stop_training_container(job_id)
         return {"status": "success"}
@@ -220,7 +292,8 @@ def stop_train(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/events")
-async def job_events(job_id: str):
+async def job_events(job_id: str, request: Request):
+    _assert_job_visible(job_id, request)
     snapshot = training_service.get_job_snapshot(job_id)
     if snapshot["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Job not found")
@@ -271,13 +344,16 @@ async def job_events(job_id: str):
 
 
 @app.get("/api/datasets")
-def list_datasets():
+def list_datasets(request: Request):
     datasets = []
     if not DATASET_DIR.exists():
         return {"datasets": []}
 
     for item in sorted(DATASET_DIR.iterdir(), key=lambda path: path.name.lower()):
         if not item.is_dir() or item.name.startswith("."):
+            continue
+        owner_id = _dataset_owner(item)
+        if _request_user_id(request) and owner_id and owner_id != _request_user_id(request):
             continue
 
         metadata = inspect_dataset(item)
@@ -294,6 +370,7 @@ def list_datasets():
                 "formats": metadata["formats"],
                 "warnings": metadata["warnings"],
                 "yamlPath": metadata["yaml_path"],
+                "createdBy": owner_id,
             }
         )
 
@@ -301,7 +378,7 @@ def list_datasets():
 
 
 @app.post("/api/upload-dataset")
-async def upload_dataset(file: UploadFile = File(...)):
+async def upload_dataset(request: Request, file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
     if not file.filename.lower().endswith(".zip"):
@@ -325,6 +402,7 @@ async def upload_dataset(file: UploadFile = File(...)):
         _flatten_single_root_folder(extract_dir)
         metadata = validate_dataset_for_upload(extract_dir)
         replace_directory(extract_dir, target_dir)
+        _write_dataset_owner(target_dir, request)
 
         return {
             "status": "success",
@@ -348,7 +426,7 @@ async def upload_dataset(file: UploadFile = File(...)):
 
 
 @app.delete("/api/datasets/{dataset_name}")
-def delete_dataset(dataset_name: str):
+def delete_dataset(dataset_name: str, request: Request):
     try:
         validate_slug(dataset_name, "dataset name")
         target_dir = contained_path(DATASET_DIR, dataset_name)
@@ -356,6 +434,7 @@ def delete_dataset(dataset_name: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
+    _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     try:
         shutil.rmtree(target_dir)
         return {"status": "success"}
@@ -364,14 +443,15 @@ def delete_dataset(dataset_name: str):
 
 
 @app.get("/api/runs")
-def list_runs():
-    return {"runs": training_service.list_runs()}
+def list_runs(request: Request):
+    return {"runs": training_service.list_runs(owner_id=_request_user_id(request))}
 
 
 @app.get("/api/runs/{project_name}/files/{file_path:path}")
-def download_run_file(project_name: str, file_path: str):
+def download_run_file(project_name: str, file_path: str, request: Request):
     try:
         validate_slug(project_name, "project name")
+        _assert_run_visible(project_name, request)
         project_dir = contained_path(RUNS_DIR, project_name)
         target = contained_path(project_dir, file_path)
     except ValueError:
@@ -382,7 +462,7 @@ def download_run_file(project_name: str, file_path: str):
 
 
 @app.get("/api/datasets/{dataset_name}/metadata")
-def dataset_metadata(dataset_name: str):
+def dataset_metadata(dataset_name: str, request: Request):
     try:
         validate_slug(dataset_name, "dataset name")
         target_dir = contained_path(DATASET_DIR, dataset_name)
@@ -390,6 +470,7 @@ def dataset_metadata(dataset_name: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
+    _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     metadata = inspect_dataset(target_dir)
     metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
     return metadata
