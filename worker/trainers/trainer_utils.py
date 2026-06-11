@@ -80,11 +80,11 @@ def split_image_dir(dataset_path: str, split: str) -> Path:
         "test": ["test"],
     }.get(split, [split])
     for candidate in candidates:
-        split_dir = base / candidate
-        if not split_dir.exists():
-            continue
-        images_dir = split_dir / "images"
-        return images_dir if images_dir.exists() else split_dir
+        for split_dir in (base / candidate, base / "images" / candidate):
+            if not split_dir.exists():
+                continue
+            images_dir = split_dir / "images"
+            return images_dir if images_dir.exists() else split_dir
     return base / candidates[0] / "images"
 
 

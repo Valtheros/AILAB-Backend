@@ -7,7 +7,7 @@ import stat
 import tempfile
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
@@ -65,6 +65,14 @@ def safe_extract_zip(zip_file: zipfile.ZipFile, target_dir: Path) -> None:
     if len(members) > MAX_ARCHIVE_ENTRIES:
         raise ValueError("ZIP contains too many entries")
 
+    normalized_names = [member.filename.replace("\\", "/").rstrip("/") for member in members]
+    implied_directories = {
+        str(parent)
+        for name in normalized_names
+        for parent in PurePosixPath(name).parents
+        if str(parent) not in {"", "."}
+    }
+
     total_uncompressed = 0
     for member in members:
         _validate_archive_member(member, target_dir)
@@ -74,10 +82,14 @@ def safe_extract_zip(zip_file: zipfile.ZipFile, target_dir: Path) -> None:
 
     target_dir.mkdir(parents=True, exist_ok=False)
     for member in members:
-        destination = contained_path(target_dir, member.filename.replace("\\", "/"))
-        if member.is_dir():
+        filename = member.filename.replace("\\", "/").rstrip("/")
+        destination = contained_path(target_dir, filename)
+        is_implied_directory = filename in implied_directories
+        if member.is_dir() or (is_implied_directory and member.file_size == 0):
             destination.mkdir(parents=True, exist_ok=True)
             continue
+        if is_implied_directory:
+            raise ValueError("ZIP contains a file and directory with the same path")
         destination.parent.mkdir(parents=True, exist_ok=True)
         with zip_file.open(member, "r") as source, open(destination, "wb") as output:
             shutil.copyfileobj(source, output, length=1024 * 1024)

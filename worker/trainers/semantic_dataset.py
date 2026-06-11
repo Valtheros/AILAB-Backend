@@ -26,14 +26,17 @@ class SemanticMaskDataset:
         import torch
         import torchvision.transforms.functional as F
         from torchvision.transforms import InterpolationMode
+        import numpy as np
 
         image_path = self.images[index]
         mask_path = self._mask_path(image_path)
         image = Image.open(image_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
+        mask = Image.open(mask_path)
+        if mask.mode not in {"L", "P", "I", "I;16"}:
+            mask = mask.convert("L")
         image = F.resize(image, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)
         mask = F.resize(mask, [self.image_size, self.image_size], interpolation=InterpolationMode.NEAREST)
-        mask_tensor = torch.as_tensor(list(mask.getdata()), dtype=torch.long).reshape(self.image_size, self.image_size)
+        mask_tensor = torch.from_numpy(np.asarray(mask, dtype=np.int64)).long()
         invalid = (mask_tensor != self.ignore_index) & ((mask_tensor < 0) | (mask_tensor >= self.num_classes))
         if invalid.any():
             invalid_values = sorted(set(mask_tensor[invalid].tolist()))

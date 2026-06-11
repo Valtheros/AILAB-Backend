@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +39,7 @@ class PaddleOCRTrainer(BaseTrainer):
 
         overrides = self._build_overrides(config, args, output_dir)
         command = [sys.executable, str(train_script), "-c", str(config_path), "-o", *overrides]
-        self._write_log(log_path, "[PaddleOCR] Running: " + " ".join(command))
+        self._write_log(log_path, "[PaddleOCR] Running: " + shlex.join(command))
 
         with open(log_path or output_dir / "train.log", "a", encoding="utf-8") as log_file:
             process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT, cwd=str(paddle_root))
@@ -54,6 +55,13 @@ class PaddleOCRTrainer(BaseTrainer):
             "results_dir": str(output_dir),
         }
 
+    def _override_path(self, path: Path | str) -> str:
+        return Path(path).resolve().as_posix()
+
+    def _override_list(self, path: Path | str) -> str:
+        escaped = self._override_path(path).replace("'", "\\'")
+        return f"['{escaped}']"
+
     def _build_overrides(self, config: dict, args: dict, output_dir: Path) -> list[str]:
         dataset_path = Path(config["dataset_path"]).resolve()
         task = str(args.get("ocr_task", "rec"))
@@ -67,19 +75,24 @@ class PaddleOCRTrainer(BaseTrainer):
 
         overrides = [
             f"Global.epoch_num={int(config.get('epochs', args.get('epochs', 50)))}",
-            f"Global.save_model_dir={output_dir}",
+            f"Global.save_model_dir={self._override_path(output_dir)}",
             f"Global.eval_batch_step=[0,1000]",
             f"Optimizer.lr.learning_rate={float(args.get('learning_rate', 0.001))}",
             f"Global.max_text_length={int(args.get('max_text_length', 25))}",
-            f"Train.dataset.data_dir={dataset_path}",
-            f"Train.dataset.label_file_list=[{train_labels[0]}]",
+            f"Train.dataset.data_dir={self._override_path(dataset_path)}",
+            f"Train.dataset.label_file_list={self._override_list(train_labels[0])}",
         ]
         if val_labels:
-            overrides.extend([f"Eval.dataset.data_dir={dataset_path}", f"Eval.dataset.label_file_list=[{val_labels[0]}]"])
+            overrides.extend(
+                [
+                    f"Eval.dataset.data_dir={self._override_path(dataset_path)}",
+                    f"Eval.dataset.label_file_list={self._override_list(val_labels[0])}",
+                ]
+            )
         if args.get("pretrained_model"):
-            overrides.append(f"Global.pretrained_model={args['pretrained_model']}")
+            overrides.append(f"Global.pretrained_model={self._override_path(str(args['pretrained_model']))}")
         if args.get("character_dict_path"):
-            overrides.append(f"Global.character_dict_path={args['character_dict_path']}")
+            overrides.append(f"Global.character_dict_path={self._override_path(str(args['character_dict_path']))}")
         if "use_space_char" in args:
             overrides.append(f"Global.use_space_char={bool(args['use_space_char'])}")
         if "batch_size_per_card" in args:

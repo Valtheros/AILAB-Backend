@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import io
 import sys
 import tempfile
@@ -8,8 +9,30 @@ import unittest
 import zipfile
 from pathlib import Path
 
+
+def _safe_load_stub(text: str):
+    data = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if value.startswith("["):
+            try:
+                data[key.strip()] = ast.literal_eval(value)
+            except Exception:
+                data[key.strip()] = []
+        else:
+            data[key.strip()] = value
+    return data
+
+
+def _dump_stub(data, *_args, **_kwargs):
+    return "\n".join(f"{key}: {value}" for key, value in data.items()) + "\n"
+
+
 if "yaml" not in sys.modules:
-    sys.modules["yaml"] = types.SimpleNamespace(safe_load=lambda *_args, **_kwargs: {})
+    sys.modules["yaml"] = types.SimpleNamespace(safe_load=_safe_load_stub, dump=_dump_stub)
 
 from dataset_utils import safe_dataset_name
 from security_utils import contained_path, safe_extract_zip, validate_slug
@@ -42,6 +65,18 @@ class SecurityUtilsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             with zipfile.ZipFile(archive) as source, self.assertRaises(ValueError):
                 safe_extract_zip(source, Path(temp) / "dataset")
+
+    def test_safe_extract_treats_zero_byte_implied_directory_as_directory(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as output:
+            output.writestr("smoke_yolo", "")
+            output.writestr("smoke_yolo/images/train/image.jpg", b"image")
+        archive.seek(0)
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "dataset"
+            with zipfile.ZipFile(archive) as source:
+                safe_extract_zip(source, target)
+            self.assertTrue((target / "smoke_yolo" / "images" / "train" / "image.jpg").is_file())
 
 
 if __name__ == "__main__":

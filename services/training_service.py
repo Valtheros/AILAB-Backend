@@ -182,6 +182,11 @@ class TrainingService:
     ) -> str:
         self._ensure_redis()
         validate_slug(project_name, "project name")
+        project_dir = contained_path(self.runs_dir, project_name)
+        if project_dir.exists():
+            run_owner = self._run_owner(project_name)
+            if owner_id and run_owner != owner_id:
+                raise FileExistsError(f"Run '{project_name}' already exists.")
 
         dataset_path = (
             self._find_dataset_path(dataset_name, owner_id=owner_id)
@@ -234,6 +239,18 @@ class TrainingService:
 
         print(f"[TrainingService] Job enqueued: {job.id} ({queue_name}: {task_type}/{model_type}/{model_name})")
         return job.id
+
+    def _run_owner(self, project_name: str) -> str | None:
+        try:
+            validate_slug(project_name, "project name")
+            config_path = contained_path(self.runs_dir, project_name, "job_config.json")
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(config, dict):
+            return None
+        owner = config.get("created_by")
+        return str(owner) if owner else None
 
     def get_container_status(self, job_id: str) -> str:
         if not self.redis:

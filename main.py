@@ -242,6 +242,8 @@ def start_train(train_request: TrainRequest, request: Request):
         return {"status": "success", "job_id": job_id, "container_id": job_id}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
@@ -394,6 +396,14 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
     temp_zip_path: Path | None = None
 
     try:
+        target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
+        request_owner = _request_user_id(request)
+        if request_owner and target_owner and target_owner != request_owner:
+            raise HTTPException(
+                status_code=409,
+                detail="Dataset name already exists. Rename the ZIP and upload again.",
+            )
+
         temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
         with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
             extract_dir = staging_dir / "extracted"

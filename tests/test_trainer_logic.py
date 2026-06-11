@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import tempfile
 import sys
@@ -7,10 +8,35 @@ import types
 import unittest
 from pathlib import Path
 
+
+def _safe_load_stub(text: str):
+    data = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        value = value.strip()
+        if value.startswith("["):
+            try:
+                data[key.strip()] = ast.literal_eval(value)
+            except Exception:
+                data[key.strip()] = []
+        else:
+            data[key.strip()] = value
+    return data
+
+
+def _dump_stub(data, *_args, **_kwargs):
+    return "\n".join(f"{key}: {value}" for key, value in data.items()) + "\n"
+
+
 try:
     import yaml as _yaml  # noqa: F401
 except Exception:
-    sys.modules["yaml"] = types.SimpleNamespace(safe_load=lambda *_args, **_kwargs: {})
+    sys.modules["yaml"] = types.SimpleNamespace(safe_load=_safe_load_stub, dump=_dump_stub)
+else:
+    if not getattr(_yaml, "__file__", None):
+        sys.modules["yaml"] = types.SimpleNamespace(safe_load=_safe_load_stub, dump=_dump_stub)
 if "PIL" not in sys.modules:
     sys.modules["PIL"] = types.SimpleNamespace(Image=types.SimpleNamespace(), ImageDraw=types.SimpleNamespace())
 if "redis" not in sys.modules:
@@ -26,7 +52,7 @@ from dataset_utils import inspect_dataset
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers.detection_datasets import CocoInstanceDataset
 from worker.trainers.paddleocr_trainer import PaddleOCRTrainer
-from worker.trainers.trainer_utils import require_positive_batch_size
+from worker.trainers.trainer_utils import require_positive_batch_size, split_image_dir
 from services.training_service import TrainingService
 
 
@@ -108,9 +134,16 @@ class TrainerLogicTests(unittest.TestCase):
                 {"ocr_task": "rec", "max_text_length": 12},
                 root / "run",
             )
-            self.assertIn(f"Train.dataset.data_dir={root.resolve()}", overrides)
-            self.assertIn(f"Train.dataset.label_file_list=[{label}]", overrides)
+            self.assertIn(f"Train.dataset.data_dir={root.resolve().as_posix()}", overrides)
+            self.assertIn(f"Train.dataset.label_file_list=['{label.resolve().as_posix()}']", overrides)
             self.assertIn("Global.max_text_length=12", overrides)
+
+    def test_yolo_split_image_dir_supports_images_train_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "images" / "train"
+            images.mkdir(parents=True)
+            self.assertEqual(split_image_dir(str(root), "train"), images)
 
     def test_paddle_overrides_reject_unimplemented_e2e_task(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -196,6 +229,18 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             self.assertIn("train: train/images", worker_text)
             self.assertIn("val: valid/images", worker_text)
             self.assertIn("test: test/images", worker_text)
+
+    def test_run_owner_reads_job_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._service(root)
+            run_dir = service.runs_dir / "existing_run"
+            run_dir.mkdir(parents=True)
+            (run_dir / "job_config.json").write_text(
+                json.dumps({"created_by": "owner-a"}),
+                encoding="utf-8",
+            )
+            self.assertEqual(service._run_owner("existing_run"), "owner-a")
 
 
 if __name__ == "__main__":

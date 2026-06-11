@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -23,6 +25,8 @@ class TesseractTrainer(BaseTrainer):
                 f"tesstrain was not found at {tesstrain_dir}. "
                 "Use the ocr-worker image or set TESSTRAIN_DIR."
             )
+        if shutil.which("make") is None:
+            raise RuntimeError("Tesseract training requires GNU make. Run the OCR worker in the Linux Docker image.")
 
         model_name = str(args.get("model_name", "custom"))
         start_model = str(args.get("start_model", "eng"))
@@ -45,7 +49,7 @@ class TesseractTrainer(BaseTrainer):
             f"TARGET_ERROR_RATE={float(args.get('target_error_rate', 0.01))}",
             f"RATIO_TRAIN={float(args.get('ratio_train', 0.9))}",
         ]
-        self._write_log(log_path, "[Tesseract] Running: " + " ".join(command))
+        self._write_log(log_path, "[Tesseract] Running: " + shlex.join(command))
 
         with open(log_path or output_dir / "train.log", "a", encoding="utf-8") as log_file:
             process = subprocess.Popen(command, stdout=log_file, stderr=subprocess.STDOUT)

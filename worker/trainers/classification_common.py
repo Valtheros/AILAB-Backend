@@ -150,7 +150,9 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     results_dir = runs_root() / config.get("project_name", "train_run")
     results_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = results_dir / "results.csv"
-    best_accuracy = -1.0
+    best_score = -1.0
+    best_validation_accuracy: float | None = None
+    best_train_accuracy = -1.0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -189,20 +191,25 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
             scheduler.step()
 
         train_accuracy = train_correct / max(train_total, 1)
-        val_accuracy = val_correct / max(val_total, 1) if val_total else train_accuracy
+        val_accuracy = val_correct / max(val_total, 1) if val_total else None
+        monitored_accuracy = val_accuracy if val_accuracy is not None else train_accuracy
+        if val_accuracy is not None:
+            best_validation_accuracy = max(best_validation_accuracy or -1.0, val_accuracy)
+        best_train_accuracy = max(best_train_accuracy, train_accuracy)
         row = {
             "epoch": epoch,
             "train/loss": train_loss / max(train_total, 1),
             "train/accuracy": train_accuracy,
             "val/loss": val_loss / max(val_total, 1) if val_total else "",
-            "val/accuracy": val_accuracy,
+            "val/accuracy": val_accuracy if val_accuracy is not None else "",
             "lr": optimizer.param_groups[0]["lr"],
         }
         append_csv_row(metrics_path, row)
-        logger(log_path, f"[{family}] epoch={epoch}/{epochs} train_acc={train_accuracy:.4f} val_acc={val_accuracy:.4f}")
+        val_display = f"{val_accuracy:.4f}" if val_accuracy is not None else "n/a"
+        logger(log_path, f"[{family}] epoch={epoch}/{epochs} train_acc={train_accuracy:.4f} val_acc={val_display}")
 
-        if val_accuracy >= best_accuracy:
-            best_accuracy = val_accuracy
+        if monitored_accuracy >= best_score:
+            best_score = monitored_accuracy
             torch.save({"model": model.state_dict(), "classes": train_dataset.classes, "config": config}, results_dir / "best.pt")
         torch.save({"model": model.state_dict(), "classes": train_dataset.classes, "config": config}, results_dir / "last.pt")
 
@@ -212,5 +219,6 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
         "model_type": family,
         "project_name": config.get("project_name", "train_run"),
         "results_dir": str(results_dir),
-        "best_accuracy": best_accuracy,
+        "best_accuracy": best_validation_accuracy,
+        "best_train_accuracy": best_train_accuracy,
     }
