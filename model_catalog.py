@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import subprocess
 from typing import Any
 
 
@@ -66,24 +67,61 @@ def _text(key: str, label: str, default: str = "", description: str = "") -> dic
     }
 
 
-COMMON_TRAINING_PARAMS = [
-    _number("epochs", "Epochs", 50, 1, 2000, 1, "Maximum training epochs."),
-    _number("batch_size", "Batch size", 16, 1, 256, 1, "Images processed in each training step."),
-    _select(
-        "device",
-        "Device",
-        "0",
-        [
-            {"value": "0", "label": "GPU 0"},
-            {"value": "0,1", "label": "GPU 0,1"},
-            {"value": "cpu", "label": "CPU"},
-        ],
-        "Torch-style device selector.",
-    ),
-    _number("workers", "Data workers", 4, 0, 32, 1, "DataLoader worker processes."),
-    _boolean("amp", "Mixed precision", True, "Use automatic mixed precision when CUDA is available."),
-    _number("seed", "Random seed", 0, 0, 999999, 1, "Seed for reproducible runs."),
-]
+def _detected_gpu_options() -> list[dict[str, str]]:
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return []
+
+    options: list[dict[str, str]] = []
+    for raw_line in result.stdout.splitlines():
+        parts = [part.strip() for part in raw_line.split(",", 2)]
+        if len(parts) != 3 or not parts[0].isdigit():
+            continue
+        index, name, memory_mb = parts
+        try:
+            memory_gb = int(memory_mb) / 1024
+            label = f"GPU {index} - {name} ({memory_gb:.1f} GB)"
+        except ValueError:
+            label = f"GPU {index} - {name}"
+        options.append({"value": index, "label": label})
+    return options
+
+
+def _device_options() -> list[dict[str, str]]:
+    return _detected_gpu_options() + [{"value": "cpu", "label": "CPU"}]
+
+
+def _common_training_params() -> list[dict[str, Any]]:
+    device_options = _device_options()
+    default_device = device_options[0]["value"]
+    return [
+        _number("epochs", "Epochs", 50, 1, 2000, 1, "Maximum training epochs."),
+        _number("batch_size", "Batch size", 16, 1, 256, 1, "Images processed in each training step."),
+        _select(
+            "device",
+            "Device",
+            default_device,
+            device_options,
+            "Available training devices detected from the deployment container.",
+        ),
+        _number("workers", "Data workers", 4, 0, 32, 1, "DataLoader worker processes."),
+        _boolean("amp", "Mixed precision", True, "Use automatic mixed precision when CUDA is available."),
+        _number("seed", "Random seed", 0, 0, 999999, 1, "Seed for reproducible runs."),
+    ]
+
+
+COMMON_TRAINING_PARAMS = _common_training_params()
 
 
 OPTIMIZER_PARAMS = [
@@ -326,8 +364,8 @@ CV_MODEL_CATALOG: dict[str, Any] = {
         {
             "id": "object_detection",
             "label": "Object Detection",
-            "description": "Train bounding-box detectors. YOLO remains available, with Faster R-CNN added as the second detector family.",
-            "dataset_formats": ["yolo_detection"],
+            "description": "Train bounding-box detectors. YOLO supports YOLO datasets, while Faster R-CNN supports YOLO and COCO boxes.",
+            "dataset_formats": ["yolo_detection", "coco_instances"],
             "models": [
                 {
                     "id": "yolo",
@@ -381,8 +419,8 @@ CV_MODEL_CATALOG: dict[str, Any] = {
                     "label": "Faster R-CNN",
                     "model_name": "fasterrcnn_resnet50_fpn_v2",
                     "runtime": "pytorch/pytorch + torchvision",
-                    "dataset_formats": ["yolo_detection"],
-                    "reason": "The most established two-stage detector in the provided choices and available directly in TorchVision.",
+                    "dataset_formats": ["yolo_detection", "coco_instances"],
+                    "reason": "The most established two-stage detector in the provided choices, available directly in TorchVision, and compatible with COCO boxes.",
                     "params": DETECTION_PARAMS,
                 },
             ],

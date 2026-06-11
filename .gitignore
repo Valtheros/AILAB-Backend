@@ -1,6 +1,9 @@
 #ignore run
 /runs
 
+# Environment files
+.env
+
 # Python cache
 __pycache__/
 *.pyc

@@ -118,6 +118,33 @@ class TrainingService:
                 continue
         raise FileNotFoundError(f"No uploaded dataset is compatible with {model_type}. Please upload or select one first.")
 
+    def _normalize_yolo_yaml_path(self, dataset_folder: Path, yaml_key: str, value: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"YOLO YAML '{yaml_key}' paths must be non-empty text")
+
+        normalized = value.strip().replace("\\", "/")
+        candidates = [normalized]
+        stripped = normalized
+        while stripped.startswith("../"):
+            stripped = stripped[3:]
+            candidates.append(stripped)
+        if stripped.startswith("./"):
+            candidates.append(stripped[2:])
+
+        seen: set[str] = set()
+        for candidate_value in candidates:
+            if candidate_value in seen:
+                continue
+            seen.add(candidate_value)
+            try:
+                candidate = contained_path(dataset_folder, candidate_value)
+            except ValueError:
+                continue
+            if candidate.exists():
+                return candidate_value
+
+        raise ValueError(f"YOLO YAML '{yaml_key}' path was not found inside the dataset: {value}")
+
     def _create_worker_yaml(self, original_yaml_path: Path, dataset_folder: Path) -> str:
         config = yaml.safe_load(original_yaml_path.read_text(encoding="utf-8")) or {}
         if not isinstance(config, dict):
@@ -129,13 +156,10 @@ class TrainingService:
             value = config.get(yaml_key)
             if value is None:
                 continue
-            values = value if isinstance(value, list) else [value]
-            for item in values:
-                if not isinstance(item, str) or not item.strip():
-                    raise ValueError(f"YOLO YAML '{yaml_key}' paths must be non-empty text")
-                candidate = contained_path(dataset_folder, item)
-                if not candidate.exists():
-                    raise ValueError(f"YOLO YAML '{yaml_key}' path was not found inside the dataset: {item}")
+            if isinstance(value, list):
+                config[yaml_key] = [self._normalize_yolo_yaml_path(dataset_folder, yaml_key, item) for item in value]
+            else:
+                config[yaml_key] = self._normalize_yolo_yaml_path(dataset_folder, yaml_key, value)
         if "train" not in config:
             raise ValueError("YOLO YAML requires a train path")
 

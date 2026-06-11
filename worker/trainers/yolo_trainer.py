@@ -32,10 +32,6 @@ class YOLOTrainer(BaseTrainer):
         extra_args.pop("model_size", None)
         extra_args.pop("epochs", None)
         extra_args.pop("batch_size", None)
-        extra_args.pop("device", None)
-        extra_args.pop("workers", None)
-        extra_args.pop("amp", None)
-        extra_args.pop("seed", None)
 
         self._write_log(log_path, f"[YOLOTrainer] model={model_name}, epochs={epochs}, batch={batch_size}")
         self._write_log(log_path, f"[YOLOTrainer] data={data_yaml}")

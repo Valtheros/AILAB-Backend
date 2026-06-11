@@ -90,30 +90,41 @@ def _iter_yolo_label_files(dataset_dir: Path) -> Iterable[Path]:
             yield label_path
 
 
-def _inspect_yolo_labels(dataset_dir: Path) -> tuple[bool, bool]:
-    has_label_file = False
-    has_segmentation_row = False
+def _inspect_yolo_labels(dataset_dir: Path) -> dict[str, int]:
+    stats = {"files": 0, "box_rows": 0, "polygon_rows": 0, "invalid_rows": 0}
 
     for label_path in _iter_yolo_label_files(dataset_dir):
-        has_label_file = True
+        stats["files"] += 1
         try:
             lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
         except OSError:
             continue
         for line in lines:
-            if len(line.strip().split()) > 5:
-                has_segmentation_row = True
+            parts = line.strip().split()
+            if not parts:
+                continue
+            if len(parts) == 5:
+                stats["box_rows"] += 1
+            elif len(parts) > 5:
+                stats["polygon_rows"] += 1
+            else:
+                stats["invalid_rows"] += 1
 
-    return has_label_file, has_segmentation_row
+    return stats
 
 
 def _imagefolder_classes(dataset_dir: Path) -> list[str]:
+    reserved_dir_names = {"image", "images", "label", "labels", "mask", "masks", "annotations"}
     for split_name in ("train", "training"):
         split_dir = dataset_dir / split_name
         if not split_dir.is_dir():
             continue
+        if (split_dir / "images").is_dir() and any((split_dir / name).is_dir() for name in ("labels", "masks")):
+            continue
         classes = []
         for item in split_dir.iterdir():
+            if item.name.lower() in reserved_dir_names:
+                continue
             if item.is_dir() and any(path.suffix.lower() in IMAGE_EXTENSIONS for path in item.rglob("*")):
                 classes.append(item.name)
         if classes:
@@ -168,16 +179,31 @@ def _has_tesseract_ground_truth(dataset_dir: Path) -> bool:
 def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     yaml_path = find_dataset_yaml(dataset_dir)
     classes = read_yaml_classes(yaml_path)
-    imagefolder_classes = _imagefolder_classes(dataset_dir)
-    if imagefolder_classes:
-        classes = imagefolder_classes
 
     formats: list[str] = []
     tasks: list[str] = []
+    warnings = []
 
     has_images = count_images(dataset_dir) > 0
     has_yolo_yaml = yaml_path is not None
-    has_yolo_labels, has_yolo_segmentation = _inspect_yolo_labels(dataset_dir)
+    yolo_stats = _inspect_yolo_labels(dataset_dir)
+    has_yolo_labels = yolo_stats["files"] > 0 and (yolo_stats["box_rows"] > 0 or yolo_stats["polygon_rows"] > 0)
+    has_yolo_detection = (
+        has_yolo_yaml
+        and has_yolo_labels
+        and yolo_stats["box_rows"] > 0
+        and yolo_stats["box_rows"] >= yolo_stats["polygon_rows"]
+    )
+    has_yolo_segmentation = (
+        has_yolo_yaml
+        and has_yolo_labels
+        and yolo_stats["polygon_rows"] > 0
+        and yolo_stats["polygon_rows"] > yolo_stats["box_rows"]
+    )
+    imagefolder_classes = [] if has_yolo_yaml and has_yolo_labels else _imagefolder_classes(dataset_dir)
+    if imagefolder_classes:
+        classes = imagefolder_classes
+
     has_semantic_masks = _has_semantic_masks(dataset_dir)
     coco_files = _find_coco_files(dataset_dir)
     has_paddleocr_labels = _has_paddleocr_labels(dataset_dir)
@@ -186,12 +212,17 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     if imagefolder_classes:
         formats.append("imagefolder")
         tasks.append("image_classification")
-    if has_yolo_yaml and has_yolo_labels and not has_yolo_segmentation:
+    if has_yolo_detection:
         formats.append("yolo_detection")
         tasks.append("object_detection")
-    if has_yolo_yaml and has_yolo_segmentation:
+    if has_yolo_segmentation:
         formats.append("yolo_segmentation")
         tasks.append("segmentation")
+    if has_yolo_yaml and yolo_stats["box_rows"] and yolo_stats["polygon_rows"]:
+        dominant = "box" if has_yolo_detection and not has_yolo_segmentation else "polygon"
+        warnings.append(
+            f"YOLO labels contain mixed box and polygon rows; using the dominant {dominant} format."
+        )
     if has_semantic_masks:
         formats.append("semantic_masks")
         tasks.append("segmentation")
@@ -207,7 +238,6 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
 
     formats = sorted(set(formats))
     tasks = sorted(set(tasks))
-    warnings = []
     if has_images and not formats:
         warnings.append("Images were found, but no supported annotation structure was detected.")
     if not has_images:

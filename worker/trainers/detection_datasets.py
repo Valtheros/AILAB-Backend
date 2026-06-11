@@ -145,11 +145,21 @@ class CocoInstanceDataset:
         return F.to_tensor(image), target
 
     def _find_annotation_file(self, split: str) -> Path | None:
-        names = [
-            f"instances_{split}.json",
-            f"{split}.json",
+        split_names = [split]
+        if split == "val":
+            split_names.extend(["valid", "validation"])
+        names = [name for split_name in split_names for name in (
+            f"instances_{split_name}.json",
+            f"{split_name}.json",
             "_annotations.coco.json",
-        ]
+        )]
+        for split_name in split_names:
+            split_dir = self.dataset_path / split_name
+            if split_dir.is_dir():
+                for name in names:
+                    candidate = split_dir / name
+                    if candidate.is_file():
+                        return candidate
         for name in names:
             for path in self.dataset_path.rglob(name):
                 return path

@@ -447,6 +447,23 @@ def list_runs(request: Request):
     return {"runs": training_service.list_runs(owner_id=_request_user_id(request))}
 
 
+@app.delete("/api/runs/{project_name}")
+def delete_run(project_name: str, request: Request):
+    try:
+        validate_slug(project_name, "project name")
+        _assert_run_visible(project_name, request)
+        project_dir = contained_path(RUNS_DIR, project_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not project_dir.exists() or not project_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        shutil.rmtree(project_dir)
+        return {"status": "success"}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{project_name}/files/{file_path:path}")
 def download_run_file(project_name: str, file_path: str, request: Request):
     try:

@@ -7,7 +7,9 @@ import types
 import unittest
 from pathlib import Path
 
-if "yaml" not in sys.modules:
+try:
+    import yaml as _yaml  # noqa: F401
+except Exception:
     sys.modules["yaml"] = types.SimpleNamespace(safe_load=lambda *_args, **_kwargs: {})
 if "PIL" not in sys.modules:
     sys.modules["PIL"] = types.SimpleNamespace(Image=types.SimpleNamespace(), ImageDraw=types.SimpleNamespace())
@@ -72,6 +74,29 @@ class TrainerLogicTests(unittest.TestCase):
             formats = inspect_dataset(root)["formats"]
             self.assertIn("yolo_detection", formats)
             self.assertNotIn("yolo_segmentation", formats)
+
+    def test_split_yolo_detection_is_not_misclassified_as_imagefolder(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "train" / "images"
+            labels = root / "train" / "labels"
+            images.mkdir(parents=True)
+            labels.mkdir(parents=True)
+            (root / "data.yaml").write_text(
+                "train: ../train/images\nnames: ['space-empty', 'space-occupied']",
+                encoding="utf-8",
+            )
+            (images / "image.jpg").write_bytes(b"not-an-image")
+            (labels / "image.txt").write_text(
+                "0 0.5 0.5 0.25 0.25\n"
+                "0 0.1 0.1 0.2 0.1 0.2 0.2 0.1 0.2",
+                encoding="utf-8",
+            )
+            metadata = inspect_dataset(root)
+            self.assertIn("yolo_detection", metadata["formats"])
+            self.assertNotIn("imagefolder", metadata["formats"])
+            self.assertNotIn("yolo_segmentation", metadata["formats"])
+            self.assertEqual(metadata["classes"], ["space-empty", "space-occupied"])
 
     def test_paddle_overrides_bind_uploaded_dataset(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -149,6 +174,28 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
                     "image_classification",
                     owner_id="owner-a",
                 )
+
+    def test_worker_yaml_normalizes_roboflow_parent_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            dataset = root / "car-park.yolov11"
+            (dataset / "train" / "images").mkdir(parents=True)
+            (dataset / "valid" / "images").mkdir(parents=True)
+            (dataset / "test" / "images").mkdir(parents=True)
+            yaml_path = dataset / "data.yaml"
+            yaml_path.write_text(
+                "train: ../train/images\n"
+                "val: ../valid/images\n"
+                "test: ../test/images\n"
+                "names: ['space-empty']\n",
+                encoding="utf-8",
+            )
+            service = self._service(root)
+            worker_yaml = Path(service._create_worker_yaml(yaml_path, dataset))
+            worker_text = worker_yaml.read_text(encoding="utf-8")
+            self.assertIn("train: train/images", worker_text)
+            self.assertIn("val: valid/images", worker_text)
+            self.assertIn("test: test/images", worker_text)
 
 
 if __name__ == "__main__":
