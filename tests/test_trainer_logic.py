@@ -59,6 +59,20 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("yolo_segmentation", formats)
             self.assertNotIn("yolo_detection", formats)
 
+    def test_nested_yolo_detection_layout_is_detected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "images" / "train"
+            labels = root / "labels" / "train"
+            images.mkdir(parents=True)
+            labels.mkdir(parents=True)
+            (root / "data.yaml").write_text("train: images/train\nnames: ['item']", encoding="utf-8")
+            (images / "image.jpg").write_bytes(b"not-an-image")
+            (labels / "image.txt").write_text("0 0.5 0.5 0.25 0.25", encoding="utf-8")
+            formats = inspect_dataset(root)["formats"]
+            self.assertIn("yolo_detection", formats)
+            self.assertNotIn("yolo_segmentation", formats)
+
     def test_paddle_overrides_bind_uploaded_dataset(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

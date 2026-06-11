@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -78,32 +78,33 @@ def read_yaml_classes(yaml_path: Path | None) -> list[str]:
     return []
 
 
-def _has_yolo_labels(dataset_dir: Path) -> bool:
-    for root, _, files in os.walk(dataset_dir):
-        root_path = Path(root)
-        if root_path.name != "labels":
+def _iter_yolo_label_files(dataset_dir: Path) -> Iterable[Path]:
+    for label_path in dataset_dir.rglob("*.txt"):
+        if not label_path.is_file():
             continue
-        if any(Path(file).suffix.lower() == ".txt" for file in files):
-            return True
-    return False
+        try:
+            relative_parts = {part.lower() for part in label_path.relative_to(dataset_dir).parts}
+        except ValueError:
+            continue
+        if "labels" in relative_parts:
+            yield label_path
 
 
-def _has_yolo_segmentation_labels(dataset_dir: Path) -> bool:
-    for root, _, files in os.walk(dataset_dir):
-        root_path = Path(root)
-        if root_path.name != "labels":
+def _inspect_yolo_labels(dataset_dir: Path) -> tuple[bool, bool]:
+    has_label_file = False
+    has_segmentation_row = False
+
+    for label_path in _iter_yolo_label_files(dataset_dir):
+        has_label_file = True
+        try:
+            lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
             continue
-        for file in files:
-            if Path(file).suffix.lower() != ".txt":
-                continue
-            label_path = root_path / file
-            try:
-                for line in label_path.read_text(encoding="utf-8").splitlines():
-                    if len(line.strip().split()) > 5:
-                        return True
-            except Exception:
-                continue
-    return False
+        for line in lines:
+            if len(line.strip().split()) > 5:
+                has_segmentation_row = True
+
+    return has_label_file, has_segmentation_row
 
 
 def _imagefolder_classes(dataset_dir: Path) -> list[str]:
@@ -176,8 +177,7 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
 
     has_images = count_images(dataset_dir) > 0
     has_yolo_yaml = yaml_path is not None
-    has_yolo_labels = _has_yolo_labels(dataset_dir)
-    has_yolo_segmentation = _has_yolo_segmentation_labels(dataset_dir)
+    has_yolo_labels, has_yolo_segmentation = _inspect_yolo_labels(dataset_dir)
     has_semantic_masks = _has_semantic_masks(dataset_dir)
     coco_files = _find_coco_files(dataset_dir)
     has_paddleocr_labels = _has_paddleocr_labels(dataset_dir)
