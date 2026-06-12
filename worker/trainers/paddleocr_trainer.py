@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from security_utils import contained_path, validate_slug
 from .base_trainer import BaseTrainer
 from .trainer_utils import extra, runs_root
 
@@ -19,11 +20,21 @@ class PaddleOCRTrainer(BaseTrainer):
         self.validate_config(config)
         args = extra(config)
 
-        paddle_root = Path(os.getenv("PADDLEOCR_ROOT", "/opt/PaddleOCR"))
-        train_script = Path(os.getenv("PADDLEOCR_TRAIN_SCRIPT", str(paddle_root / "tools" / "train.py")))
-        config_path = Path(str(args.get("config_path", "")))
-        if not config_path.is_absolute():
-            config_path = paddle_root / config_path
+        paddle_root = Path(os.getenv("PADDLEOCR_ROOT", "/opt/PaddleOCR")).resolve()
+        dataset_path = Path(config["dataset_path"]).resolve()
+        allowed_roots = self._allowed_roots(paddle_root, dataset_path)
+        train_script = self._resolve_required_path(
+            os.getenv("PADDLEOCR_TRAIN_SCRIPT", str(paddle_root / "tools" / "train.py")),
+            paddle_root,
+            allowed_roots,
+            "PaddleOCR training script",
+        )
+        config_path = self._resolve_required_path(
+            str(args.get("config_path", "")),
+            paddle_root,
+            allowed_roots,
+            "PaddleOCR config file",
+        )
 
         if not train_script.exists():
             raise RuntimeError(
@@ -33,8 +44,9 @@ class PaddleOCRTrainer(BaseTrainer):
         if not config_path.exists():
             raise RuntimeError(f"PaddleOCR config file was not found at {config_path}.")
 
-        project_name = config.get("project_name", "train_run")
-        output_dir = runs_root() / project_name
+        project_name = str(config.get("project_name", "train_run"))
+        validate_slug(project_name, "project name")
+        output_dir = contained_path(runs_root(), project_name)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         overrides = self._build_overrides(config, args, output_dir)
@@ -55,6 +67,39 @@ class PaddleOCRTrainer(BaseTrainer):
             "results_dir": str(output_dir),
         }
 
+    def _allowed_roots(self, paddle_root: Path, dataset_path: Path) -> list[Path]:
+        roots = [paddle_root.resolve(), dataset_path.resolve()]
+        for raw_root in os.getenv("PADDLEOCR_ALLOWED_PATHS", "").split(os.pathsep):
+            if raw_root.strip():
+                roots.append(Path(raw_root).resolve())
+        return roots
+
+    def _resolve_contained_path(self, value: str, default_root: Path, allowed_roots: list[Path], label: str) -> Path:
+        raw_value = str(value or "").strip()
+        if not raw_value:
+            raise ValueError(f"{label} is required")
+        raw_path = Path(raw_value)
+        if raw_path.is_absolute():
+            candidate = raw_path.resolve()
+        else:
+            candidate = contained_path(default_root, raw_path)
+        if not any(candidate.is_relative_to(root) for root in allowed_roots):
+            allowed = ", ".join(root.as_posix() for root in allowed_roots)
+            raise ValueError(f"{label} must be inside an allowed directory: {allowed}")
+        return candidate
+
+    def _resolve_required_path(self, value: str, default_root: Path, allowed_roots: list[Path], label: str) -> Path:
+        candidate = self._resolve_contained_path(value, default_root, allowed_roots, label)
+        if not candidate.exists():
+            raise RuntimeError(f"{label} was not found at {candidate}.")
+        return candidate
+
+    def _resolve_optional_path(self, value: object, default_root: Path, allowed_roots: list[Path], label: str) -> Path | None:
+        raw_value = str(value or "").strip()
+        if not raw_value:
+            return None
+        return self._resolve_contained_path(raw_value, default_root, allowed_roots, label)
+
     def _override_path(self, path: Path | str) -> str:
         return Path(path).resolve().as_posix()
 
@@ -64,6 +109,8 @@ class PaddleOCRTrainer(BaseTrainer):
 
     def _build_overrides(self, config: dict, args: dict, output_dir: Path) -> list[str]:
         dataset_path = Path(config["dataset_path"]).resolve()
+        paddle_root = Path(os.getenv("PADDLEOCR_ROOT", "/opt/PaddleOCR")).resolve()
+        allowed_roots = self._allowed_roots(paddle_root, dataset_path)
         task = str(args.get("ocr_task", "rec"))
         if task not in {"det", "rec"}:
             raise ValueError("PaddleOCR ocr_task must be either 'det' or 'rec'")
@@ -89,10 +136,22 @@ class PaddleOCRTrainer(BaseTrainer):
                     f"Eval.dataset.label_file_list={self._override_list(val_labels[0])}",
                 ]
             )
-        if args.get("pretrained_model"):
-            overrides.append(f"Global.pretrained_model={self._override_path(str(args['pretrained_model']))}")
-        if args.get("character_dict_path"):
-            overrides.append(f"Global.character_dict_path={self._override_path(str(args['character_dict_path']))}")
+        pretrained_model = self._resolve_optional_path(
+            args.get("pretrained_model"),
+            paddle_root,
+            allowed_roots,
+            "PaddleOCR pretrained model path",
+        )
+        if pretrained_model:
+            overrides.append(f"Global.pretrained_model={self._override_path(pretrained_model)}")
+        character_dict_path = self._resolve_optional_path(
+            args.get("character_dict_path"),
+            paddle_root,
+            allowed_roots,
+            "PaddleOCR character dictionary path",
+        )
+        if character_dict_path:
+            overrides.append(f"Global.character_dict_path={self._override_path(character_dict_path)}")
         if "use_space_char" in args:
             overrides.append(f"Global.use_space_char={bool(args['use_space_char'])}")
         if "batch_size_per_card" in args:

@@ -35,7 +35,7 @@ if "yaml" not in sys.modules:
     sys.modules["yaml"] = types.SimpleNamespace(safe_load=_safe_load_stub, dump=_dump_stub)
 
 from dataset_utils import safe_dataset_name
-from security_utils import contained_path, safe_extract_zip, validate_slug
+from security_utils import contained_path, named_file_lock, safe_extract_zip, validate_slug
 
 
 class SecurityUtilsTests(unittest.TestCase):
@@ -56,6 +56,16 @@ class SecurityUtilsTests(unittest.TestCase):
             root.mkdir()
             with self.assertRaises(ValueError):
                 contained_path(root, "../run-sibling/file.txt")
+
+
+    def test_named_file_lock_rejects_concurrent_same_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with named_file_lock(root, "shared_dataset", "dataset name"):
+                with self.assertRaises(FileExistsError):
+                    with named_file_lock(root, "shared_dataset", "dataset name"):
+                        pass
+            self.assertFalse((root / ".locks" / "shared_dataset.lock").exists())
 
     def test_safe_extract_rejects_parent_directory(self):
         archive = io.BytesIO()

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import tempfile
 import sys
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -138,6 +140,27 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn(f"Train.dataset.label_file_list=['{label.resolve().as_posix()}']", overrides)
             self.assertIn("Global.max_text_length=12", overrides)
 
+
+    def test_paddle_overrides_reject_path_outside_allowed_roots(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paddle_root = root / "PaddleOCR"
+            dataset = root / "dataset"
+            runs = root / "runs"
+            paddle_root.mkdir()
+            dataset.mkdir()
+            runs.mkdir()
+            (dataset / "rec_gt_train.txt").write_text("image.png\thello", encoding="utf-8")
+            outside = root / "outside_dict.txt"
+            outside.write_text("abc", encoding="utf-8")
+            with patch.dict(os.environ, {"PADDLEOCR_ROOT": str(paddle_root), "RUNS_DIR": str(runs)}, clear=False):
+                with self.assertRaises(ValueError):
+                    PaddleOCRTrainer()._build_overrides(
+                        {"dataset_path": str(dataset), "epochs": 1},
+                        {"ocr_task": "rec", "character_dict_path": str(outside)},
+                        runs / "run",
+                    )
+
     def test_yolo_split_image_dir_supports_images_train_layout(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -167,11 +190,36 @@ class TrainerLogicTests(unittest.TestCase):
                 dataset._resolve_image_path("../outside.png")
 
 
+class _FakeJob:
+    id = "job-1"
+
+    def __init__(self):
+        self.meta = {}
+
+    def save_meta(self):
+        pass
+
+
+class _FakeQueue:
+    def __init__(self):
+        self.jobs: list[tuple[str, dict]] = []
+
+    def enqueue(self, target: str, config: dict, **_kwargs):
+        self.jobs.append((target, config))
+        return _FakeJob()
+
+
 class TrainingServiceOwnershipTests(unittest.TestCase):
     def _service(self, root: Path) -> TrainingService:
         service = TrainingService.__new__(TrainingService)
         service.dataset_dir = root
         service.runs_dir = root / "runs"
+        return service
+
+    def _queued_service(self, root: Path) -> TrainingService:
+        service = self._service(root)
+        service.redis = object()
+        service.queues = {"cv_training": _FakeQueue(), "ocr_training": _FakeQueue()}
         return service
 
     def _imagefolder_dataset(self, root: Path, name: str, owner_id: str | None = None) -> Path:
@@ -229,6 +277,37 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             self.assertIn("train: train/images", worker_text)
             self.assertIn("val: valid/images", worker_text)
             self.assertIn("test: test/images", worker_text)
+
+
+    def test_start_training_reserves_project_name_globally(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._queued_service(root)
+            self._imagefolder_dataset(root, "dataset_a", owner_id="owner-a")
+
+            job_id = service.start_training_container(
+                task_type="image_classification",
+                model_type="resnet",
+                model_name="resnet50",
+                epochs=1,
+                batch_size=1,
+                project_name="shared_run",
+                dataset_name="dataset_a",
+                owner_id="owner-a",
+            )
+            self.assertEqual(job_id, "job-1")
+            self.assertTrue((service.runs_dir / "shared_run" / "job_config.json").is_file())
+            with self.assertRaises(FileExistsError):
+                service.start_training_container(
+                    task_type="image_classification",
+                    model_type="resnet",
+                    model_name="resnet50",
+                    epochs=1,
+                    batch_size=1,
+                    project_name="shared_run",
+                    dataset_name="dataset_a",
+                    owner_id="owner-b",
+                )
 
     def test_run_owner_reads_job_config(self):
         with tempfile.TemporaryDirectory() as temp:

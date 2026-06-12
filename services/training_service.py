@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -182,11 +183,10 @@ class TrainingService:
     ) -> str:
         self._ensure_redis()
         validate_slug(project_name, "project name")
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
         project_dir = contained_path(self.runs_dir, project_name)
         if project_dir.exists():
-            run_owner = self._run_owner(project_name)
-            if owner_id and run_owner != owner_id:
-                raise FileExistsError(f"Run '{project_name}' already exists.")
+            raise FileExistsError(f"Run '{project_name}' already exists.")
 
         dataset_path = (
             self._find_dataset_path(dataset_name, owner_id=owner_id)
@@ -219,13 +219,25 @@ class TrainingService:
 
         queue_name = self._queue_name_for_model(model_type)
         queue = self.queues[queue_name]
-        job = queue.enqueue(
-            "worker_app.run_training",
-            job_config,
-            job_timeout="24h",
-            result_ttl=86400,
-            failure_ttl=86400,
-        )
+        reserved_project_dir = False
+        try:
+            project_dir.mkdir(parents=False, exist_ok=False)
+            reserved_project_dir = True
+            (project_dir / "job_config.json").write_text(json.dumps(job_config, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            job = queue.enqueue(
+                "worker_app.run_training",
+                job_config,
+                job_timeout="24h",
+                result_ttl=86400,
+                failure_ttl=86400,
+            )
+        except FileExistsError as exc:
+            raise FileExistsError(f"Run '{project_name}' already exists.") from exc
+        except Exception:
+            if reserved_project_dir:
+                shutil.rmtree(project_dir, ignore_errors=True)
+            raise
 
         job.meta["project_name"] = project_name
         job.meta["model_type"] = model_type

@@ -5,6 +5,7 @@ import re
 import shutil
 import stat
 import tempfile
+from contextlib import contextmanager
 import uuid
 import zipfile
 from pathlib import Path, PurePosixPath
@@ -42,6 +43,26 @@ def contained_path(root: Path, *parts: str | Path) -> Path:
     if not candidate.is_relative_to(root_path):
         raise ValueError(f"Path escapes configured root: {candidate}")
     return candidate
+
+
+@contextmanager
+def named_file_lock(root: Path, name: str, label: str = "resource"):
+    validate_slug(name, label)
+    locks_dir = contained_path(root, ".locks")
+    locks_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = contained_path(locks_dir, f"{name}.lock")
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.write(descriptor, str(os.getpid()).encode("utf-8"))
+        except FileExistsError as exc:
+            raise FileExistsError(f"{label.title()} '{name}' is already being written.") from exc
+        yield lock_path
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+            lock_path.unlink(missing_ok=True)
 
 
 def _validate_archive_member(member: zipfile.ZipInfo, target_dir: Path) -> None:

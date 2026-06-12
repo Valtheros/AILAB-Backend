@@ -23,6 +23,7 @@ from dataset_utils import (
 from model_catalog import get_catalog, get_model, validate_model_params
 from security_utils import (
     contained_path,
+    named_file_lock,
     replace_directory,
     safe_extract_zip,
     save_upload_to_temp,
@@ -396,35 +397,38 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
     temp_zip_path: Path | None = None
 
     try:
-        target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
-        request_owner = _request_user_id(request)
-        if request_owner and target_owner and target_owner != request_owner:
-            raise HTTPException(
-                status_code=409,
-                detail="Dataset name already exists. Rename the ZIP and upload again.",
-            )
+        with named_file_lock(DATASET_DIR, dataset_name, "dataset name"):
+            target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
+            request_owner = _request_user_id(request)
+            if request_owner and target_owner and target_owner != request_owner:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dataset name already exists. Rename the ZIP and upload again.",
+                )
 
-        temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
-        with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
-            extract_dir = staging_dir / "extracted"
-            _safe_extract(zip_ref, extract_dir)
+            temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
+            with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
+                extract_dir = staging_dir / "extracted"
+                _safe_extract(zip_ref, extract_dir)
 
-        _flatten_single_root_folder(extract_dir)
-        metadata = validate_dataset_for_upload(extract_dir)
-        replace_directory(extract_dir, target_dir)
-        _write_dataset_owner(target_dir, request)
+            _flatten_single_root_folder(extract_dir)
+            metadata = validate_dataset_for_upload(extract_dir)
+            replace_directory(extract_dir, target_dir)
+            _write_dataset_owner(target_dir, request)
 
-        return {
-            "status": "success",
-            "dataset_name": dataset_name,
-            "tasks": metadata["tasks"],
-            "formats": metadata["formats"],
-            "classes": metadata["classes"],
-        }
+            return {
+                "status": "success",
+                "dataset_name": dataset_name,
+                "tasks": metadata["tasks"],
+                "formats": metadata["formats"],
+                "classes": metadata["classes"],
+            }
     except HTTPException:
         raise
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid ZIP file")
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
