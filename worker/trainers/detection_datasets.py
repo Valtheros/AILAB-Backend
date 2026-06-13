@@ -76,9 +76,10 @@ class YoloBoxDataset:
 
 
 class CocoInstanceDataset:
-    def __init__(self, dataset_path: str, split: str = "train"):
+    def __init__(self, dataset_path: str, split: str = "train", include_masks: bool = True):
         self.dataset_path = Path(dataset_path)
         self.split = split
+        self.include_masks = include_masks
         annotation_path = self._find_annotation_file(split)
         if annotation_path is None:
             raise ValueError(f"No COCO annotation file found for split '{split}'.")
@@ -123,7 +124,8 @@ class CocoInstanceDataset:
                 continue
             boxes.append([x, y, x + box_width, y + box_height])
             labels.append(self.category_to_label.get(annotation.get("category_id"), 1))
-            masks.append(self._annotation_mask(annotation, width, height))
+            if self.include_masks:
+                masks.append(self._annotation_mask(annotation, width, height))
             iscrowd.append(int(annotation.get("iscrowd", 0)))
 
         target = {
@@ -132,10 +134,11 @@ class CocoInstanceDataset:
             "image_id": torch.tensor([image_id]),
             "iscrowd": torch.as_tensor(iscrowd, dtype=torch.int64),
         }
-        if masks:
-            target["masks"] = torch.stack(masks)
-        else:
-            target["masks"] = torch.zeros((0, height, width), dtype=torch.uint8)
+        if self.include_masks:
+            if masks:
+                target["masks"] = torch.stack(masks)
+            else:
+                target["masks"] = torch.zeros((0, height, width), dtype=torch.uint8)
         if boxes:
             target["area"] = (target["boxes"][:, 3] - target["boxes"][:, 1]) * (
                 target["boxes"][:, 2] - target["boxes"][:, 0]
@@ -183,6 +186,7 @@ class CocoInstanceDataset:
         raise FileNotFoundError(f"COCO image '{file_name}' was not found under {self.dataset_path}")
 
     def _annotation_mask(self, annotation: dict, width: int, height: int):
+        import numpy as np
         import torch
 
         mask_image = Image.new("L", (width, height), 0)
@@ -202,4 +206,4 @@ class CocoInstanceDataset:
             if getattr(decoded, "ndim", 0) == 3:
                 decoded = decoded[:, :, 0]
             return torch.as_tensor(decoded, dtype=torch.uint8)
-        return torch.as_tensor(mask_image, dtype=torch.uint8)
+        return torch.as_tensor(np.array(mask_image, dtype=np.uint8), dtype=torch.uint8)

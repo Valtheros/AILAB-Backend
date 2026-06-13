@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bc \
     tesseract-ocr \
     tesseract-ocr-eng \
+    tesseract-ocr-tha \
     libtesseract-dev \
     libleptonica-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -36,5 +37,6 @@ COPY . .
 
 ENV PADDLEOCR_ROOT=/opt/PaddleOCR
 ENV TESSTRAIN_DIR=/opt/tesstrain
+ENV TESSERACT_START_MODELS=eng:English,tha:Thai
 
 CMD ["rq", "worker", "--url", "redis://redis:6379", "ocr_training"]

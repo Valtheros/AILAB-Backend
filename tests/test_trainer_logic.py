@@ -50,11 +50,13 @@ if "rq.command" not in sys.modules:
 if "rq.job" not in sys.modules:
     sys.modules["rq.job"] = types.SimpleNamespace(Job=types.SimpleNamespace, JobStatus=types.SimpleNamespace)
 
-from dataset_utils import inspect_dataset
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, normalize_dataset_for_training, validate_dataset_for_upload
 from worker.trainers.classification_common import _batch_size_for
+from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
 from worker.trainers.paddleocr_trainer import PaddleOCRTrainer
 from worker.trainers.trainer_utils import require_positive_batch_size, split_image_dir
+from model_catalog import get_catalog
 from services.training_service import TrainingService
 
 
@@ -65,7 +67,7 @@ class TrainerLogicTests(unittest.TestCase):
     def test_ocr_formats_are_detected_independently(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            (root / "image.png").write_bytes(b"not-an-image")
+            (root / "sample.png").write_bytes(b"not-an-image")
             (root / "sample.gt.txt").write_text("hello", encoding="utf-8")
             metadata = inspect_dataset(root)
             self.assertIn("tesseract_ground_truth", metadata["formats"])
@@ -124,7 +126,215 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("yolo_detection", metadata["formats"])
             self.assertNotIn("imagefolder", metadata["formats"])
             self.assertNotIn("yolo_segmentation", metadata["formats"])
+            self.assertFalse(metadata["errors"])
             self.assertEqual(metadata["classes"], ["space-empty", "space-occupied"])
+
+
+    def test_yolo_segmentation_upload_is_rejected_until_supported(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "train" / "images"
+            labels = root / "train" / "labels"
+            images.mkdir(parents=True)
+            labels.mkdir(parents=True)
+            (root / "data.yaml").write_text("train: train/images\nnames: ['item']", encoding="utf-8")
+            (images / "image.jpg").write_bytes(b"not-an-image")
+            (labels / "image.txt").write_text("0 0 0 1 0 1 1 0 1", encoding="utf-8")
+            self.assertIn("yolo_segmentation", inspect_dataset(root)["formats"])
+            with self.assertRaises(ValueError):
+                validate_dataset_for_upload(root)
+
+    def test_coco_box_only_advertises_detection_not_segmentation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg"}],
+                        "categories": [{"id": 1, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata = inspect_dataset(root)
+            self.assertIn("coco_instances", metadata["formats"])
+            self.assertIn("object_detection", metadata["tasks"])
+            self.assertNotIn("segmentation", metadata["tasks"])
+            self.assertEqual(metadata["classes"], ["space"])
+
+    def test_coco_box_dataset_normalizes_to_yolo_detection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 5, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 5, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata = normalize_dataset_for_training(root)
+            validate_dataset_for_upload(root)
+            ready = {item["id"] for item in compatible_models_for_metadata(metadata, get_catalog()) if item["ready"]}
+
+            self.assertIn("coco_instances", metadata["formats"])
+            self.assertIn("yolo_detection", metadata["formats"])
+            self.assertTrue((root / ".ailab_normalized" / "yolo_detection" / "data.yaml").is_file())
+            self.assertIn("yolo", ready)
+            self.assertIn("faster_rcnn", ready)
+            self.assertNotIn("mask_rcnn", ready)
+
+    def test_tesseract_ground_truth_exports_paddleocr_rec_labels(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "line_001.png").write_bytes(b"not-an-image")
+            (root / "line_001.gt.txt").write_text("hello", encoding="utf-8")
+            metadata = normalize_dataset_for_training(root)
+            validate_dataset_for_upload(root)
+
+            self.assertIn("tesseract_ground_truth", metadata["formats"])
+            self.assertIn("paddleocr_labels", metadata["formats"])
+            self.assertIn("rec", metadata["paddleocr_tasks"])
+            self.assertTrue((root / ".ailab_normalized" / "paddleocr_rec" / "rec_gt_train.txt").is_file())
+
+    def test_paddleocr_rec_labels_export_tesseract_ground_truth(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "line_001.png").write_bytes(b"not-an-image")
+            (root / "rec_gt_train.txt").write_text("line_001.png\thello", encoding="utf-8")
+            metadata = normalize_dataset_for_training(root)
+            validate_dataset_for_upload(root)
+
+            self.assertIn("paddleocr_labels", metadata["formats"])
+            self.assertIn("tesseract_ground_truth", metadata["formats"])
+            self.assertGreater(metadata["tesseract"]["pairs"], 0)
+
+    def test_coco_missing_images_are_rejected_on_upload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "orphan.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "missing.jpg"}],
+                        "categories": [{"id": 1, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "COCO annotations reference"):
+                validate_dataset_for_upload(root)
+
+    def test_semantic_upload_rejects_missing_masks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "train" / "images"
+            masks = root / "train" / "masks"
+            images.mkdir(parents=True)
+            masks.mkdir(parents=True)
+            (images / "image_001.jpg").write_bytes(b"not-an-image")
+            (images / "image_002.jpg").write_bytes(b"not-an-image")
+            (masks / "image_002.png").write_bytes(b"not-a-mask")
+            with self.assertRaisesRegex(ValueError, "Semantic masks are missing"):
+                validate_dataset_for_upload(root)
+
+    def test_coco_polygon_mask_returns_uint8_tensor(self):
+        captured = {}
+
+        def as_tensor(value, dtype=None):
+            captured["value"] = value
+            return types.SimpleNamespace(
+                dtype=dtype,
+                shape=getattr(value, "shape", None),
+                sum=lambda: types.SimpleNamespace(item=lambda: int(value.sum())),
+            )
+
+        class FakeMaskImage:
+            def __init__(self, size, fill):
+                self.width, self.height = size
+                self._data = [fill] * (self.width * self.height)
+
+            def getdata(self):
+                return self._data
+
+            def fill_polygon(self):
+                self._data[0] = 1
+
+        class FakeImageModule:
+            @staticmethod
+            def new(_mode, size, fill):
+                return FakeMaskImage(size, fill)
+
+        class FakeImageDrawModule:
+            @staticmethod
+            def Draw(image):
+                return types.SimpleNamespace(polygon=lambda *_args, **_kwargs: image.fill_polygon())
+
+        class FakeArray:
+            def __init__(self, image):
+                self.shape = (image.height, image.width)
+                self._sum = sum(image.getdata())
+
+            def sum(self):
+                return self._sum
+
+        dataset = CocoInstanceDataset.__new__(CocoInstanceDataset)
+        fake_torch = types.SimpleNamespace(uint8="uint8", as_tensor=as_tensor)
+        fake_numpy = types.SimpleNamespace(uint8="uint8", array=lambda image, dtype=None: FakeArray(image))
+        with patch.object(detection_datasets_module, "Image", FakeImageModule):
+            with patch.object(detection_datasets_module, "ImageDraw", FakeImageDrawModule):
+                with patch.dict(sys.modules, {"torch": fake_torch, "numpy": fake_numpy}):
+                    mask = dataset._annotation_mask({"segmentation": [[0, 0, 2, 0, 2, 2, 0, 2]]}, 4, 4)
+
+        self.assertEqual(mask.dtype, "uint8")
+        self.assertEqual(tuple(mask.shape), (4, 4))
+        self.assertGreater(int(mask.sum().item()), 0)
+        self.assertFalse(isinstance(captured["value"], FakeMaskImage))
+
+    def test_coco_box_dataset_can_omit_masks_for_faster_rcnn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            image_path = train / "image_001.jpg"
+            try:
+                from PIL import Image
+
+                Image.new("RGB", (8, 8), "white").save(image_path)
+            except Exception:
+                image_path.write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 8, "height": 8}],
+                        "categories": [{"id": 1, "name": "space"}],
+                        "annotations": [
+                            {
+                                "id": 1,
+                                "image_id": 1,
+                                "category_id": 1,
+                                "bbox": [1, 1, 4, 4],
+                                "segmentation": [[1, 1, 5, 1, 5, 5, 1, 5]],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            dataset = CocoInstanceDataset(str(root), "train", include_masks=False)
+            self.assertFalse(dataset.include_masks)
 
     def test_paddle_overrides_bind_uploaded_dataset(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -278,6 +488,75 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             self.assertIn("val: valid/images", worker_text)
             self.assertIn("test: test/images", worker_text)
 
+
+    def test_paddleocr_task_mismatch_is_rejected_before_enqueue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._service(root)
+            dataset = root / "paddle_det"
+            dataset.mkdir()
+            (dataset / "image_001.jpg").write_bytes(b"not-an-image")
+            (dataset / "det_gt_train.txt").write_text("image_001.jpg\t[]", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "selected PaddleOCR task"):
+                service._assert_dataset_matches_model(
+                    dataset,
+                    "paddleocr",
+                    "ocr",
+                    extra_args={"ocr_task": "rec"},
+                )
+
+    def test_mask_rcnn_rejects_coco_box_only_dataset(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._service(root)
+            dataset = root / "coco_box"
+            train = dataset / "train"
+            train.mkdir(parents=True)
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg"}],
+                        "categories": [{"id": 1, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "does not advertise task 'segmentation'"):
+                service._assert_dataset_matches_model(dataset, "mask_rcnn", "segmentation")
+
+    def test_faster_rcnn_coco_dataset_does_not_get_worker_yaml(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._queued_service(root)
+            dataset = root / "coco_box"
+            train = dataset / "train"
+            train.mkdir(parents=True)
+            (dataset / "data.yaml").write_text("train: train/images\nnames: ['space']", encoding="utf-8")
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg"}],
+                        "categories": [{"id": 1, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            job_id = service.start_training_container(
+                task_type="object_detection",
+                model_type="faster_rcnn",
+                model_name="fasterrcnn_resnet50_fpn_v2",
+                epochs=1,
+                batch_size=1,
+                project_name="coco_run",
+                dataset_name="coco_box",
+            )
+            self.assertEqual(job_id, "job-1")
+            queued_config = service.queues["cv_training"].jobs[0][1]
+            self.assertIsNone(queued_config["data_yaml_path"])
 
     def test_start_training_reserves_project_name_globally(self):
         with tempfile.TemporaryDirectory() as temp:

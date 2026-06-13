@@ -14,9 +14,11 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from dataset_utils import (
+    dataset_workflow_metadata,
     find_dataset_yaml,
     format_bytes,
     inspect_dataset,
+    normalize_dataset_for_training,
     safe_dataset_name,
     validate_dataset_for_upload,
 )
@@ -104,16 +106,21 @@ def _dataset_owner(dataset_dir: Path) -> str | None:
     return str(owner) if owner else None
 
 
-def _write_dataset_owner(dataset_dir: Path, request: Request) -> None:
+def _write_dataset_metadata(dataset_dir: Path, request: Request, workflow: dict[str, Any] | None = None) -> None:
+    metadata = _read_json_file(_dataset_meta_path(dataset_dir))
     owner_id = _request_user_id(request)
-    if not owner_id:
-        return
-    metadata = {
-        "created_by": owner_id,
-        "created_by_email": _request_user_email(request),
-        "created_at": int(time.time()),
-    }
-    _dataset_meta_path(dataset_dir).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    if owner_id:
+        metadata.update(
+            {
+                "created_by": owner_id,
+                "created_by_email": _request_user_email(request),
+                "created_at": metadata.get("created_at") or int(time.time()),
+            }
+        )
+    if workflow:
+        metadata.update({"workflow": workflow})
+    if metadata:
+        _dataset_meta_path(dataset_dir).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def _assert_owned_resource_visible(owner_id: str | None, request: Request) -> None:
@@ -185,6 +192,128 @@ def _flatten_single_root_folder(target_dir: Path) -> None:
     for item in single_dir.iterdir():
         shutil.move(str(item), str(target_dir / item.name))
     single_dir.rmdir()
+
+
+def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
+    workflow = dataset_workflow_metadata(metadata, get_catalog())
+    ready_models = [model for model in workflow.get("compatible_models", []) if model.get("ready")]
+    return {
+        "tasks": metadata["tasks"],
+        "formats": metadata["formats"],
+        "classes": metadata["classes"],
+        "image_count": metadata["image_count"],
+        "size_bytes": metadata["size_bytes"],
+        "warnings": metadata.get("warnings", []),
+        "errors": metadata.get("errors", []),
+        "paddleocr_tasks": metadata.get("paddleocr_tasks", []),
+        "source_format": workflow["source_format"],
+        "canonical_task": workflow["canonical_task"],
+        "normalized_formats": workflow["normalized_formats"],
+        "annotation_stats": workflow["annotation_stats"],
+        "conversion_warnings": workflow.get("conversion_warnings", []),
+        "compatible_models": workflow.get("compatible_models", []),
+        "ready_models": ready_models,
+    }
+
+
+def _dataset_response(dataset_name: str, metadata: dict[str, Any]) -> dict[str, Any]:
+    profile = _dataset_profile(metadata)
+    return {
+        "status": "success",
+        "dataset_name": dataset_name,
+        "tasks": profile["tasks"],
+        "formats": profile["formats"],
+        "classes": profile["classes"],
+        "paddleocrTasks": profile["paddleocr_tasks"],
+        "sourceFormat": profile["source_format"],
+        "canonicalTask": profile["canonical_task"],
+        "normalizedFormats": profile["normalized_formats"],
+        "annotationStats": profile["annotation_stats"],
+        "conversionWarnings": profile["conversion_warnings"],
+        "compatibleModels": profile["compatible_models"],
+        "readyModels": profile["ready_models"],
+    }
+
+
+async def _inspect_uploaded_zip(file: UploadFile) -> tuple[str, dict[str, Any]]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are supported")
+
+    dataset_name = safe_dataset_name(file.filename)
+    staging_dir = staging_directory(DATASET_DIR)
+    temp_zip_path: Path | None = None
+    try:
+        temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
+        with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
+            extract_dir = staging_dir / "extracted"
+            _safe_extract(zip_ref, extract_dir)
+        _flatten_single_root_folder(extract_dir)
+        metadata = normalize_dataset_for_training(extract_dir)
+        validate_dataset_for_upload(extract_dir)
+        return dataset_name, metadata
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid ZIP file")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if temp_zip_path and temp_zip_path.exists():
+            temp_zip_path.unlink()
+
+
+async def _import_uploaded_zip(request: Request, file: UploadFile) -> dict[str, Any]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    if not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip files are supported")
+
+    dataset_name = safe_dataset_name(file.filename)
+    try:
+        validate_slug(dataset_name, "dataset name")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    target_dir = contained_path(DATASET_DIR, dataset_name)
+    staging_dir = staging_directory(DATASET_DIR)
+    temp_zip_path: Path | None = None
+
+    try:
+        with named_file_lock(DATASET_DIR, dataset_name, "dataset name"):
+            target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
+            request_owner = _request_user_id(request)
+            if request_owner and target_owner and target_owner != request_owner:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Dataset name already exists. Rename the ZIP and upload again.",
+                )
+
+            temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
+            with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
+                extract_dir = staging_dir / "extracted"
+                _safe_extract(zip_ref, extract_dir)
+
+            _flatten_single_root_folder(extract_dir)
+            metadata = normalize_dataset_for_training(extract_dir)
+            validate_dataset_for_upload(extract_dir)
+            replace_directory(extract_dir, target_dir)
+            workflow = dataset_workflow_metadata(metadata, get_catalog())
+            _write_dataset_metadata(target_dir, request, workflow)
+            return _dataset_response(dataset_name, metadata)
+    except HTTPException:
+        raise
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid ZIP file")
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if temp_zip_path and temp_zip_path.exists():
+            temp_zip_path.unlink()
 
 
 @app.get("/")
@@ -360,6 +489,7 @@ def list_datasets(request: Request):
             continue
 
         metadata = inspect_dataset(item)
+        profile = _dataset_profile(metadata)
         created = time.strftime("%Y-%m-%d", time.localtime(item.stat().st_ctime))
         datasets.append(
             {
@@ -372,7 +502,16 @@ def list_datasets(request: Request):
                 "tasks": metadata["tasks"],
                 "formats": metadata["formats"],
                 "warnings": metadata["warnings"],
+                "errors": metadata.get("errors", []),
                 "yamlPath": metadata["yaml_path"],
+                "paddleocrTasks": metadata.get("paddleocr_tasks", []),
+                "sourceFormat": profile["source_format"],
+                "canonicalTask": profile["canonical_task"],
+                "normalizedFormats": profile["normalized_formats"],
+                "annotationStats": profile["annotation_stats"],
+                "conversionWarnings": profile["conversion_warnings"],
+                "compatibleModels": profile["compatible_models"],
+                "readyModels": profile["ready_models"],
                 "createdBy": owner_id,
             }
         )
@@ -380,63 +519,20 @@ def list_datasets(request: Request):
     return {"datasets": datasets}
 
 
+@app.post("/api/datasets/inspect-upload")
+async def inspect_dataset_upload(file: UploadFile = File(...)):
+    dataset_name, metadata = await _inspect_uploaded_zip(file)
+    return {"status": "success", "dataset_name": dataset_name, "profile": _dataset_profile(metadata)}
+
+
+@app.post("/api/datasets/import")
+async def import_dataset(request: Request, file: UploadFile = File(...)):
+    return await _import_uploaded_zip(request, file)
+
+
 @app.post("/api/upload-dataset")
 async def upload_dataset(request: Request, file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are supported")
-
-    dataset_name = safe_dataset_name(file.filename)
-    try:
-        validate_slug(dataset_name, "dataset name")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    target_dir = contained_path(DATASET_DIR, dataset_name)
-    staging_dir = staging_directory(DATASET_DIR)
-    temp_zip_path: Path | None = None
-
-    try:
-        with named_file_lock(DATASET_DIR, dataset_name, "dataset name"):
-            target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
-            request_owner = _request_user_id(request)
-            if request_owner and target_owner and target_owner != request_owner:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Dataset name already exists. Rename the ZIP and upload again.",
-                )
-
-            temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
-            with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
-                extract_dir = staging_dir / "extracted"
-                _safe_extract(zip_ref, extract_dir)
-
-            _flatten_single_root_folder(extract_dir)
-            metadata = validate_dataset_for_upload(extract_dir)
-            replace_directory(extract_dir, target_dir)
-            _write_dataset_owner(target_dir, request)
-
-            return {
-                "status": "success",
-                "dataset_name": dataset_name,
-                "tasks": metadata["tasks"],
-                "formats": metadata["formats"],
-                "classes": metadata["classes"],
-            }
-    except HTTPException:
-        raise
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="Invalid ZIP file")
-    except FileExistsError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if temp_zip_path and temp_zip_path.exists():
-            temp_zip_path.unlink()
+    return await _import_uploaded_zip(request, file)
 
 
 @app.delete("/api/datasets/{dataset_name}")
@@ -504,4 +600,19 @@ def dataset_metadata(dataset_name: str, request: Request):
     _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     metadata = inspect_dataset(target_dir)
     metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
+    metadata.update(_dataset_profile(metadata))
     return metadata
+
+
+@app.get("/api/datasets/{dataset_name}/compatibility")
+def dataset_compatibility(dataset_name: str, request: Request):
+    try:
+        validate_slug(dataset_name, "dataset name")
+        target_dir = contained_path(DATASET_DIR, dataset_name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not target_dir.exists():
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    _assert_owned_resource_visible(_dataset_owner(target_dir), request)
+    metadata = inspect_dataset(target_dir)
+    return {"dataset_name": dataset_name, **_dataset_profile(metadata)}

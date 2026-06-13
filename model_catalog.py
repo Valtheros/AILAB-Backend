@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
+from pathlib import Path
 import subprocess
 from typing import Any
 
@@ -268,8 +270,113 @@ OCR_COMMON_PARAMS = [
 ]
 
 
+PADDLEOCR_BASE_MODEL_PRESETS = [
+    {
+        "id": "ppocrv4-rec",
+        "label": "PP-OCRv4 Recognition",
+        "task": "rec",
+        "config_path": "/opt/PaddleOCR/configs/rec/PP-OCRv4/ch_PP-OCRv4_rec.yml",
+        "pretrained_model": "",
+        "labels": ["rec_gt_train.txt", "rec_gt_val.txt"],
+        "description": "General text recognition. The PaddleOCR config provides the default starting weights unless a checkpoint is selected.",
+        "available": True,
+    },
+    {
+        "id": "ppocrv4-det",
+        "label": "PP-OCRv4 Detection",
+        "task": "det",
+        "config_path": "/opt/PaddleOCR/configs/det/ch_PP-OCRv4/ch_PP-OCRv4_det.yml",
+        "pretrained_model": "",
+        "labels": ["det_gt_train.txt", "det_gt_val.txt"],
+        "description": "General text detection for boxes or polygons. The PaddleOCR config provides the default starting weights unless a checkpoint is selected.",
+        "available": True,
+    },
+]
+
+
+DEFAULT_TESSERACT_BASE_MODELS = {
+    "eng": {
+        "label": "English",
+        "description": "Bundled with the OCR worker image and suitable as a default Latin-script start model.",
+        "available": True,
+    },
+    "tha": {
+        "label": "Thai",
+        "description": "Bundled with the OCR worker image for Thai language and font adaptation.",
+        "available": True,
+    },
+}
+
+
+def _configured_tesseract_base_models() -> dict[str, dict[str, Any]]:
+    configured: dict[str, dict[str, Any]] = {}
+    raw_value = os.getenv("TESSERACT_START_MODELS", "")
+    for raw_item in raw_value.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        code, _, label = item.partition(":")
+        code = code.strip()
+        if not code:
+            continue
+        configured[code] = {
+            "label": label.strip() or code,
+            "description": "Configured by TESSERACT_START_MODELS.",
+            "available": True,
+        }
+    return configured
+
+
+def _detected_tessdata_codes() -> set[str]:
+    roots = [
+        os.getenv("TESSDATA_PREFIX", ""),
+        "/usr/share/tesseract-ocr/5/tessdata",
+        "/usr/share/tesseract-ocr/4.00/tessdata",
+        "/usr/share/tessdata",
+        "/usr/local/share/tessdata",
+    ]
+    codes: set[str] = set()
+    for raw_root in roots:
+        if not raw_root:
+            continue
+        root = Path(raw_root)
+        if not root.exists():
+            continue
+        for path in root.glob("*.traineddata"):
+            codes.add(path.stem)
+    return codes
+
+
+def _tesseract_base_model_presets() -> list[dict[str, Any]]:
+    detected = _detected_tessdata_codes()
+    entries = deepcopy(DEFAULT_TESSERACT_BASE_MODELS)
+    entries.update(_configured_tesseract_base_models())
+
+    for code in detected:
+        entries.setdefault(
+            code,
+            {
+                "label": code,
+                "description": "Detected from installed Tesseract traineddata files.",
+                "available": True,
+            },
+        )
+        entries[code]["available"] = True
+
+    return [
+        {
+            "id": code,
+            "value": code,
+            "label": f"{meta['label']} ({code})",
+            "description": meta["description"],
+            "available": bool(meta["available"]),
+        }
+        for code, meta in sorted(entries.items(), key=lambda item: (not item[1]["available"], item[0]))
+    ]
+
+
 CV_MODEL_CATALOG: dict[str, Any] = {
-    "version": "2026-05-31",
+    "version": "2026-06-13",
     "common_params": COMMON_TRAINING_PARAMS,
     "tasks": [
         {
@@ -337,6 +444,7 @@ CV_MODEL_CATALOG: dict[str, Any] = {
                     "runtime": "paddlepaddle/paddle + PaddleOCR",
                     "dataset_formats": ["paddleocr_labels"],
                     "reason": "PaddleOCR has an official Docker-based workflow for text detection and recognition training.",
+                    "base_model_presets": PADDLEOCR_BASE_MODEL_PRESETS,
                     "params": [
                         _text("config_path", "PaddleOCR config path", "/opt/PaddleOCR/configs/rec/PP-OCRv4/ch_PP-OCRv4_rec.yml"),
                         _text("pretrained_model", "Pretrained model path", ""),
@@ -351,6 +459,7 @@ CV_MODEL_CATALOG: dict[str, Any] = {
                     "runtime": "tesseract-ocr/tesstrain",
                     "dataset_formats": ["tesseract_ground_truth"],
                     "reason": "Tesseract training is supported through the official tesstrain workflow and is practical for language/font adaptation.",
+                    "base_model_presets": _tesseract_base_model_presets(),
                     "params": [
                         _text("model_name", "Output language/model code", "custom"),
                         _text("start_model", "Start model", "eng"),
@@ -429,13 +538,65 @@ CV_MODEL_CATALOG: dict[str, Any] = {
 }
 
 
+DATASET_INTERFACES = {
+    "resnet": {
+        "accepted_source_formats": ["imagefolder"],
+        "canonical_format": "imagefolder",
+        "conversion_targets": ["imagefolder"],
+    },
+    "efficientnet": {
+        "accepted_source_formats": ["imagefolder"],
+        "canonical_format": "imagefolder",
+        "conversion_targets": ["imagefolder"],
+    },
+    "yolo": {
+        "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "canonical_format": "yolo_detection",
+        "conversion_targets": ["yolo_detection"],
+    },
+    "faster_rcnn": {
+        "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "canonical_format": "coco_instances_or_yolo_detection",
+        "conversion_targets": ["coco_instances", "yolo_detection"],
+    },
+    "deeplabv3plus": {
+        "accepted_source_formats": ["semantic_masks"],
+        "canonical_format": "semantic_masks",
+        "conversion_targets": ["semantic_masks"],
+    },
+    "mask_rcnn": {
+        "accepted_source_formats": ["coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "canonical_format": "coco_instances",
+        "conversion_targets": ["coco_instances"],
+    },
+    "paddleocr": {
+        "accepted_source_formats": ["paddleocr_labels", "tesseract_ground_truth"],
+        "canonical_format": "paddleocr_labels",
+        "conversion_targets": ["paddleocr_labels"],
+    },
+    "tesseract": {
+        "accepted_source_formats": ["tesseract_ground_truth", "paddleocr_recognition_labels"],
+        "canonical_format": "tesseract_ground_truth",
+        "conversion_targets": ["tesseract_ground_truth"],
+    },
+}
+
+
+def _enrich_catalog_interfaces(catalog: dict[str, Any]) -> dict[str, Any]:
+    for task in catalog.get("tasks", []):
+        for model in task.get("models", []):
+            model.update(DATASET_INTERFACES.get(model.get("id"), {}))
+    return catalog
+
+
 def get_catalog() -> dict[str, Any]:
-    return deepcopy(CV_MODEL_CATALOG)
+    return _enrich_catalog_interfaces(deepcopy(CV_MODEL_CATALOG))
 
 
 def flatten_models() -> dict[str, dict[str, Any]]:
     models: dict[str, dict[str, Any]] = {}
-    for task in CV_MODEL_CATALOG["tasks"]:
+    catalog = get_catalog()
+    for task in catalog["tasks"]:
         for model in task["models"]:
             entry = deepcopy(model)
             entry["task_type"] = task["id"]

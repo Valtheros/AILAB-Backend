@@ -86,11 +86,18 @@ class TrainingService:
             raise FileNotFoundError(f"No datasets found in {self.dataset_dir}. Please upload a dataset first.")
         return sorted(candidates, key=lambda path: path.stat().st_ctime, reverse=True)[0]
 
-    def _assert_dataset_matches_model(self, dataset_path: Path, model_type: str, task_type: str) -> dict[str, Any]:
+    def _assert_dataset_matches_model(
+        self,
+        dataset_path: Path,
+        model_type: str,
+        task_type: str,
+        extra_args: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         metadata = inspect_dataset(dataset_path)
         model_entry = get_model(model_type)
         expected_formats = set(model_entry.get("dataset_formats", [])) if model_entry else set()
         detected_formats = set(metadata["formats"])
+        extra_args = extra_args or {}
 
         if model_entry and task_type != model_entry["task_type"]:
             raise ValueError(f"Model '{model_type}' belongs to task '{model_entry['task_type']}', not '{task_type}'.")
@@ -105,15 +112,33 @@ class TrainingService:
                 f"Dataset '{dataset_path.name}' does not advertise task '{task_type}'. "
                 f"Detected tasks: {metadata['tasks'] or ['none']}."
             )
+        if model_type == "paddleocr":
+            requested_task = str(extra_args.get("ocr_task", "rec"))
+            available_tasks = set(metadata.get("paddleocr_tasks", []))
+            if available_tasks and requested_task not in available_tasks:
+                raise ValueError(
+                    f"Dataset '{dataset_path.name}' has PaddleOCR labels for {sorted(available_tasks)}, "
+                    f"but the selected PaddleOCR task is '{requested_task}'."
+                )
+        if model_type == "mask_rcnn" and metadata.get("coco", {}).get("mask_annotations", 0) <= 0:
+            raise ValueError(f"Dataset '{dataset_path.name}' has no COCO instance masks for Mask R-CNN.")
+        if model_type == "faster_rcnn" and not ({"yolo_detection", "coco_instances"}.intersection(detected_formats)):
+            raise ValueError(f"Dataset '{dataset_path.name}' has no bounding-box annotations for Faster R-CNN.")
         return metadata
 
-    def _find_latest_compatible_dataset_path(self, model_type: str, task_type: str, owner_id: str | None = None) -> Path:
+    def _find_latest_compatible_dataset_path(
+        self,
+        model_type: str,
+        task_type: str,
+        owner_id: str | None = None,
+        extra_args: dict[str, Any] | None = None,
+    ) -> Path:
         candidates = [path for path in self.dataset_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
         for candidate in sorted(candidates, key=lambda path: path.stat().st_ctime, reverse=True):
             if not self._is_dataset_visible(candidate, owner_id):
                 continue
             try:
-                self._assert_dataset_matches_model(candidate, model_type, task_type)
+                self._assert_dataset_matches_model(candidate, model_type, task_type, extra_args=extra_args)
                 return candidate
             except ValueError:
                 continue
@@ -191,12 +216,27 @@ class TrainingService:
         dataset_path = (
             self._find_dataset_path(dataset_name, owner_id=owner_id)
             if dataset_name
-            else self._find_latest_compatible_dataset_path(model_type, task_type, owner_id=owner_id)
+            else self._find_latest_compatible_dataset_path(
+                model_type,
+                task_type,
+                owner_id=owner_id,
+                extra_args=extra_args or {},
+            )
         )
-        dataset_metadata = self._assert_dataset_matches_model(dataset_path, model_type, task_type)
+        dataset_metadata = self._assert_dataset_matches_model(
+            dataset_path,
+            model_type,
+            task_type,
+            extra_args=extra_args or {},
+        )
         data_yaml_path = None
-        original_yaml = find_dataset_yaml(dataset_path)
-        if original_yaml:
+        uses_yolo_dataset = model_type == "yolo" or (
+            model_type == "faster_rcnn" and "yolo_detection" in dataset_metadata["formats"]
+        )
+        if uses_yolo_dataset:
+            original_yaml = find_dataset_yaml(dataset_path)
+            if original_yaml is None:
+                raise ValueError(f"Dataset '{dataset_path.name}' is missing data.yaml for YOLO-style labels.")
             data_yaml_path = self._create_worker_yaml(original_yaml, dataset_path)
 
         job_config = {

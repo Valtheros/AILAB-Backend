@@ -86,16 +86,16 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
     use_coco_boxes = model_kind == "faster_rcnn" and "coco_instances" in dataset_formats and not data_yaml_path
 
     if model_kind == "mask_rcnn":
-        train_dataset = CocoInstanceDataset(dataset_path, "train")
+        train_dataset = CocoInstanceDataset(dataset_path, "train", include_masks=True)
         try:
-            val_dataset = CocoInstanceDataset(dataset_path, "val")
+            val_dataset = CocoInstanceDataset(dataset_path, "val", include_masks=True)
         except Exception:
             val_dataset = None
         model_builder = build_mask_rcnn
     elif use_coco_boxes:
-        train_dataset = CocoInstanceDataset(dataset_path, "train")
+        train_dataset = CocoInstanceDataset(dataset_path, "train", include_masks=False)
         try:
-            val_dataset = CocoInstanceDataset(dataset_path, "val")
+            val_dataset = CocoInstanceDataset(dataset_path, "val", include_masks=False)
         except Exception:
             val_dataset = None
         model_builder = build_faster_rcnn
