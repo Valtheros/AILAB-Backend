@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,6 +20,8 @@ PADDLEOCR_TRAIN_LABEL_NAMES = {
     "det_gt_val.txt": "det",
 }
 NORMALIZED_DIR_NAME = ".ailab_normalized"
+EXPORTS_DIR_NAME = ".ailab_exports"
+SOURCE_FINGERPRINT_SKIP_FILES = {".ailab_dataset.json"}
 TRAINABLE_FORMATS = {
     "imagefolder",
     "yolo_detection",
@@ -43,9 +47,23 @@ def format_bytes(size: int) -> str:
 
 def _iter_visible_files(dataset_dir: Path):
     for root, dirs, files in os.walk(dataset_dir):
-        dirs[:] = [name for name in dirs if name != NORMALIZED_DIR_NAME]
+        dirs[:] = [name for name in dirs if name not in {NORMALIZED_DIR_NAME, EXPORTS_DIR_NAME}]
         for file in files:
             yield Path(root) / file
+
+
+def _is_export_path(path: Path) -> bool:
+    return EXPORTS_DIR_NAME in path.parts
+
+
+def _iter_source_files(dataset_dir: Path):
+    for root, dirs, files in os.walk(dataset_dir):
+        dirs[:] = [name for name in dirs if name not in {NORMALIZED_DIR_NAME, EXPORTS_DIR_NAME}]
+        for file in files:
+            path = Path(root) / file
+            if path.name in SOURCE_FINGERPRINT_SKIP_FILES:
+                continue
+            yield path
 
 
 def count_images(dataset_dir: Path) -> int:
@@ -70,7 +88,8 @@ def find_dataset_yaml(dataset_dir: Path) -> Path | None:
     normalized_candidate = dataset_dir / NORMALIZED_DIR_NAME / "yolo_detection" / "data.yaml"
     if normalized_candidate.is_file():
         return normalized_candidate
-    for root, _, files in os.walk(dataset_dir):
+    for root, dirs, files in os.walk(dataset_dir):
+        dirs[:] = [name for name in dirs if name != EXPORTS_DIR_NAME]
         for name in ("data.yaml", "dataset.yaml"):
             if name in files:
                 return Path(root) / name
@@ -113,7 +132,7 @@ def _is_image_file(path: Path) -> bool:
 
 def _iter_yolo_label_files(dataset_dir: Path) -> Iterable[Path]:
     for label_path in dataset_dir.rglob("*.txt"):
-        if not label_path.is_file():
+        if not label_path.is_file() or _is_export_path(label_path):
             continue
         try:
             relative_parts = {part.lower() for part in label_path.relative_to(dataset_dir).parts}
@@ -258,6 +277,8 @@ def _inspect_semantic_masks(dataset_dir: Path) -> dict[str, Any]:
 def _find_coco_files(dataset_dir: Path) -> list[str]:
     files: list[str] = []
     for path in dataset_dir.rglob("*.json"):
+        if _is_export_path(path):
+            continue
         lowered = path.name.lower()
         if lowered.startswith("_annotations") or "instances" in lowered or "coco" in lowered:
             files.append(str(path.relative_to(dataset_dir)))
@@ -411,7 +432,7 @@ def _inspect_paddleocr_labels(dataset_dir: Path) -> dict[str, Any]:
     stats: dict[str, Any] = {"tasks": [], "files": [], "missing_image_refs": 0}
     tasks = set()
     for path in dataset_dir.rglob("*"):
-        if not path.is_file():
+        if not path.is_file() or _is_export_path(path):
             continue
         task = PADDLEOCR_TRAIN_LABEL_NAMES.get(path.name.lower())
         if not task:
@@ -451,7 +472,7 @@ def _find_tesseract_image_for_gt(gt_path: Path) -> Path | None:
 def _inspect_tesseract_ground_truth(dataset_dir: Path) -> dict[str, int]:
     stats = {"gt_files": 0, "pairs": 0, "missing_images": 0}
     for gt_path in dataset_dir.rglob("*.gt.txt"):
-        if not gt_path.is_file():
+        if not gt_path.is_file() or _is_export_path(gt_path):
             continue
         stats["gt_files"] += 1
         if _find_tesseract_image_for_gt(gt_path):
@@ -588,10 +609,10 @@ def validate_dataset_for_upload(dataset_dir: Path) -> dict[str, Any]:
 
 def _source_format_from_metadata(metadata: dict[str, Any]) -> str:
     formats = set(metadata.get("formats", []))
-    if "yolo_detection" in formats:
-        return "yolo"
     if "coco_instances" in formats:
         return "coco"
+    if "yolo_detection" in formats:
+        return "yolo"
     if "semantic_masks" in formats:
         return "semantic_masks"
     if "imagefolder" in formats:
@@ -603,12 +624,62 @@ def _source_format_from_metadata(metadata: dict[str, Any]) -> str:
     return "unknown"
 
 
+def _dataset_tasks_from_metadata(metadata: dict[str, Any]) -> list[str]:
+    formats = set(metadata.get("formats", []))
+    dataset_tasks: list[str] = []
+    coco = metadata.get("coco", {})
+    paddleocr_tasks = set(metadata.get("paddleocr_tasks", []))
+
+    if "imagefolder" in formats:
+        dataset_tasks.append("image_classification")
+    if "yolo_detection" in formats or coco.get("box_annotations", 0) > 0:
+        dataset_tasks.append("object_detection")
+    if "semantic_masks" in formats:
+        dataset_tasks.append("semantic_segmentation")
+    if coco.get("mask_annotations", 0) > 0:
+        dataset_tasks.append("instance_segmentation")
+    if "rec" in paddleocr_tasks or metadata.get("tesseract", {}).get("pairs", 0) > 0:
+        dataset_tasks.append("ocr_recognition")
+    if "det" in paddleocr_tasks:
+        dataset_tasks.append("ocr_detection")
+
+    return list(dict.fromkeys(dataset_tasks))
+
+
 def _canonical_task_from_metadata(metadata: dict[str, Any]) -> str:
-    tasks = metadata.get("tasks", [])
-    if len(tasks) == 1:
-        return str(tasks[0])
-    if "object_detection" in tasks and "segmentation" in tasks:
-        return "object_detection_or_segmentation"
+    dataset_tasks = _dataset_tasks_from_metadata(metadata)
+    if len(dataset_tasks) == 1:
+        return dataset_tasks[0]
+    if "instance_segmentation" in dataset_tasks:
+        return "instance_segmentation"
+    if "semantic_segmentation" in dataset_tasks:
+        return "semantic_segmentation"
+    if "object_detection" in dataset_tasks:
+        return "object_detection"
+    if "ocr_recognition" in dataset_tasks and "ocr_detection" in dataset_tasks:
+        return "ocr_recognition_or_detection"
+    if dataset_tasks:
+        return "multi_task"
+    return "unknown"
+
+
+def _canonical_format_from_metadata(metadata: dict[str, Any]) -> str:
+    formats = set(metadata.get("formats", []))
+    coco = metadata.get("coco", {})
+    paddleocr_tasks = set(metadata.get("paddleocr_tasks", []))
+
+    if "imagefolder" in formats:
+        return "imagefolder"
+    if "semantic_masks" in formats:
+        return "semantic_masks"
+    if coco.get("mask_annotations", 0) > 0:
+        return "coco_instance_masks"
+    if "yolo_detection" in formats or coco.get("box_annotations", 0) > 0:
+        return "object_detection_boxes"
+    if "det" in paddleocr_tasks:
+        return "ocr_detection_labels"
+    if "rec" in paddleocr_tasks or metadata.get("tesseract", {}).get("pairs", 0) > 0:
+        return "ocr_recognition_labels"
     return "unknown"
 
 
@@ -626,27 +697,41 @@ def _annotation_stats(metadata: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _has_bounding_boxes(metadata: dict[str, Any]) -> bool:
+    formats = set(metadata.get("formats", []))
+    return "yolo_detection" in formats or metadata.get("coco", {}).get("box_annotations", 0) > 0
+
+
+def _has_ocr_recognition(metadata: dict[str, Any]) -> bool:
+    return "rec" in set(metadata.get("paddleocr_tasks", [])) or metadata.get("tesseract", {}).get("pairs", 0) > 0
+
+
 def _model_compatibility_reason(model_id: str, metadata: dict[str, Any], task_id: str) -> tuple[bool, str]:
     formats = set(metadata.get("formats", []))
     tasks = set(metadata.get("tasks", []))
-    if task_id not in tasks:
-        return False, f"Dataset does not contain {task_id} annotations."
+    paddleocr_tasks = set(metadata.get("paddleocr_tasks", []))
+
     if model_id == "yolo":
-        return ("yolo_detection" in formats, "Requires YOLO detection labels.")
+        ok = _has_bounding_boxes(metadata) and "object_detection" in tasks
+        return ok, "Requires bounding boxes; COCO boxes are exported to YOLO at train time."
     if model_id == "faster_rcnn":
-        ok = bool({"yolo_detection", "coco_instances"}.intersection(formats)) and "object_detection" in tasks
-        return ok, "Requires bounding-box annotations in YOLO or COCO format."
+        ok = _has_bounding_boxes(metadata) and "object_detection" in tasks
+        return ok, "Requires bounding boxes in YOLO or COCO; COCO can be used directly."
     if model_id == "mask_rcnn":
         ok = "coco_instances" in formats and metadata.get("coco", {}).get("mask_annotations", 0) > 0
-        return ok, "Requires COCO instance masks."
+        return ok, "Requires COCO instance masks, not box-only annotations."
     if model_id == "deeplabv3plus":
-        return ("semantic_masks" in formats, "Requires image/mask semantic segmentation pairs.")
+        return "semantic_masks" in formats, "Requires image/mask semantic segmentation pairs."
     if model_id in {"resnet", "efficientnet"}:
-        return ("imagefolder" in formats, "Requires ImageFolder class folders.")
+        return "imagefolder" in formats, "Requires image classification class folders."
     if model_id == "paddleocr":
-        return ("paddleocr_labels" in formats, "Requires PaddleOCR rec/det label files.")
+        ok = bool(paddleocr_tasks) or metadata.get("tesseract", {}).get("pairs", 0) > 0
+        return ok, "Requires OCR detection labels or recognition ground truth."
     if model_id == "tesseract":
-        return ("tesseract_ground_truth" in formats, "Requires image and .gt.txt pairs.")
+        ok = _has_ocr_recognition(metadata)
+        return ok, "Requires OCR recognition ground truth; PaddleOCR rec labels are exported at train time."
+    if task_id not in tasks:
+        return False, f"Dataset does not contain {task_id} annotations."
     return False, "No compatibility rule is defined for this model."
 
 
@@ -664,18 +749,55 @@ def compatible_models_for_metadata(metadata: dict[str, Any], catalog: dict[str, 
                     "ready": ready,
                     "reason": reason,
                     "required_formats": model.get("dataset_formats", task.get("dataset_formats", [])),
+                    "dataset_task": model.get("dataset_task"),
+                    "required_annotations": model.get("required_annotations", []),
+                    "accepted_canonical_formats": model.get("accepted_canonical_formats", []),
+                    "train_export_format": model.get("train_export_format"),
                 }
             )
     return compatible
 
 
+def export_cache_metadata(dataset_dir: Path) -> list[dict[str, Any]]:
+    root = dataset_dir / EXPORTS_DIR_NAME
+    if not root.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    for manifest_path in sorted(root.glob("*/*/manifest.json")):
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        try:
+            relative_path = str(manifest_path.parent.relative_to(dataset_dir))
+        except ValueError:
+            relative_path = str(manifest_path.parent)
+        entries.append(
+            {
+                "model": data.get("model_type"),
+                "export_format": data.get("export_format"),
+                "fingerprint": data.get("fingerprint"),
+                "path": relative_path,
+                "created_at": data.get("created_at"),
+            }
+        )
+    return entries
+
+
 def dataset_workflow_metadata(metadata: dict[str, Any], catalog: dict[str, Any] | None = None) -> dict[str, Any]:
+    dataset_tasks = _dataset_tasks_from_metadata(metadata)
     workflow = {
         "source_format": _source_format_from_metadata(metadata),
+        "dataset_task": _canonical_task_from_metadata(metadata),
+        "dataset_tasks": dataset_tasks,
         "canonical_task": _canonical_task_from_metadata(metadata),
+        "canonical_format": _canonical_format_from_metadata(metadata),
         "normalized_formats": metadata.get("formats", []),
         "annotation_stats": _annotation_stats(metadata),
         "conversion_warnings": metadata.get("conversion_warnings", []),
+        "export_cache": metadata.get("export_cache", []),
     }
     if catalog is not None:
         workflow["compatible_models"] = compatible_models_for_metadata(metadata, catalog)
@@ -858,6 +980,422 @@ def _convert_paddleocr_rec_to_tesseract(dataset_dir: Path, normalized_root: Path
             rows_written += 1
     return [] if rows_written else []
 
+
+
+def _source_fingerprint(dataset_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(_iter_source_files(dataset_dir), key=lambda item: item.relative_to(dataset_dir).as_posix()):
+        try:
+            stat = path.stat()
+            relative = path.relative_to(dataset_dir).as_posix()
+        except OSError:
+            continue
+        digest.update(relative.encode("utf-8", errors="ignore"))
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _export_identity(dataset_dir: Path, model_type: str, extra_args: dict[str, Any]) -> tuple[str, Path, str]:
+    source_fingerprint = _source_fingerprint(dataset_dir)
+    cache_material = {
+        "source_fingerprint": source_fingerprint,
+        "model_type": model_type,
+        "ocr_task": str(extra_args.get("ocr_task", "")) if model_type == "paddleocr" else "",
+    }
+    fingerprint = hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode("utf-8")).hexdigest()[:20]
+    return source_fingerprint, dataset_dir / EXPORTS_DIR_NAME / model_type / fingerprint, fingerprint
+
+
+def _cache_is_valid(export_root: Path, source_fingerprint: str, export_format: str, required_files: list[str]) -> bool:
+    manifest_path = export_root / "manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if manifest.get("source_fingerprint") != source_fingerprint or manifest.get("export_format") != export_format:
+        return False
+    return all((export_root / required_file).exists() for required_file in required_files)
+
+
+def _write_export_manifest(
+    export_root: Path,
+    model_type: str,
+    export_format: str,
+    source_fingerprint: str,
+    fingerprint: str,
+    warnings: list[str],
+) -> None:
+    manifest = {
+        "model_type": model_type,
+        "export_format": export_format,
+        "source_fingerprint": source_fingerprint,
+        "fingerprint": fingerprint,
+        "warnings": warnings,
+        "created_at": int(time.time()),
+    }
+    (export_root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def _normalize_yolo_yaml_value(dataset_dir: Path, yaml_key: str, value: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"YOLO YAML '{yaml_key}' paths must be non-empty text")
+
+    normalized = value.strip().replace("\\", "/")
+    candidates = [normalized]
+    stripped = normalized
+    while stripped.startswith("../"):
+        stripped = stripped[3:]
+        candidates.append(stripped)
+    if stripped.startswith("./"):
+        candidates.append(stripped[2:])
+
+    seen: set[str] = set()
+    for candidate_value in candidates:
+        if candidate_value in seen:
+            continue
+        seen.add(candidate_value)
+        candidate = _safe_child(dataset_dir, candidate_value)
+        if candidate and candidate.exists():
+            return candidate_value
+    raise ValueError(f"YOLO YAML '{yaml_key}' path was not found inside the dataset: {value}")
+
+
+def _write_source_yolo_export(dataset_dir: Path, output_root: Path) -> Path:
+    original_yaml = find_dataset_yaml(dataset_dir)
+    if original_yaml is None:
+        raise ValueError(f"Dataset '{dataset_dir.name}' is missing data.yaml for YOLO-style labels.")
+    config = yaml.safe_load(original_yaml.read_text(encoding="utf-8")) or {}
+    if not isinstance(config, dict):
+        raise ValueError("YOLO YAML root must be an object")
+    if not isinstance(config.get("names"), (dict, list)) or not config["names"]:
+        raise ValueError("YOLO YAML requires a non-empty names list or mapping")
+    config["path"] = str(dataset_dir)
+    for yaml_key in ("train", "val", "test"):
+        value = config.get(yaml_key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            config[yaml_key] = [_normalize_yolo_yaml_value(dataset_dir, yaml_key, item) for item in value]
+        else:
+            config[yaml_key] = _normalize_yolo_yaml_value(dataset_dir, yaml_key, value)
+    if "train" not in config:
+        raise ValueError("YOLO YAML requires a train path")
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_yaml = output_root / "data.yaml"
+    output_yaml.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
+    return output_yaml
+
+
+def _write_coco_yolo_export(dataset_dir: Path, output_root: Path, metadata: dict[str, Any]) -> tuple[Path, list[str]]:
+    warnings: list[str] = []
+    coco_files = metadata.get("coco_files", [])
+    if not coco_files or metadata.get("coco", {}).get("box_annotations", 0) <= 0:
+        raise ValueError(f"Dataset '{dataset_dir.name}' has no COCO bounding-box annotations to export for YOLO.")
+
+    classes = metadata.get("classes", []) or ["object"]
+    wrote_labels = False
+    splits: set[str] = set()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    for relative_file in coco_files:
+        annotation_path = dataset_dir / relative_file
+        try:
+            data = json.loads(annotation_path.read_text(encoding="utf-8"))
+        except Exception:
+            warnings.append(f"Could not read COCO annotations from {relative_file}.")
+            continue
+        images = data.get("images", []) if isinstance(data, dict) else []
+        annotations = data.get("annotations", []) if isinstance(data, dict) else []
+        categories = data.get("categories", []) if isinstance(data, dict) else []
+        if not isinstance(images, list) or not isinstance(annotations, list):
+            continue
+
+        category_ids = [category.get("id") for category in categories if isinstance(category, dict) and "id" in category]
+        category_to_index = {category_id: index for index, category_id in enumerate(category_ids)} or {1: 0}
+        annotations_by_image: dict[Any, list[dict[str, Any]]] = {}
+        for annotation in annotations:
+            if isinstance(annotation, dict):
+                annotations_by_image.setdefault(annotation.get("image_id"), []).append(annotation)
+
+        split = _annotation_split(annotation_path, dataset_dir)
+        split = "val" if split in {"valid", "validation"} else split
+        splits.add(split)
+        images_dir = output_root / "images" / split
+        labels_dir = output_root / "labels" / split
+        images_dir.mkdir(parents=True, exist_ok=True)
+        labels_dir.mkdir(parents=True, exist_ok=True)
+
+        for image_record in images:
+            if not isinstance(image_record, dict):
+                continue
+            source_image = _resolve_coco_image(dataset_dir, annotation_path, image_record.get("file_name"))
+            if source_image is None:
+                continue
+            dimensions = _image_dimensions(source_image, image_record)
+            if dimensions is None:
+                warnings.append(f"Skipping {source_image.name}: image width/height were not available for YOLO export.")
+                continue
+            width, height = dimensions
+            if width <= 0 or height <= 0:
+                continue
+
+            target_image = _unique_child(images_dir, source_image.name, prefix=f"{image_record.get('id', '')}_")
+            shutil.copy2(source_image, target_image)
+            rows: list[str] = []
+            for annotation in annotations_by_image.get(image_record.get("id"), []):
+                bbox = annotation.get("bbox")
+                if not _valid_bbox(bbox):
+                    continue
+                x, y, box_width, box_height = [float(value) for value in bbox]
+                class_index = category_to_index.get(annotation.get("category_id"), 0)
+                x_center = (x + box_width / 2) / width
+                y_center = (y + box_height / 2) / height
+                rows.append(
+                    f"{class_index} {x_center:.6f} {y_center:.6f} {box_width / width:.6f} {box_height / height:.6f}"
+                )
+            (labels_dir / f"{target_image.stem}.txt").write_text("\n".join(rows), encoding="utf-8")
+            if rows:
+                wrote_labels = True
+
+    if not wrote_labels:
+        raise ValueError(f"Dataset '{dataset_dir.name}' did not produce any YOLO labels from COCO boxes.")
+    train_split = "train" if "train" in splits else sorted(splits)[0]
+    yaml_data: dict[str, Any] = {
+        "path": str(output_root),
+        "train": f"images/{train_split}",
+        "names": classes,
+    }
+    if "val" in splits:
+        yaml_data["val"] = "images/val"
+    if "test" in splits:
+        yaml_data["test"] = "images/test"
+    output_yaml = output_root / "data.yaml"
+    output_yaml.write_text(yaml.dump(yaml_data, default_flow_style=False), encoding="utf-8")
+    return output_yaml, warnings
+
+
+def _write_tesseract_as_paddleocr_rec(dataset_dir: Path, output_root: Path) -> Path:
+    images_dir = output_root / "images"
+    rows: list[str] = []
+    for gt_path in dataset_dir.rglob("*.gt.txt"):
+        if _is_export_path(gt_path):
+            continue
+        image_path = _find_tesseract_image_for_gt(gt_path)
+        if image_path is None:
+            continue
+        images_dir.mkdir(parents=True, exist_ok=True)
+        target_image = _unique_child(images_dir, image_path.name)
+        shutil.copy2(image_path, target_image)
+        text = gt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        rows.append(f"images/{target_image.name}\t{text}")
+    if not rows:
+        raise ValueError(f"Dataset '{dataset_dir.name}' has no Tesseract ground truth pairs to export for PaddleOCR recognition.")
+    output_root.mkdir(parents=True, exist_ok=True)
+    label_path = output_root / "rec_gt_train.txt"
+    label_path.write_text("\n".join(rows), encoding="utf-8")
+    return label_path
+
+
+def _write_paddleocr_rec_as_tesseract(dataset_dir: Path, output_root: Path) -> None:
+    rows_written = 0
+    for label_path in dataset_dir.rglob("rec_gt_train.txt"):
+        if _is_export_path(label_path):
+            continue
+        try:
+            lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if "\t" not in line:
+                continue
+            image_ref, text = line.split("\t", 1)
+            image_path = _safe_child(label_path.parent, image_ref.replace("\\", "/"))
+            if image_path is None or not _is_image_file(image_path):
+                image_path = _safe_child(dataset_dir, image_ref.replace("\\", "/"))
+            if image_path is None or not _is_image_file(image_path):
+                continue
+            output_root.mkdir(parents=True, exist_ok=True)
+            target_image = _unique_child(output_root, image_path.name)
+            shutil.copy2(image_path, target_image)
+            (output_root / f"{target_image.stem}.gt.txt").write_text(text.strip(), encoding="utf-8")
+            rows_written += 1
+    if rows_written <= 0:
+        raise ValueError(f"Dataset '{dataset_dir.name}' has no PaddleOCR recognition labels to export for Tesseract.")
+
+
+def _prepared_response(
+    dataset_dir: Path,
+    model_type: str,
+    metadata: dict[str, Any],
+    dataset_path: Path,
+    export_format: str,
+    data_yaml_path: Path | None = None,
+    export_path: Path | None = None,
+    cache_hit: bool = False,
+    fingerprint: str | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    metadata = dict(metadata)
+    metadata["export_cache"] = export_cache_metadata(dataset_dir)
+    return {
+        "dataset_path": str(dataset_path),
+        "source_dataset_path": str(dataset_dir),
+        "data_yaml_path": str(data_yaml_path) if data_yaml_path else None,
+        "metadata": metadata,
+        "export": {
+            "model": model_type,
+            "export_format": export_format,
+            "path": str(export_path) if export_path else None,
+            "cache_hit": cache_hit,
+            "fingerprint": fingerprint,
+            "warnings": warnings or [],
+        },
+    }
+
+
+def _cached_generated_export(
+    dataset_dir: Path,
+    model_type: str,
+    extra_args: dict[str, Any],
+    export_format: str,
+    required_files: list[str],
+    writer,
+) -> tuple[Path, bool, str, list[str]]:
+    source_fingerprint, export_root, fingerprint = _export_identity(dataset_dir, model_type, extra_args)
+    if _cache_is_valid(export_root, source_fingerprint, export_format, required_files):
+        return export_root, True, fingerprint, []
+    shutil.rmtree(export_root, ignore_errors=True)
+    export_root.mkdir(parents=True, exist_ok=True)
+    warnings = writer(export_root)
+    _write_export_manifest(export_root, model_type, export_format, source_fingerprint, fingerprint, warnings)
+    return export_root, False, fingerprint, warnings
+
+
+def prepare_dataset_for_model(dataset_dir: Path, model_type: str, extra_args: dict[str, Any] | None = None) -> dict[str, Any]:
+    extra_args = extra_args or {}
+    metadata = inspect_dataset(dataset_dir)
+    formats = set(metadata.get("formats", []))
+    paddleocr_tasks = set(metadata.get("paddleocr_tasks", []))
+
+    if model_type in {"resnet", "efficientnet"}:
+        if "imagefolder" not in formats:
+            raise ValueError(f"Dataset '{dataset_dir.name}' has no image classification class folders.")
+        return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "imagefolder")
+
+    if model_type == "deeplabv3plus":
+        if "semantic_masks" not in formats:
+            raise ValueError(f"Dataset '{dataset_dir.name}' has no semantic image/mask pairs for DeepLabV3+.")
+        return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "semantic_masks")
+
+    if model_type == "mask_rcnn":
+        if metadata.get("coco", {}).get("mask_annotations", 0) <= 0:
+            raise ValueError(f"Dataset '{dataset_dir.name}' has no COCO instance masks for Mask R-CNN.")
+        return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "coco_instances")
+
+    if model_type in {"yolo", "faster_rcnn"}:
+        if "yolo_detection" in formats:
+            export_root, cache_hit, fingerprint, warnings = _cached_generated_export(
+                dataset_dir,
+                model_type,
+                extra_args,
+                "yolo_detection",
+                ["data.yaml"],
+                lambda output_root: (_write_source_yolo_export(dataset_dir, output_root), [])[1],
+            )
+            return _prepared_response(
+                dataset_dir,
+                model_type,
+                metadata,
+                dataset_dir,
+                "yolo_detection",
+                data_yaml_path=export_root / "data.yaml",
+                export_path=export_root,
+                cache_hit=cache_hit,
+                fingerprint=fingerprint,
+                warnings=warnings,
+            )
+        if metadata.get("coco", {}).get("box_annotations", 0) > 0:
+            if model_type == "faster_rcnn":
+                return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "coco_instances")
+            export_root, cache_hit, fingerprint, warnings = _cached_generated_export(
+                dataset_dir,
+                model_type,
+                extra_args,
+                "yolo_detection",
+                ["data.yaml"],
+                lambda output_root: _write_coco_yolo_export(dataset_dir, output_root, metadata)[1],
+            )
+            return _prepared_response(
+                dataset_dir,
+                model_type,
+                metadata,
+                export_root,
+                "yolo_detection",
+                data_yaml_path=export_root / "data.yaml",
+                export_path=export_root,
+                cache_hit=cache_hit,
+                fingerprint=fingerprint,
+                warnings=warnings,
+            )
+        raise ValueError(f"Dataset '{dataset_dir.name}' has no bounding-box annotations for {model_type}.")
+
+    if model_type == "paddleocr":
+        requested_task = str(extra_args.get("ocr_task", "rec"))
+        if requested_task not in {"rec", "det"}:
+            raise ValueError("PaddleOCR ocr_task must be either 'det' or 'rec'.")
+        if requested_task in paddleocr_tasks:
+            return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "paddleocr_labels")
+        if requested_task == "rec" and metadata.get("tesseract", {}).get("pairs", 0) > 0:
+            export_root, cache_hit, fingerprint, warnings = _cached_generated_export(
+                dataset_dir,
+                model_type,
+                extra_args,
+                "paddleocr_recognition_labels",
+                ["rec_gt_train.txt"],
+                lambda output_root: (_write_tesseract_as_paddleocr_rec(dataset_dir, output_root), [])[1],
+            )
+            return _prepared_response(
+                dataset_dir,
+                model_type,
+                metadata,
+                export_root,
+                "paddleocr_recognition_labels",
+                export_path=export_root,
+                cache_hit=cache_hit,
+                fingerprint=fingerprint,
+                warnings=warnings,
+            )
+        raise ValueError(f"Dataset '{dataset_dir.name}' has no PaddleOCR {requested_task} labels.")
+
+    if model_type == "tesseract":
+        if metadata.get("tesseract", {}).get("pairs", 0) > 0:
+            return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "tesseract_ground_truth")
+        if "rec" in paddleocr_tasks:
+            export_root, cache_hit, fingerprint, warnings = _cached_generated_export(
+                dataset_dir,
+                model_type,
+                extra_args,
+                "tesseract_ground_truth",
+                [],
+                lambda output_root: (_write_paddleocr_rec_as_tesseract(dataset_dir, output_root), [])[1],
+            )
+            return _prepared_response(
+                dataset_dir,
+                model_type,
+                metadata,
+                export_root,
+                "tesseract_ground_truth",
+                export_path=export_root,
+                cache_hit=cache_hit,
+                fingerprint=fingerprint,
+                warnings=warnings,
+            )
+        raise ValueError(f"Dataset '{dataset_dir.name}' has no OCR recognition ground truth for Tesseract.")
+
+    raise ValueError(f"No dataset export rule is defined for model '{model_type}'.")
 
 def normalize_dataset_for_training(dataset_dir: Path) -> dict[str, Any]:
     normalized_root = _reset_normalized_root(dataset_dir)

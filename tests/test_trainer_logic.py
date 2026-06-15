@@ -50,7 +50,7 @@ if "rq.command" not in sys.modules:
 if "rq.job" not in sys.modules:
     sys.modules["rq.job"] = types.SimpleNamespace(Job=types.SimpleNamespace, JobStatus=types.SimpleNamespace)
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, normalize_dataset_for_training, validate_dataset_for_upload
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, normalize_dataset_for_training, prepare_dataset_for_model, validate_dataset_for_upload
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
@@ -192,6 +192,80 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("yolo", ready)
             self.assertIn("faster_rcnn", ready)
             self.assertNotIn("mask_rcnn", ready)
+
+    def test_coco_box_dataset_is_yolo_compatible_before_export(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 5, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 5, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata = inspect_dataset(root)
+            ready = {item["id"] for item in compatible_models_for_metadata(metadata, get_catalog()) if item["ready"]}
+
+            self.assertIn("coco_instances", metadata["formats"])
+            self.assertNotIn("yolo_detection", metadata["formats"])
+            self.assertIn("yolo", ready)
+            self.assertIn("faster_rcnn", ready)
+            self.assertNotIn("mask_rcnn", ready)
+
+    def test_prepare_yolo_from_coco_box_dataset_uses_export_cache(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 5, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 5, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            first = prepare_dataset_for_model(root, "yolo", {"model_size": "n"})
+            second = prepare_dataset_for_model(root, "yolo", {"model_size": "s"})
+
+            export_path = Path(first["dataset_path"])
+            self.assertIn(".ailab_exports", export_path.parts)
+            self.assertTrue((export_path / "data.yaml").is_file())
+            self.assertTrue((export_path / "labels" / "train").is_dir())
+            self.assertFalse(first["export"]["cache_hit"])
+            self.assertTrue(second["export"]["cache_hit"])
+            self.assertEqual(first["export"]["fingerprint"], second["export"]["fingerprint"])
+
+    def test_prepare_ocr_recognition_exports_between_paddleocr_and_tesseract(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "line_001.png").write_bytes(b"not-an-image")
+            (root / "line_001.gt.txt").write_text("hello", encoding="utf-8")
+
+            paddle = prepare_dataset_for_model(root, "paddleocr", {"ocr_task": "rec"})
+            paddle_path = Path(paddle["dataset_path"])
+            self.assertIn(".ailab_exports", paddle_path.parts)
+            self.assertTrue((paddle_path / "rec_gt_train.txt").is_file())
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "line_001.png").write_bytes(b"not-an-image")
+            (root / "rec_gt_train.txt").write_text("line_001.png\thello", encoding="utf-8")
+
+            tesseract = prepare_dataset_for_model(root, "tesseract")
+            tesseract_path = Path(tesseract["dataset_path"])
+            self.assertIn(".ailab_exports", tesseract_path.parts)
+            self.assertTrue((tesseract_path / "line_001.gt.txt").is_file())
 
     def test_tesseract_ground_truth_exports_paddleocr_rec_labels(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -523,7 +597,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "does not advertise task 'segmentation'"):
+            with self.assertRaisesRegex(ValueError, "COCO instance masks"):
                 service._assert_dataset_matches_model(dataset, "mask_rcnn", "segmentation")
 
     def test_faster_rcnn_coco_dataset_does_not_get_worker_yaml(self):
@@ -557,6 +631,43 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             self.assertEqual(job_id, "job-1")
             queued_config = service.queues["cv_training"].jobs[0][1]
             self.assertIsNone(queued_config["data_yaml_path"])
+
+    def test_yolo_coco_dataset_is_exported_before_enqueue(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            service = self._queued_service(root)
+            dataset = root / "coco_box"
+            train = dataset / "train"
+            train.mkdir(parents=True)
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 1, "name": "space"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 1, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            job_id = service.start_training_container(
+                task_type="object_detection",
+                model_type="yolo",
+                model_name="yolo11n",
+                epochs=1,
+                batch_size=1,
+                project_name="yolo_coco_run",
+                dataset_name="coco_box",
+                extra_args={"model_size": "n"},
+            )
+
+            self.assertEqual(job_id, "job-1")
+            queued_config = service.queues["cv_training"].jobs[0][1]
+            self.assertEqual(queued_config["source_dataset_path"], str(dataset))
+            self.assertIn(".ailab_exports", Path(queued_config["dataset_path"]).parts)
+            self.assertTrue(Path(queued_config["data_yaml_path"]).is_file())
+            self.assertEqual(queued_config["dataset_export"]["export_format"], "yolo_detection")
 
     def test_start_training_reserves_project_name_globally(self):
         with tempfile.TemporaryDirectory() as temp:

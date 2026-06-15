@@ -15,14 +15,15 @@ from pydantic import BaseModel, Field
 
 from dataset_utils import (
     dataset_workflow_metadata,
+    export_cache_metadata,
     find_dataset_yaml,
     format_bytes,
     inspect_dataset,
-    normalize_dataset_for_training,
     safe_dataset_name,
     validate_dataset_for_upload,
 )
 from model_catalog import get_catalog, get_model, validate_model_params
+from resource_guard import ResourcePlanError, enforce_resource_plan, get_resource_profile
 from security_utils import (
     contained_path,
     named_file_lock,
@@ -207,12 +208,16 @@ def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
         "errors": metadata.get("errors", []),
         "paddleocr_tasks": metadata.get("paddleocr_tasks", []),
         "source_format": workflow["source_format"],
+        "dataset_task": workflow["dataset_task"],
+        "dataset_tasks": workflow["dataset_tasks"],
         "canonical_task": workflow["canonical_task"],
+        "canonical_format": workflow["canonical_format"],
         "normalized_formats": workflow["normalized_formats"],
         "annotation_stats": workflow["annotation_stats"],
         "conversion_warnings": workflow.get("conversion_warnings", []),
         "compatible_models": workflow.get("compatible_models", []),
         "ready_models": ready_models,
+        "export_cache": workflow.get("export_cache", []),
     }
 
 
@@ -226,12 +231,16 @@ def _dataset_response(dataset_name: str, metadata: dict[str, Any]) -> dict[str, 
         "classes": profile["classes"],
         "paddleocrTasks": profile["paddleocr_tasks"],
         "sourceFormat": profile["source_format"],
+        "datasetTask": profile["dataset_task"],
+        "datasetTasks": profile["dataset_tasks"],
         "canonicalTask": profile["canonical_task"],
+        "canonicalFormat": profile["canonical_format"],
         "normalizedFormats": profile["normalized_formats"],
         "annotationStats": profile["annotation_stats"],
         "conversionWarnings": profile["conversion_warnings"],
         "compatibleModels": profile["compatible_models"],
         "readyModels": profile["ready_models"],
+        "exportCache": profile["export_cache"],
     }
 
 
@@ -250,7 +259,7 @@ async def _inspect_uploaded_zip(file: UploadFile) -> tuple[str, dict[str, Any]]:
             extract_dir = staging_dir / "extracted"
             _safe_extract(zip_ref, extract_dir)
         _flatten_single_root_folder(extract_dir)
-        metadata = normalize_dataset_for_training(extract_dir)
+        metadata = inspect_dataset(extract_dir)
         validate_dataset_for_upload(extract_dir)
         return dataset_name, metadata
     except zipfile.BadZipFile:
@@ -294,7 +303,7 @@ async def _import_uploaded_zip(request: Request, file: UploadFile) -> dict[str, 
                 _safe_extract(zip_ref, extract_dir)
 
             _flatten_single_root_folder(extract_dir)
-            metadata = normalize_dataset_for_training(extract_dir)
+            metadata = inspect_dataset(extract_dir)
             validate_dataset_for_upload(extract_dir)
             replace_directory(extract_dir, target_dir)
             workflow = dataset_workflow_metadata(metadata, get_catalog())
@@ -329,6 +338,11 @@ def model_catalog():
     return get_catalog()
 
 
+@app.get("/api/resource-profile")
+def resource_profile():
+    return get_resource_profile()
+
+
 @app.post("/api/train")
 def start_train(train_request: TrainRequest, request: Request):
     model_entry = get_model(train_request.model_type)
@@ -357,6 +371,16 @@ def start_train(train_request: TrainRequest, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
+        resource_plan = enforce_resource_plan(
+            train_request.model_type,
+            params=extra_args,
+            batch_size=train_request.batch_size,
+        )
+        extra_args = resource_plan["normalized_params"]
+    except ResourcePlanError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         job_id = training_service.start_training_container(
             task_type=task_type,
             model_type=train_request.model_type,
@@ -366,6 +390,7 @@ def start_train(train_request: TrainRequest, request: Request):
             project_name=train_request.project_name,
             dataset_name=train_request.dataset_name,
             extra_args=extra_args,
+            resource_plan=resource_plan,
             owner_id=_request_user_id(request),
             owner_email=_request_user_email(request),
         )
@@ -489,6 +514,7 @@ def list_datasets(request: Request):
             continue
 
         metadata = inspect_dataset(item)
+        metadata["export_cache"] = export_cache_metadata(item)
         profile = _dataset_profile(metadata)
         created = time.strftime("%Y-%m-%d", time.localtime(item.stat().st_ctime))
         datasets.append(
@@ -506,12 +532,16 @@ def list_datasets(request: Request):
                 "yamlPath": metadata["yaml_path"],
                 "paddleocrTasks": metadata.get("paddleocr_tasks", []),
                 "sourceFormat": profile["source_format"],
+                "datasetTask": profile["dataset_task"],
+                "datasetTasks": profile["dataset_tasks"],
                 "canonicalTask": profile["canonical_task"],
+                "canonicalFormat": profile["canonical_format"],
                 "normalizedFormats": profile["normalized_formats"],
                 "annotationStats": profile["annotation_stats"],
                 "conversionWarnings": profile["conversion_warnings"],
                 "compatibleModels": profile["compatible_models"],
                 "readyModels": profile["ready_models"],
+                "exportCache": profile["export_cache"],
                 "createdBy": owner_id,
             }
         )
@@ -599,6 +629,7 @@ def dataset_metadata(dataset_name: str, request: Request):
         raise HTTPException(status_code=404, detail="Dataset not found")
     _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     metadata = inspect_dataset(target_dir)
+    metadata["export_cache"] = export_cache_metadata(target_dir)
     metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
     metadata.update(_dataset_profile(metadata))
     return metadata
@@ -615,4 +646,5 @@ def dataset_compatibility(dataset_name: str, request: Request):
         raise HTTPException(status_code=404, detail="Dataset not found")
     _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     metadata = inspect_dataset(target_dir)
+    metadata["export_cache"] = export_cache_metadata(target_dir)
     return {"dataset_name": dataset_name, **_dataset_profile(metadata)}

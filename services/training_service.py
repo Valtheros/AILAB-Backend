@@ -12,7 +12,7 @@ from rq import Queue
 from rq.command import send_stop_job_command
 from rq.job import Job, JobStatus
 
-from dataset_utils import find_dataset_yaml, inspect_dataset
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model
 from model_catalog import get_model
 from security_utils import contained_path, validate_slug
 from settings import DATASET_DIR, REDIS_URL, RUNS_DIR, ensure_runtime_dirs
@@ -94,20 +94,24 @@ class TrainingService:
         extra_args: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata = inspect_dataset(dataset_path)
-        model_entry = get_model(model_type)
-        expected_formats = set(model_entry.get("dataset_formats", [])) if model_entry else set()
         detected_formats = set(metadata["formats"])
+        model_entry = get_model(model_type)
         extra_args = extra_args or {}
 
         if model_entry and task_type != model_entry["task_type"]:
             raise ValueError(f"Model '{model_type}' belongs to task '{model_entry['task_type']}', not '{task_type}'.")
-        if expected_formats and not expected_formats.intersection(detected_formats):
-            raise ValueError(
-                f"Dataset '{dataset_path.name}' is not compatible with {model_type}. "
-                f"Detected formats: {sorted(detected_formats) or ['none']}. "
-                f"Expected one of: {sorted(expected_formats)}."
-            )
-        if task_type not in metadata["tasks"] and expected_formats:
+        if model_entry:
+            compatibility = compatible_models_for_metadata(
+                metadata,
+                {"tasks": [{"id": model_entry["task_type"], "models": [model_entry]}]},
+            )[0]
+            if not compatibility.get("ready"):
+                raise ValueError(
+                    f"Dataset '{dataset_path.name}' is not compatible with {model_type}. "
+                    f"{compatibility.get('reason', 'No compatibility rule matched.')} "
+                    f"Detected formats: {sorted(metadata['formats']) or ['none']}."
+                )
+        if model_entry and task_type not in metadata["tasks"]:
             raise ValueError(
                 f"Dataset '{dataset_path.name}' does not advertise task '{task_type}'. "
                 f"Detected tasks: {metadata['tasks'] or ['none']}."
@@ -203,6 +207,7 @@ class TrainingService:
         project_name: str,
         dataset_name: str | None = None,
         extra_args: dict[str, Any] | None = None,
+        resource_plan: dict[str, Any] | None = None,
         owner_id: str | None = None,
         owner_email: str | None = None,
     ) -> str:
@@ -223,21 +228,20 @@ class TrainingService:
                 extra_args=extra_args or {},
             )
         )
-        dataset_metadata = self._assert_dataset_matches_model(
+        self._assert_dataset_matches_model(
             dataset_path,
             model_type,
             task_type,
             extra_args=extra_args or {},
         )
-        data_yaml_path = None
-        uses_yolo_dataset = model_type == "yolo" or (
-            model_type == "faster_rcnn" and "yolo_detection" in dataset_metadata["formats"]
+        prepared_dataset = prepare_dataset_for_model(
+            dataset_path,
+            model_type,
+            extra_args=extra_args or {},
         )
-        if uses_yolo_dataset:
-            original_yaml = find_dataset_yaml(dataset_path)
-            if original_yaml is None:
-                raise ValueError(f"Dataset '{dataset_path.name}' is missing data.yaml for YOLO-style labels.")
-            data_yaml_path = self._create_worker_yaml(original_yaml, dataset_path)
+        dataset_metadata = prepared_dataset["metadata"]
+        worker_dataset_path = Path(prepared_dataset["dataset_path"])
+        data_yaml_path = prepared_dataset.get("data_yaml_path")
 
         job_config = {
             "task_type": task_type,
@@ -247,10 +251,13 @@ class TrainingService:
             "batch_size": batch_size,
             "project_name": project_name,
             "dataset_name": dataset_path.name,
-            "dataset_path": str(dataset_path),
+            "dataset_path": str(worker_dataset_path),
+            "source_dataset_path": str(dataset_path),
             "data_yaml_path": data_yaml_path,
             "dataset_metadata": dataset_metadata,
+            "dataset_export": prepared_dataset.get("export"),
             "extra_args": extra_args or {},
+            "resource_plan": resource_plan or {},
             "created_by": owner_id,
             "created_by_email": owner_email,
         }

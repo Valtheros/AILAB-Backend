@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
+from resource_guard import enrich_catalog_resources
+
 
 def _number(
     key: str,
@@ -540,44 +542,76 @@ CV_MODEL_CATALOG: dict[str, Any] = {
 
 DATASET_INTERFACES = {
     "resnet": {
+        "dataset_task": "image_classification",
+        "required_annotations": ["one class label per image"],
         "accepted_source_formats": ["imagefolder"],
+        "accepted_canonical_formats": ["imagefolder"],
         "canonical_format": "imagefolder",
         "conversion_targets": ["imagefolder"],
+        "train_export_format": "imagefolder",
     },
     "efficientnet": {
+        "dataset_task": "image_classification",
+        "required_annotations": ["one class label per image"],
         "accepted_source_formats": ["imagefolder"],
+        "accepted_canonical_formats": ["imagefolder"],
         "canonical_format": "imagefolder",
         "conversion_targets": ["imagefolder"],
+        "train_export_format": "imagefolder",
     },
     "yolo": {
+        "dataset_task": "object_detection",
+        "required_annotations": ["bounding boxes"],
         "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
-        "canonical_format": "yolo_detection",
+        "accepted_canonical_formats": ["object_detection_boxes"],
+        "canonical_format": "object_detection_boxes",
         "conversion_targets": ["yolo_detection"],
+        "train_export_format": "yolo_detection",
     },
     "faster_rcnn": {
+        "dataset_task": "object_detection",
+        "required_annotations": ["bounding boxes"],
         "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
-        "canonical_format": "coco_instances_or_yolo_detection",
+        "accepted_canonical_formats": ["object_detection_boxes", "coco_instance_masks"],
+        "canonical_format": "object_detection_boxes",
         "conversion_targets": ["coco_instances", "yolo_detection"],
+        "train_export_format": "coco_instances_or_yolo_detection",
     },
     "deeplabv3plus": {
+        "dataset_task": "semantic_segmentation",
+        "required_annotations": ["one class ID per pixel mask"],
         "accepted_source_formats": ["semantic_masks"],
+        "accepted_canonical_formats": ["semantic_masks"],
         "canonical_format": "semantic_masks",
         "conversion_targets": ["semantic_masks"],
+        "train_export_format": "semantic_masks",
     },
     "mask_rcnn": {
+        "dataset_task": "instance_segmentation",
+        "required_annotations": ["instance masks", "bounding boxes"],
         "accepted_source_formats": ["coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
-        "canonical_format": "coco_instances",
+        "accepted_canonical_formats": ["coco_instance_masks"],
+        "canonical_format": "coco_instance_masks",
         "conversion_targets": ["coco_instances"],
+        "train_export_format": "coco_instances",
     },
     "paddleocr": {
+        "dataset_task": "ocr_recognition_or_detection",
+        "required_annotations": ["OCR recognition text labels or OCR detection boxes"],
         "accepted_source_formats": ["paddleocr_labels", "tesseract_ground_truth"],
-        "canonical_format": "paddleocr_labels",
+        "accepted_canonical_formats": ["ocr_recognition_labels", "ocr_detection_labels"],
+        "canonical_format": "ocr_labels",
         "conversion_targets": ["paddleocr_labels"],
+        "train_export_format": "paddleocr_labels",
     },
     "tesseract": {
+        "dataset_task": "ocr_recognition",
+        "required_annotations": ["OCR recognition ground truth text"],
         "accepted_source_formats": ["tesseract_ground_truth", "paddleocr_recognition_labels"],
-        "canonical_format": "tesseract_ground_truth",
+        "accepted_canonical_formats": ["ocr_recognition_labels"],
+        "canonical_format": "ocr_recognition_labels",
         "conversion_targets": ["tesseract_ground_truth"],
+        "train_export_format": "tesseract_ground_truth",
     },
 }
 
@@ -590,7 +624,7 @@ def _enrich_catalog_interfaces(catalog: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_catalog() -> dict[str, Any]:
-    return _enrich_catalog_interfaces(deepcopy(CV_MODEL_CATALOG))
+    return enrich_catalog_resources(_enrich_catalog_interfaces(deepcopy(CV_MODEL_CATALOG)))
 
 
 def flatten_models() -> dict[str, dict[str, Any]]:

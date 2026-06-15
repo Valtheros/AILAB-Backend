@@ -21,6 +21,28 @@ class ModelCatalogValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_model_params("yolo", {"batch_size": -1})
 
+
+    def test_catalog_models_expose_dataset_interface_metadata(self):
+        catalog = get_catalog()
+        for task in catalog["tasks"]:
+            for model in task["models"]:
+                with self.subTest(model=model["id"]):
+                    self.assertTrue(model.get("dataset_task"))
+                    self.assertTrue(model.get("required_annotations"))
+                    self.assertTrue(model.get("accepted_canonical_formats"))
+                    self.assertTrue(model.get("train_export_format"))
+
+
+    def test_catalog_models_expose_resource_guardrail_metadata(self):
+        catalog = get_catalog()
+        for task in catalog["tasks"]:
+            for model in task["models"]:
+                with self.subTest(model=model["id"]):
+                    self.assertTrue(model.get("safe_defaults"))
+                    self.assertTrue(model.get("hard_limits"))
+                    self.assertTrue(model.get("memory_notes"))
+                    self.assertEqual(model.get("resource_profile", {}).get("policy"), "auto_safe")
+
     def test_paddleocr_catalog_exposes_base_model_presets(self):
         catalog = get_catalog()
         ocr_task = next(task for task in catalog["tasks"] if task["id"] == "ocr")
