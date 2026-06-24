@@ -484,7 +484,7 @@ CV_MODEL_CATALOG: dict[str, Any] = {
                     "model_name": "yolo11n",
                     "runtime": "pytorch/pytorch + ultralytics",
                     "dataset_formats": ["yolo_detection"],
-                    "reason": "Existing platform model.",
+                    "reason": "Fast YOLOv11 detector for bounding-box object detection with a practical speed and accuracy baseline.",
                     "params": [
                         _select(
                             "model_size",
