@@ -6,6 +6,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from security_utils import contained_path
+from .input_limits import MAX_BOXES_PER_IMAGE, iter_text_lines_limited, open_rgb_image_checked, read_json_limited, validate_coco_document, validate_coco_segmentation
 from .trainer_utils import IMAGE_EXTENSIONS, list_images, read_classes_from_yaml, read_yaml, split_image_dir
 
 
@@ -29,14 +30,16 @@ class YoloBoxDataset:
         import torchvision.transforms.functional as F
 
         image_path = self.images[index]
-        image = Image.open(image_path).convert("RGB")
+        image = open_rgb_image_checked(image_path)
         width, height = image.size
         label_path = self._label_path(image_path)
 
         boxes = []
         labels = []
         if label_path.exists():
-            for line in label_path.read_text(encoding="utf-8").splitlines():
+            for row_index, line in enumerate(iter_text_lines_limited(label_path, label="YOLO label file"), start=1):
+                if row_index > MAX_BOXES_PER_IMAGE:
+                    raise ValueError(f"YOLO label file has more than {MAX_BOXES_PER_IMAGE} boxes: {label_path}")
                 parts = line.strip().split()
                 if len(parts) < 5:
                     continue
@@ -84,7 +87,8 @@ class CocoInstanceDataset:
         if annotation_path is None:
             raise ValueError(f"No COCO annotation file found for split '{split}'.")
 
-        data = json.loads(annotation_path.read_text(encoding="utf-8"))
+        data = read_json_limited(annotation_path)
+        validate_coco_document(data, str(annotation_path))
         self.annotation_root = annotation_path.parent
         self.images_by_id = {image["id"]: image for image in data.get("images", [])}
         categories = sorted(data.get("categories", []), key=lambda category: category["id"])
@@ -108,7 +112,7 @@ class CocoInstanceDataset:
         image_id, annotations = self.items[index]
         image_info = self.images_by_id[image_id]
         image_path = self._resolve_image_path(image_info["file_name"])
-        image = Image.open(image_path).convert("RGB")
+        image = open_rgb_image_checked(image_path)
         width, height = image.size
 
         boxes = []
@@ -193,11 +197,13 @@ class CocoInstanceDataset:
         draw = ImageDraw.Draw(mask_image)
         segmentation = annotation.get("segmentation", [])
         if isinstance(segmentation, list):
-            for polygon in segmentation:
-                if len(polygon) >= 6 and len(polygon) % 2 == 0:
-                    points = [(polygon[i], polygon[i + 1]) for i in range(0, len(polygon), 2)]
-                    draw.polygon(points, outline=1, fill=1)
+            if validate_coco_segmentation(segmentation, width, height):
+                for polygon in segmentation:
+                    if len(polygon) >= 6 and len(polygon) % 2 == 0:
+                        points = [(polygon[i], polygon[i + 1]) for i in range(0, len(polygon), 2)]
+                        draw.polygon(points, outline=1, fill=1)
         elif isinstance(segmentation, dict):
+            validate_coco_segmentation(segmentation, width, height)
             try:
                 from pycocotools import mask as coco_mask
             except ImportError as exc:

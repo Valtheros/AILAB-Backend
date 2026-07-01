@@ -94,6 +94,12 @@ def list_images(directory: Path) -> list[Path]:
     return sorted(path for path in directory.rglob("*") if path.suffix.lower() in IMAGE_EXTENSIONS)
 
 
+def guarded_image_loader(path: str):
+    from .input_limits import open_rgb_image_checked
+
+    return open_rgb_image_checked(Path(path))
+
+
 def append_csv_row(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     exists = path.exists()

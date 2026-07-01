@@ -49,9 +49,15 @@ app.add_middleware(
 )
 
 
+PUBLIC_API_PATHS = {"/api/model-catalog", "/api/resource-profile"}
+
+
 @app.middleware("http")
 async def require_internal_token(request: Request, call_next):
-    if BACKEND_INTERNAL_TOKEN and request.url.path.startswith("/api"):
+    path = request.url.path
+    if path.startswith("/api") and path not in PUBLIC_API_PATHS:
+        if not BACKEND_INTERNAL_TOKEN:
+            return JSONResponse({"detail": "BACKEND_INTERNAL_TOKEN must be set for protected backend API routes"}, status_code=503)
         provided = request.headers.get("x-internal-token")
         if provided != BACKEND_INTERNAL_TOKEN:
             return JSONResponse({"detail": "Unauthorized backend request"}, status_code=401)
@@ -88,6 +94,13 @@ def _request_user_email(request: Request) -> str | None:
     return value.strip() if value and value.strip() else None
 
 
+def _require_request_user_id(request: Request) -> str:
+    user_id = _request_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authenticated user identity is required")
+    return user_id
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -109,24 +122,22 @@ def _dataset_owner(dataset_dir: Path) -> str | None:
 
 def _write_dataset_metadata(dataset_dir: Path, request: Request, workflow: dict[str, Any] | None = None) -> None:
     metadata = _read_json_file(_dataset_meta_path(dataset_dir))
-    owner_id = _request_user_id(request)
-    if owner_id:
-        metadata.update(
-            {
-                "created_by": owner_id,
-                "created_by_email": _request_user_email(request),
-                "created_at": metadata.get("created_at") or int(time.time()),
-            }
-        )
+    owner_id = _require_request_user_id(request)
+    metadata.update(
+        {
+            "created_by": owner_id,
+            "created_by_email": _request_user_email(request),
+            "created_at": metadata.get("created_at") or int(time.time()),
+        }
+    )
     if workflow:
         metadata.update({"workflow": workflow})
-    if metadata:
-        _dataset_meta_path(dataset_dir).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    _dataset_meta_path(dataset_dir).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def _assert_owned_resource_visible(owner_id: str | None, request: Request) -> None:
-    request_owner = _request_user_id(request)
-    if request_owner and owner_id and owner_id != request_owner:
+    request_owner = _require_request_user_id(request)
+    if not owner_id or owner_id != request_owner:
         raise HTTPException(status_code=404, detail="Resource not found")
 
 
@@ -290,8 +301,8 @@ async def _import_uploaded_zip(request: Request, file: UploadFile) -> dict[str, 
     try:
         with named_file_lock(DATASET_DIR, dataset_name, "dataset name"):
             target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
-            request_owner = _request_user_id(request)
-            if request_owner and target_owner and target_owner != request_owner:
+            request_owner = _require_request_user_id(request)
+            if target_dir.exists() and target_owner != request_owner:
                 raise HTTPException(
                     status_code=409,
                     detail="Dataset name already exists. Rename the ZIP and upload again.",
@@ -391,10 +402,12 @@ def start_train(train_request: TrainRequest, request: Request):
             dataset_name=train_request.dataset_name,
             extra_args=extra_args,
             resource_plan=resource_plan,
-            owner_id=_request_user_id(request),
+            owner_id=_require_request_user_id(request),
             owner_email=_request_user_email(request),
         )
         return {"status": "success", "job_id": job_id, "container_id": job_id}
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     except FileExistsError as exc:
@@ -502,6 +515,7 @@ async def job_events(job_id: str, request: Request):
 
 @app.get("/api/datasets")
 def list_datasets(request: Request):
+    request_owner = _require_request_user_id(request)
     datasets = []
     if not DATASET_DIR.exists():
         return {"datasets": []}
@@ -510,7 +524,7 @@ def list_datasets(request: Request):
         if not item.is_dir() or item.name.startswith("."):
             continue
         owner_id = _dataset_owner(item)
-        if _request_user_id(request) and owner_id and owner_id != _request_user_id(request):
+        if owner_id != request_owner:
             continue
 
         metadata = inspect_dataset(item)
@@ -550,7 +564,8 @@ def list_datasets(request: Request):
 
 
 @app.post("/api/datasets/inspect-upload")
-async def inspect_dataset_upload(file: UploadFile = File(...)):
+async def inspect_dataset_upload(request: Request, file: UploadFile = File(...)):
+    _require_request_user_id(request)
     dataset_name, metadata = await _inspect_uploaded_zip(file)
     return {"status": "success", "dataset_name": dataset_name, "profile": _dataset_profile(metadata)}
 
@@ -584,7 +599,7 @@ def delete_dataset(dataset_name: str, request: Request):
 
 @app.get("/api/runs")
 def list_runs(request: Request):
-    return {"runs": training_service.list_runs(owner_id=_request_user_id(request))}
+    return {"runs": training_service.list_runs(owner_id=_require_request_user_id(request))}
 
 
 @app.delete("/api/runs/{project_name}")

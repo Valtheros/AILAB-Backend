@@ -586,6 +586,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             dataset = root / "coco_box"
             train = dataset / "train"
             train.mkdir(parents=True)
+            (dataset / ".ailab_dataset.json").write_text(json.dumps({"created_by": "owner-a"}), encoding="utf-8")
             (train / "image_001.jpg").write_bytes(b"not-an-image")
             (train / "_annotations.coco.json").write_text(
                 json.dumps(
@@ -607,6 +608,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             dataset = root / "coco_box"
             train = dataset / "train"
             train.mkdir(parents=True)
+            (dataset / ".ailab_dataset.json").write_text(json.dumps({"created_by": "owner-a"}), encoding="utf-8")
             (dataset / "data.yaml").write_text("train: train/images\nnames: ['space']", encoding="utf-8")
             (train / "image_001.jpg").write_bytes(b"not-an-image")
             (train / "_annotations.coco.json").write_text(
@@ -627,6 +629,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
                 batch_size=1,
                 project_name="coco_run",
                 dataset_name="coco_box",
+                owner_id="owner-a",
             )
             self.assertEqual(job_id, "job-1")
             queued_config = service.queues["cv_training"].jobs[0][1]
@@ -639,6 +642,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             dataset = root / "coco_box"
             train = dataset / "train"
             train.mkdir(parents=True)
+            (dataset / ".ailab_dataset.json").write_text(json.dumps({"created_by": "owner-a"}), encoding="utf-8")
             (train / "image_001.jpg").write_bytes(b"not-an-image")
             (train / "_annotations.coco.json").write_text(
                 json.dumps(
@@ -660,6 +664,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
                 project_name="yolo_coco_run",
                 dataset_name="coco_box",
                 extra_args={"model_size": "n"},
+                owner_id="owner-a",
             )
 
             self.assertEqual(job_id, "job-1")

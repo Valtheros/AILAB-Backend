@@ -62,7 +62,7 @@ class TrainingService:
 
     def _is_dataset_visible(self, dataset_path: Path, owner_id: str | None = None) -> bool:
         dataset_owner = self._dataset_owner(dataset_path)
-        return not owner_id or not dataset_owner or dataset_owner == owner_id
+        return bool(owner_id and dataset_owner and dataset_owner == owner_id)
 
     def _assert_dataset_visible(self, dataset_path: Path, owner_id: str | None = None) -> None:
         if not self._is_dataset_visible(dataset_path, owner_id):
@@ -212,6 +212,8 @@ class TrainingService:
         owner_email: str | None = None,
     ) -> str:
         self._ensure_redis()
+        if not owner_id:
+            raise PermissionError("Authenticated user identity is required to start training.")
         validate_slug(project_name, "project name")
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         project_dir = contained_path(self.runs_dir, project_name)
@@ -290,8 +292,7 @@ class TrainingService:
         job.meta["model_type"] = model_type
         job.meta["task_type"] = task_type
         job.meta["queue"] = queue_name
-        if owner_id:
-            job.meta["created_by"] = owner_id
+        job.meta["created_by"] = owner_id
         if owner_email:
             job.meta["created_by_email"] = owner_email
         job.save_meta()
@@ -444,6 +445,8 @@ class TrainingService:
             raise RuntimeError(f"Could not stop job {job_id}: {exc}")
 
     def list_runs(self, owner_id: str | None = None) -> list[dict[str, Any]]:
+        if not owner_id:
+            return []
         runs = []
         for project_dir in sorted(self.runs_dir.iterdir(), key=lambda path: path.stat().st_mtime, reverse=True):
             if not project_dir.is_dir() or project_dir.name.startswith("."):
@@ -456,7 +459,7 @@ class TrainingService:
                 except Exception:
                     config = {}
             run_owner = config.get("created_by")
-            if owner_id and run_owner and run_owner != owner_id:
+            if run_owner != owner_id:
                 continue
 
             files = []

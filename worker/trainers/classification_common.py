@@ -103,8 +103,8 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
         ]
     )
 
-    train_dataset = ImageFolder(train_dir, transform=train_transform)
-    val_dataset = ImageFolder(val_dir, transform=val_transform) if val_dir.exists() else None
+    train_dataset = ImageFolder(train_dir, transform=train_transform, loader=guarded_image_loader)
+    val_dataset = ImageFolder(val_dir, transform=val_transform, loader=guarded_image_loader) if val_dir.exists() else None
     num_classes = len(train_dataset.classes)
     if num_classes < 2:
         raise ValueError("Image classification requires at least two class folders.")

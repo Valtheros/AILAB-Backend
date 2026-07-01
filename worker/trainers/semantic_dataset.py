@@ -4,6 +4,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from .input_limits import open_image_checked, open_rgb_image_checked
 from .trainer_utils import IMAGE_EXTENSIONS, MASK_EXTENSIONS, list_images
 
 
@@ -30,8 +31,8 @@ class SemanticMaskDataset:
 
         image_path = self.images[index]
         mask_path = self._mask_path(image_path)
-        image = Image.open(image_path).convert("RGB")
-        mask = Image.open(mask_path)
+        image = open_rgb_image_checked(image_path)
+        mask = open_image_checked(mask_path)
         if mask.mode not in {"L", "P", "I", "I;16"}:
             mask = mask.convert("L")
         image = F.resize(image, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)

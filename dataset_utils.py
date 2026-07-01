@@ -32,6 +32,85 @@ TRAINABLE_FORMATS = {
 }
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+MAX_LABEL_FILE_BYTES = _env_int("AILAB_MAX_LABEL_FILE_BYTES", 2 * 1024 * 1024)
+MAX_LABEL_ROWS = _env_int("AILAB_MAX_LABEL_ROWS", 100_000)
+MAX_BOXES_PER_IMAGE = _env_int("AILAB_MAX_BOXES_PER_IMAGE", 10_000)
+MAX_OCR_TEXT_CHARS = _env_int("AILAB_MAX_OCR_TEXT_CHARS", 10_000)
+MAX_COCO_JSON_BYTES = _env_int("AILAB_MAX_COCO_JSON_BYTES", 64 * 1024 * 1024)
+MAX_COCO_IMAGES = _env_int("AILAB_MAX_COCO_IMAGES", 200_000)
+MAX_COCO_ANNOTATIONS = _env_int("AILAB_MAX_COCO_ANNOTATIONS", 1_000_000)
+MAX_COCO_ANNOTATIONS_PER_IMAGE = _env_int("AILAB_MAX_COCO_ANNOTATIONS_PER_IMAGE", 10_000)
+MAX_COCO_POLYGON_POINTS = _env_int("AILAB_MAX_COCO_POLYGON_POINTS", 20_000)
+MAX_COCO_MASKS_PER_IMAGE = _env_int("AILAB_MAX_COCO_MASKS_PER_IMAGE", 1_000)
+MAX_SOURCE_IMAGE_PIXELS = _env_int("AILAB_MAX_SOURCE_IMAGE_PIXELS", 100_000_000)
+
+
+def _ensure_file_size(path: Path, max_bytes: int, label: str) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"Could not stat {label}: {path}") from exc
+    if size > max_bytes:
+        raise ValueError(f"{label} exceeds {max_bytes} bytes: {path}")
+
+
+def _read_text_limited(path: Path, *, max_bytes: int = MAX_LABEL_FILE_BYTES, label: str = "label file") -> str:
+    _ensure_file_size(path, max_bytes, label)
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _iter_text_lines_limited(
+    path: Path,
+    *,
+    max_bytes: int = MAX_LABEL_FILE_BYTES,
+    max_rows: int = MAX_LABEL_ROWS,
+    label: str = "label file",
+):
+    _ensure_file_size(path, max_bytes, label)
+    with open(path, "r", encoding="utf-8", errors="ignore") as file:
+        for index, line in enumerate(file, start=1):
+            if index > max_rows:
+                raise ValueError(f"{label} exceeds {max_rows} rows: {path}")
+            yield line.rstrip("\r\n")
+
+
+def _read_json_limited(path: Path, *, max_bytes: int = MAX_COCO_JSON_BYTES, label: str = "COCO annotation file") -> Any:
+    _ensure_file_size(path, max_bytes, label)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _ensure_ocr_text_length(text: str, label: str) -> None:
+    if len(text) > MAX_OCR_TEXT_CHARS:
+        raise ValueError(f"{label} exceeds {MAX_OCR_TEXT_CHARS} characters")
+
+
+def _ensure_pixel_budget(width: float, height: float, label: str) -> None:
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{label} has invalid dimensions {width}x{height}")
+    pixels = int(width) * int(height)
+    if pixels > MAX_SOURCE_IMAGE_PIXELS:
+        raise ValueError(f"{label} has {pixels} pixels, above the {MAX_SOURCE_IMAGE_PIXELS} pixel limit")
+
+
+def _build_image_basename_index(dataset_dir: Path) -> dict[str, Path]:
+    index: dict[str, Path] = {}
+    for path in _iter_visible_files(dataset_dir):
+        if path.suffix.lower() not in IMAGE_EXTENSIONS or not path.is_file():
+            continue
+        index.setdefault(path.name, path)
+        if len(index) > MAX_COCO_IMAGES:
+            raise ValueError(f"Dataset contains more than {MAX_COCO_IMAGES} image basenames")
+    return index
+
+
 def safe_dataset_name(filename: str) -> str:
     name = filename.rsplit(".", 1)[0]
     return "".join(ch if ch.isascii() and (ch.isalnum() or ch in ("-", "_", ".")) else "_" for ch in name).strip("._") or "dataset"
@@ -168,25 +247,30 @@ def _yolo_row_kind(parts: list[str], class_count: int) -> str:
 
 
 def _inspect_yolo_labels(dataset_dir: Path, class_count: int = 0) -> dict[str, int]:
-    stats = {"files": 0, "box_rows": 0, "polygon_rows": 0, "invalid_rows": 0}
+    stats = {"files": 0, "box_rows": 0, "polygon_rows": 0, "invalid_rows": 0, "errors": []}
 
     for label_path in _iter_yolo_label_files(dataset_dir):
         stats["files"] += 1
+        row_count = 0
         try:
-            lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
+            for line in _iter_text_lines_limited(label_path, label="YOLO label file"):
+                row_count += 1
+                parts = line.strip().split()
+                if not parts:
+                    continue
+                kind = _yolo_row_kind(parts, class_count)
+                if kind == "box":
+                    if row_count > MAX_BOXES_PER_IMAGE:
+                        stats["errors"].append(f"YOLO label file has more than {MAX_BOXES_PER_IMAGE} boxes: {label_path}")
+                        break
+                    stats["box_rows"] += 1
+                elif kind == "polygon":
+                    stats["polygon_rows"] += 1
+                else:
+                    stats["invalid_rows"] += 1
+        except (OSError, ValueError) as exc:
+            stats["errors"].append(str(exc))
             continue
-        for line in lines:
-            parts = line.strip().split()
-            if not parts:
-                continue
-            kind = _yolo_row_kind(parts, class_count)
-            if kind == "box":
-                stats["box_rows"] += 1
-            elif kind == "polygon":
-                stats["polygon_rows"] += 1
-            else:
-                stats["invalid_rows"] += 1
 
     return stats
 
@@ -300,7 +384,7 @@ def _annotation_split(annotation_path: Path, dataset_dir: Path) -> str:
     return annotation_path.parent.name.lower() if annotation_path.parent != dataset_dir else "train"
 
 
-def _resolve_coco_image(dataset_dir: Path, annotation_path: Path, file_name: Any) -> Path | None:
+def _resolve_coco_image(dataset_dir: Path, annotation_path: Path, file_name: Any, image_index: dict[str, Path] | None = None) -> Path | None:
     if not isinstance(file_name, str) or not file_name.strip():
         return None
     normalized = file_name.strip().replace("\\", "/")
@@ -330,7 +414,13 @@ def _resolve_coco_image(dataset_dir: Path, annotation_path: Path, file_name: Any
     basename = Path(stripped).name
     if not basename:
         return None
+    if image_index is not None:
+        return image_index.get(basename)
+    scanned = 0
     for match in dataset_dir.rglob(basename):
+        scanned += 1
+        if scanned > MAX_COCO_IMAGES:
+            return None
         if _is_image_file(match):
             return match
     return None
@@ -346,8 +436,9 @@ def _valid_bbox(bbox: Any) -> bool:
     return width > 0 and height > 0
 
 
-def _valid_coco_segmentation(segmentation: Any) -> bool:
+def _valid_coco_segmentation(segmentation: Any, image_dimensions: tuple[float, float] | None = None) -> bool:
     if isinstance(segmentation, list):
+        total_points = 0
         for polygon in segmentation:
             if not isinstance(polygon, list) or len(polygon) < 6 or len(polygon) % 2 != 0:
                 continue
@@ -355,10 +446,28 @@ def _valid_coco_segmentation(segmentation: Any) -> bool:
                 [float(value) for value in polygon]
             except (TypeError, ValueError):
                 continue
+            total_points += len(polygon) // 2
+            if total_points > MAX_COCO_POLYGON_POINTS:
+                return False
             return True
         return False
     if isinstance(segmentation, dict):
-        return "counts" in segmentation and "size" in segmentation
+        size = segmentation.get("size")
+        if "counts" not in segmentation or not isinstance(size, (list, tuple)) or len(size) != 2:
+            return False
+        try:
+            height, width = int(size[0]), int(size[1])
+        except (TypeError, ValueError):
+            return False
+        try:
+            _ensure_pixel_budget(width, height, "COCO RLE mask")
+        except ValueError:
+            return False
+        if image_dimensions is not None:
+            image_width, image_height = image_dimensions
+            if int(round(image_width)) != width or int(round(image_height)) != height:
+                return False
+        return True
     return False
 
 
@@ -371,12 +480,21 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
         "box_annotations": 0,
         "mask_annotations": 0,
         "classes": [],
+        "errors": [],
     }
     class_names: dict[Any, str] = {}
+    try:
+        image_index = _build_image_basename_index(dataset_dir)
+    except ValueError as exc:
+        stats["errors"].append(str(exc))
+        image_index = {}
     for relative_file in stats["files"]:
         annotation_path = dataset_dir / relative_file
         try:
-            data = json.loads(annotation_path.read_text(encoding="utf-8"))
+            data = _read_json_limited(annotation_path)
+        except ValueError as exc:
+            stats["errors"].append(str(exc))
+            continue
         except Exception:
             continue
         if not isinstance(data, dict):
@@ -386,20 +504,48 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
         categories = data.get("categories", [])
         if not isinstance(images, list) or not isinstance(annotations, list):
             continue
+        if len(images) > MAX_COCO_IMAGES:
+            stats["errors"].append(f"COCO file {relative_file} has more than {MAX_COCO_IMAGES} images.")
+            continue
+        if len(annotations) > MAX_COCO_ANNOTATIONS:
+            stats["errors"].append(f"COCO file {relative_file} has more than {MAX_COCO_ANNOTATIONS} annotations.")
+            continue
+        annotations_per_image: dict[Any, int] = {}
+        masks_per_image: dict[Any, int] = {}
+        for annotation in annotations:
+            if isinstance(annotation, dict):
+                image_id_for_count = annotation.get("image_id")
+                annotations_per_image[image_id_for_count] = annotations_per_image.get(image_id_for_count, 0) + 1
+                if annotation.get("segmentation") is not None:
+                    masks_per_image[image_id_for_count] = masks_per_image.get(image_id_for_count, 0) + 1
+        if any(count > MAX_COCO_ANNOTATIONS_PER_IMAGE for count in annotations_per_image.values()):
+            stats["errors"].append(f"COCO file {relative_file} has too many annotations for one image.")
+            continue
+        if any(count > MAX_COCO_MASKS_PER_IMAGE for count in masks_per_image.values()):
+            stats["errors"].append(f"COCO file {relative_file} has too many masks for one image.")
+            continue
         if isinstance(categories, list):
             for category in categories:
                 if isinstance(category, dict) and "id" in category:
                     class_names[category.get("id")] = str(category.get("name", category.get("id")))
 
         found_image_ids = set()
+        image_dimensions_by_id: dict[Any, tuple[float, float]] = {}
         for image in images:
             if not isinstance(image, dict):
                 continue
             image_id = image.get("id")
-            image_path = _resolve_coco_image(dataset_dir, annotation_path, image.get("file_name"))
+            image_path = _resolve_coco_image(dataset_dir, annotation_path, image.get("file_name"), image_index)
             if image_path is None:
                 stats["missing_images"] += 1
                 continue
+            try:
+                dimensions = _image_dimensions(image_path, image)
+            except ValueError as exc:
+                stats["errors"].append(str(exc))
+                continue
+            if dimensions is not None:
+                image_dimensions_by_id[image_id] = dimensions
             found_image_ids.add(image_id)
 
         file_box_annotations = 0
@@ -416,9 +562,13 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
                 file_box_annotations += 1
             elif annotation.get("bbox") is not None:
                 stats["invalid_annotations"] += 1
-            if has_bbox and _valid_coco_segmentation(annotation.get("segmentation")):
-                stats["mask_annotations"] += 1
-                file_mask_annotations += 1
+            segmentation = annotation.get("segmentation")
+            if has_bbox and segmentation is not None:
+                if _valid_coco_segmentation(segmentation, image_dimensions_by_id.get(annotation.get("image_id"))):
+                    stats["mask_annotations"] += 1
+                    file_mask_annotations += 1
+                else:
+                    stats["errors"].append("COCO segmentation exceeds mask limits or does not match image dimensions.")
         if found_image_ids and (file_box_annotations or file_mask_annotations):
             stats["valid_files"].append(relative_file)
 
@@ -429,7 +579,7 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
 
 
 def _inspect_paddleocr_labels(dataset_dir: Path) -> dict[str, Any]:
-    stats: dict[str, Any] = {"tasks": [], "files": [], "missing_image_refs": 0}
+    stats: dict[str, Any] = {"tasks": [], "files": [], "missing_image_refs": 0, "errors": []}
     tasks = set()
     for path in dataset_dir.rglob("*"):
         if not path.is_file() or _is_export_path(path):
@@ -440,22 +590,24 @@ def _inspect_paddleocr_labels(dataset_dir: Path) -> dict[str, Any]:
         tasks.add(task)
         stats["files"].append(str(path.relative_to(dataset_dir)))
         try:
-            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
+            for line in _iter_text_lines_limited(path, label="PaddleOCR label file"):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                image_ref, text_value = (stripped.split("\t", 1) + [""])[:2]
+                image_ref = image_ref.strip()
+                _ensure_ocr_text_length(text_value.strip(), f"PaddleOCR label row in {path}")
+                if not image_ref:
+                    continue
+                normalized_ref = image_ref.replace("\\", "/")
+                candidate = _safe_child(path.parent, normalized_ref)
+                if candidate is None or not _is_image_file(candidate):
+                    candidate = _safe_child(dataset_dir, normalized_ref)
+                if candidate is None or not _is_image_file(candidate):
+                    stats["missing_image_refs"] += 1
+        except (OSError, ValueError) as exc:
+            stats["errors"].append(str(exc))
             continue
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            image_ref = stripped.split("\t", 1)[0].strip()
-            if not image_ref:
-                continue
-            normalized_ref = image_ref.replace("\\", "/")
-            candidate = _safe_child(path.parent, normalized_ref)
-            if candidate is None or not _is_image_file(candidate):
-                candidate = _safe_child(dataset_dir, normalized_ref)
-            if candidate is None or not _is_image_file(candidate):
-                stats["missing_image_refs"] += 1
     stats["tasks"] = sorted(tasks)
     return stats
 
@@ -469,17 +621,40 @@ def _find_tesseract_image_for_gt(gt_path: Path) -> Path | None:
     return None
 
 
-def _inspect_tesseract_ground_truth(dataset_dir: Path) -> dict[str, int]:
-    stats = {"gt_files": 0, "pairs": 0, "missing_images": 0}
+def _inspect_tesseract_ground_truth(dataset_dir: Path) -> dict[str, Any]:
+    stats: dict[str, Any] = {"gt_files": 0, "pairs": 0, "missing_images": 0, "errors": []}
     for gt_path in dataset_dir.rglob("*.gt.txt"):
         if not gt_path.is_file() or _is_export_path(gt_path):
             continue
         stats["gt_files"] += 1
+        try:
+            text = _read_text_limited(gt_path, label="Tesseract ground truth file").strip()
+            _ensure_ocr_text_length(text, f"Tesseract ground truth file {gt_path}")
+        except (OSError, ValueError) as exc:
+            stats["errors"].append(str(exc))
+            continue
         if _find_tesseract_image_for_gt(gt_path):
             stats["pairs"] += 1
         else:
             stats["missing_images"] += 1
     return stats
+
+
+def _inspect_source_pixel_budgets(dataset_dir: Path) -> list[str]:
+    errors: list[str] = []
+    for path in _iter_visible_files(dataset_dir):
+        if path.suffix.lower() not in IMAGE_EXTENSIONS.union(MASK_EXTENSIONS):
+            continue
+        try:
+            from PIL import Image
+
+            with Image.open(path) as image:
+                _ensure_pixel_budget(float(image.width), float(image.height), path.name)
+        except ValueError as exc:
+            errors.append(str(exc))
+        except Exception:
+            continue
+    return errors
 
 
 def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
@@ -526,6 +701,11 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     if has_yolo_segmentation:
         formats.append("yolo_segmentation")
         tasks.append("segmentation")
+    errors.extend(yolo_stats.get("errors", []))
+    errors.extend(coco_stats.get("errors", []))
+    errors.extend(paddleocr_stats.get("errors", []))
+    errors.extend(tesseract_stats.get("errors", []))
+    errors.extend(_inspect_source_pixel_budgets(dataset_dir))
     if has_yolo_yaml and yolo_stats["invalid_rows"]:
         errors.append(f"YOLO labels contain {yolo_stats['invalid_rows']} invalid rows.")
     if has_yolo_yaml and yolo_stats["box_rows"] and yolo_stats["polygon_rows"]:
@@ -830,16 +1010,23 @@ def _unique_child(directory: Path, filename: str, prefix: str = "") -> Path:
 def _image_dimensions(image_path: Path, image_record: dict[str, Any]) -> tuple[float, float] | None:
     width = image_record.get("width")
     height = image_record.get("height")
-    try:
-        if width and height:
-            return float(width), float(height)
-    except (TypeError, ValueError):
-        pass
+    if width and height:
+        try:
+            width_value, height_value = float(width), float(height)
+        except (TypeError, ValueError):
+            pass
+        else:
+            _ensure_pixel_budget(width_value, height_value, f"image {image_path.name}")
+            return width_value, height_value
     try:
         from PIL import Image
 
         with Image.open(image_path) as image:
-            return float(image.width), float(image.height)
+            width_value, height_value = float(image.width), float(image.height)
+            _ensure_pixel_budget(width_value, height_value, f"image {image_path.name}")
+            return width_value, height_value
+    except ValueError:
+        raise
     except Exception:
         return None
 
@@ -852,6 +1039,7 @@ def _convert_coco_to_yolo(dataset_dir: Path, normalized_root: Path, metadata: di
 
     output_root = normalized_root / "yolo_detection"
     output_root.mkdir(parents=True, exist_ok=True)
+    image_index = _build_image_basename_index(dataset_dir)
     classes = metadata.get("classes", []) or ["object"]
     wrote_labels = False
     splits: set[str] = set()
@@ -859,7 +1047,7 @@ def _convert_coco_to_yolo(dataset_dir: Path, normalized_root: Path, metadata: di
     for relative_file in coco_files:
         annotation_path = dataset_dir / relative_file
         try:
-            data = json.loads(annotation_path.read_text(encoding="utf-8"))
+            data = _read_json_limited(annotation_path)
         except Exception:
             warnings.append(f"Could not read COCO annotations from {relative_file}.")
             continue
@@ -889,7 +1077,7 @@ def _convert_coco_to_yolo(dataset_dir: Path, normalized_root: Path, metadata: di
         for image_record in images:
             if not isinstance(image_record, dict):
                 continue
-            source_image = _resolve_coco_image(dataset_dir, annotation_path, image_record.get("file_name"))
+            source_image = _resolve_coco_image(dataset_dir, annotation_path, image_record.get("file_name"), image_index)
             if source_image is None:
                 continue
             dimensions = _image_dimensions(source_image, image_record)
@@ -946,7 +1134,8 @@ def _convert_tesseract_to_paddleocr_rec(dataset_dir: Path, normalized_root: Path
         images_dir.mkdir(parents=True, exist_ok=True)
         target_image = _unique_child(images_dir, image_path.name)
         shutil.copy2(image_path, target_image)
-        text = gt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        text = _read_text_limited(gt_path, label="Tesseract ground truth file").strip()
+        _ensure_ocr_text_length(text, f"Tesseract ground truth file {gt_path}")
         rows.append(f"images/{target_image.name}\t{text}")
     if rows:
         output_root.mkdir(parents=True, exist_ok=True)
@@ -961,13 +1150,14 @@ def _convert_paddleocr_rec_to_tesseract(dataset_dir: Path, normalized_root: Path
         if NORMALIZED_DIR_NAME in label_path.parts:
             continue
         try:
-            lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            lines = list(_iter_text_lines_limited(label_path, label="PaddleOCR recognition label file"))
         except OSError:
             continue
         for line in lines:
             if "\t" not in line:
                 continue
             image_ref, text = line.split("\t", 1)
+            _ensure_ocr_text_length(text.strip(), f"PaddleOCR recognition label row in {label_path}")
             image_path = _safe_child(label_path.parent, image_ref.replace("\\", "/"))
             if image_path is None or not _is_image_file(image_path):
                 image_path = _safe_child(dataset_dir, image_ref.replace("\\", "/"))
@@ -1099,11 +1289,12 @@ def _write_coco_yolo_export(dataset_dir: Path, output_root: Path, metadata: dict
     wrote_labels = False
     splits: set[str] = set()
     output_root.mkdir(parents=True, exist_ok=True)
+    image_index = _build_image_basename_index(dataset_dir)
 
     for relative_file in coco_files:
         annotation_path = dataset_dir / relative_file
         try:
-            data = json.loads(annotation_path.read_text(encoding="utf-8"))
+            data = _read_json_limited(annotation_path)
         except Exception:
             warnings.append(f"Could not read COCO annotations from {relative_file}.")
             continue
@@ -1131,7 +1322,7 @@ def _write_coco_yolo_export(dataset_dir: Path, output_root: Path, metadata: dict
         for image_record in images:
             if not isinstance(image_record, dict):
                 continue
-            source_image = _resolve_coco_image(dataset_dir, annotation_path, image_record.get("file_name"))
+            source_image = _resolve_coco_image(dataset_dir, annotation_path, image_record.get("file_name"), image_index)
             if source_image is None:
                 continue
             dimensions = _image_dimensions(source_image, image_record)
@@ -1189,7 +1380,8 @@ def _write_tesseract_as_paddleocr_rec(dataset_dir: Path, output_root: Path) -> P
         images_dir.mkdir(parents=True, exist_ok=True)
         target_image = _unique_child(images_dir, image_path.name)
         shutil.copy2(image_path, target_image)
-        text = gt_path.read_text(encoding="utf-8", errors="ignore").strip()
+        text = _read_text_limited(gt_path, label="Tesseract ground truth file").strip()
+        _ensure_ocr_text_length(text, f"Tesseract ground truth file {gt_path}")
         rows.append(f"images/{target_image.name}\t{text}")
     if not rows:
         raise ValueError(f"Dataset '{dataset_dir.name}' has no Tesseract ground truth pairs to export for PaddleOCR recognition.")
@@ -1205,13 +1397,14 @@ def _write_paddleocr_rec_as_tesseract(dataset_dir: Path, output_root: Path) -> N
         if _is_export_path(label_path):
             continue
         try:
-            lines = label_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+            lines = list(_iter_text_lines_limited(label_path, label="PaddleOCR recognition label file"))
         except OSError:
             continue
         for line in lines:
             if "\t" not in line:
                 continue
             image_ref, text = line.split("\t", 1)
+            _ensure_ocr_text_length(text.strip(), f"PaddleOCR recognition label row in {label_path}")
             image_path = _safe_child(label_path.parent, image_ref.replace("\\", "/"))
             if image_path is None or not _is_image_file(image_path):
                 image_path = _safe_child(dataset_dir, image_ref.replace("\\", "/"))
