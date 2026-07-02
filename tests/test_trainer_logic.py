@@ -218,6 +218,41 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("faster_rcnn", ready)
             self.assertNotIn("mask_rcnn", ready)
 
+    def test_coco_detection_with_invalid_masks_uploads_without_mask_rcnn(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 5, "name": "space"}],
+                        "annotations": [
+                            {
+                                "id": 1,
+                                "image_id": 1,
+                                "category_id": 5,
+                                "bbox": [1, 1, 4, 4],
+                                "segmentation": {"counts": "abc", "size": [100000, 100000]},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata = inspect_dataset(root)
+            ready = {item["id"] for item in compatible_models_for_metadata(metadata, get_catalog()) if item["ready"]}
+
+            validate_dataset_for_upload(root)
+            self.assertIn("object_detection", metadata["tasks"])
+            self.assertNotIn("segmentation", metadata["tasks"])
+            self.assertTrue(any("invalid masks" in warning for warning in metadata["warnings"]))
+            self.assertIn("yolo", ready)
+            self.assertIn("faster_rcnn", ready)
+            self.assertNotIn("mask_rcnn", ready)
+
     def test_prepare_yolo_from_coco_box_dataset_uses_export_cache(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

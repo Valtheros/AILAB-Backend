@@ -51,6 +51,7 @@ MAX_COCO_ANNOTATIONS_PER_IMAGE = _env_int("AILAB_MAX_COCO_ANNOTATIONS_PER_IMAGE"
 MAX_COCO_POLYGON_POINTS = _env_int("AILAB_MAX_COCO_POLYGON_POINTS", 20_000)
 MAX_COCO_MASKS_PER_IMAGE = _env_int("AILAB_MAX_COCO_MASKS_PER_IMAGE", 1_000)
 MAX_SOURCE_IMAGE_PIXELS = _env_int("AILAB_MAX_SOURCE_IMAGE_PIXELS", 100_000_000)
+MAX_DATASET_ISSUES_RETURNED = _env_int("AILAB_MAX_DATASET_ISSUES_RETURNED", 12)
 
 
 def _ensure_file_size(path: Path, max_bytes: int, label: str) -> None:
@@ -65,6 +66,31 @@ def _ensure_file_size(path: Path, max_bytes: int, label: str) -> None:
 def _read_text_limited(path: Path, *, max_bytes: int = MAX_LABEL_FILE_BYTES, label: str = "label file") -> str:
     _ensure_file_size(path, max_bytes, label)
     return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def _summarize_issue_list(issues: Iterable[str], *, max_items: int = MAX_DATASET_ISSUES_RETURNED) -> list[str]:
+    counts: dict[str, int] = {}
+    ordered: list[str] = []
+    for issue in issues:
+        normalized = " ".join(str(issue).split())
+        if not normalized:
+            continue
+        if normalized not in counts:
+            ordered.append(normalized)
+            counts[normalized] = 0
+        counts[normalized] += 1
+
+    summarized: list[str] = []
+    for issue in ordered[:max_items]:
+        count = counts[issue]
+        if count > 1:
+            summarized.append(f"{issue} (repeated {count} times)")
+        else:
+            summarized.append(issue)
+    omitted = len(ordered) - max_items
+    if omitted > 0:
+        summarized.append(f"{omitted} more unique dataset issues were omitted.")
+    return summarized
 
 
 def _iter_text_lines_limited(
@@ -481,8 +507,11 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
         "mask_annotations": 0,
         "classes": [],
         "errors": [],
+        "warnings": [],
+        "invalid_segmentations": 0,
     }
     class_names: dict[Any, str] = {}
+    invalid_coco_segmentations = 0
     try:
         image_index = _build_image_basename_index(dataset_dir)
     except ValueError as exc:
@@ -568,9 +597,20 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
                     stats["mask_annotations"] += 1
                     file_mask_annotations += 1
                 else:
-                    stats["errors"].append("COCO segmentation exceeds mask limits or does not match image dimensions.")
+                    invalid_coco_segmentations += 1
         if found_image_ids and (file_box_annotations or file_mask_annotations):
             stats["valid_files"].append(relative_file)
+
+    if invalid_coco_segmentations:
+        stats["invalid_segmentations"] = invalid_coco_segmentations
+        issue = (
+            "COCO segmentation exceeds mask limits or does not match image dimensions "
+            f"({invalid_coco_segmentations} annotations)."
+        )
+        if stats["box_annotations"]:
+            stats["warnings"].append(f"{issue} Using COCO bounding boxes for object detection and ignoring invalid masks.")
+        else:
+            stats["errors"].append(issue)
 
     if class_names:
         sort_key = lambda item: (0, int(item[0])) if str(item[0]).isdigit() else (1, str(item[0]))
@@ -703,6 +743,7 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
         tasks.append("segmentation")
     errors.extend(yolo_stats.get("errors", []))
     errors.extend(coco_stats.get("errors", []))
+    warnings.extend(coco_stats.get("warnings", []))
     errors.extend(paddleocr_stats.get("errors", []))
     errors.extend(tesseract_stats.get("errors", []))
     errors.extend(_inspect_source_pixel_budgets(dataset_dir))
@@ -717,11 +758,12 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     if semantic_stats["missing_masks"]:
         preview = ", ".join(semantic_stats["missing_masks"][:5])
         errors.append(f"Semantic masks are missing for {len(semantic_stats['missing_masks'])} images: {preview}")
+    has_reliable_coco_masks = coco_stats["mask_annotations"] > 0 and not coco_stats.get("invalid_segmentations")
     if coco_stats["box_annotations"] or coco_stats["mask_annotations"]:
         formats.append("coco_instances")
         if coco_stats["box_annotations"]:
             tasks.append("object_detection")
-        if coco_stats["mask_annotations"]:
+        if has_reliable_coco_masks:
             tasks.append("segmentation")
         if not classes and coco_stats["classes"]:
             classes = coco_stats["classes"]
@@ -760,8 +802,8 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
         "semantic_masks": semantic_stats,
         "paddleocr_tasks": paddleocr_stats["tasks"],
         "tesseract": tesseract_stats,
-        "warnings": warnings,
-        "errors": errors,
+        "warnings": _summarize_issue_list(warnings),
+        "errors": _summarize_issue_list(errors),
     }
 
 
@@ -816,7 +858,7 @@ def _dataset_tasks_from_metadata(metadata: dict[str, Any]) -> list[str]:
         dataset_tasks.append("object_detection")
     if "semantic_masks" in formats:
         dataset_tasks.append("semantic_segmentation")
-    if coco.get("mask_annotations", 0) > 0:
+    if coco.get("mask_annotations", 0) > 0 and not coco.get("invalid_segmentations", 0):
         dataset_tasks.append("instance_segmentation")
     if "rec" in paddleocr_tasks or metadata.get("tesseract", {}).get("pairs", 0) > 0:
         dataset_tasks.append("ocr_recognition")
@@ -852,7 +894,7 @@ def _canonical_format_from_metadata(metadata: dict[str, Any]) -> str:
         return "imagefolder"
     if "semantic_masks" in formats:
         return "semantic_masks"
-    if coco.get("mask_annotations", 0) > 0:
+    if coco.get("mask_annotations", 0) > 0 and not coco.get("invalid_segmentations", 0):
         return "coco_instance_masks"
     if "yolo_detection" in formats or coco.get("box_annotations", 0) > 0:
         return "object_detection_boxes"
@@ -898,7 +940,8 @@ def _model_compatibility_reason(model_id: str, metadata: dict[str, Any], task_id
         ok = _has_bounding_boxes(metadata) and "object_detection" in tasks
         return ok, "Requires bounding boxes in YOLO or COCO; COCO can be used directly."
     if model_id == "mask_rcnn":
-        ok = "coco_instances" in formats and metadata.get("coco", {}).get("mask_annotations", 0) > 0
+        coco = metadata.get("coco", {})
+        ok = "coco_instances" in formats and coco.get("mask_annotations", 0) > 0 and not coco.get("invalid_segmentations", 0)
         return ok, "Requires COCO instance masks, not box-only annotations."
     if model_id == "deeplabv3plus":
         return "semantic_masks" in formats, "Requires image/mask semantic segmentation pairs."

@@ -177,9 +177,11 @@ class SecurityRegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             metadata = inspect_dataset(root)
-            self.assertTrue(any("COCO segmentation exceeds" in error for error in metadata["errors"]))
-            with self.assertRaises(ValueError):
-                validate_dataset_for_upload(root)
+            self.assertFalse(metadata["errors"])
+            self.assertTrue(any("COCO segmentation exceeds" in warning for warning in metadata["warnings"]))
+            self.assertIn("object_detection", metadata["tasks"])
+            self.assertNotIn("segmentation", metadata["tasks"])
+            validate_dataset_for_upload(root)
 
     def test_source_image_pixel_budget_uses_coco_dimensions(self):
         with tempfile.TemporaryDirectory() as temp:
