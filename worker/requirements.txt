@@ -1,28 +1,18 @@
-# ── Core ML Framework (pre-installed in base image, listed for clarity) ──
-torch
-torchvision
+# Match the versions shipped by the pinned PyTorch CUDA base image.
+torch==2.2.0
+torchvision==0.17.0
 
-# ── Computer Vision Models ───────────────────────────────────────────────
-# YOLO (v8, v9, v10, v11)
-ultralytics>=8.0.0
+# Model runtimes used by the exposed trainers.
+ultralytics==8.4.56
+segmentation-models-pytorch
 
-# timm: pretrained models สำหรับ classification (EfficientNet, ViT, etc.)
-timm
-
-# transformers: HuggingFace → RT-DETR, DETR, Swin Transformer, ฯลฯ
-transformers
-
-# ── Image Processing ─────────────────────────────────────────────────────
+# Image and dataset handling.
 opencv-python-headless
 Pillow
-albumentations
+pycocotools
+pyyaml
+numpy<2.0
 
-# ── Queue & Job Management ───────────────────────────────────────────────
+# Queue runtime.
 redis
 rq
-
-# ── Utilities ────────────────────────────────────────────────────────────
-pyyaml
-# NumPy 2.0 incompatible กับ PyTorch 2.2 → ต้อง pin ไว้ที่ <2.0
-numpy<2.0
-pandas
