@@ -90,6 +90,17 @@ class ResourceGuardTests(unittest.TestCase):
         self.assertEqual(plan["normalized_params"]["workers"], 4)
         self.assertTrue(plan["warnings"])
 
+    def test_estimated_vram_above_safe_limit_is_rejected(self):
+        plan = validate_resource_plan(
+            "resnet",
+            {"image_size": 224, "workers": 4, "device": "0"},
+            batch_size=64,
+            profile=TEST_PROFILE,
+        )
+        self.assertFalse(plan["ok"])
+        self.assertGreater(plan["estimated_vram_mb"], plan["safe_vram_mb"])
+        self.assertTrue(any("Estimated GPU memory" in error for error in plan["errors"]))
+
     def test_cpu_mode_uses_conservative_limits(self):
         plan = validate_resource_plan(
             "yolo",

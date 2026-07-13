@@ -35,6 +35,7 @@ class YOLOTrainer(BaseTrainer):
 
         self._write_log(log_path, f"[YOLOTrainer] model={model_name}, epochs={epochs}, batch={batch_size}")
         self._write_log(log_path, f"[YOLOTrainer] data={data_yaml}")
+        self._write_log(log_path, f"[YOLOTrainer] Loading {model_name}.pt; the first run may download or initialize model weights.")
 
         model = YOLO(f"{model_name}.pt")
         results = model.train(

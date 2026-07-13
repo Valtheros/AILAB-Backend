@@ -42,10 +42,13 @@ class DeepLabV3PlusTrainer(BaseTrainer):
         num_classes = int(args.get("num_classes", 2))
         ignore_index = int(args.get("ignore_index", 255))
         train_dataset = SemanticMaskDataset(config["dataset_path"], "train", image_size, num_classes, ignore_index)
-        try:
+        has_val_split = any((Path(config["dataset_path"]) / name).is_dir() for name in ("valid", "val", "validation"))
+        if has_val_split:
             val_dataset = SemanticMaskDataset(config["dataset_path"], "val", image_size, num_classes, ignore_index)
-        except Exception:
+        else:
             val_dataset = None
+        for warning in train_dataset.warnings + (val_dataset.warnings if val_dataset is not None else []):
+            self._write_log(log_path, f"[Dataset warning] {warning}")
 
         encoder_weights = args.get("encoder_weights", "imagenet")
         if encoder_weights == "none":
@@ -72,9 +75,12 @@ class DeepLabV3PlusTrainer(BaseTrainer):
         model.to(device)
         batch_size = require_positive_batch_size(int(config.get("batch_size", args.get("batch_size", 8))), "deeplabv3plus")
         workers = int(args.get("workers", 4))
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers)
+        worker_options = {"prefetch_factor": 1} if workers > 0 else {}
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers, **worker_options
+        )
         val_loader = (
-            DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
+            DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers, **worker_options)
             if val_dataset is not None
             else None
         )

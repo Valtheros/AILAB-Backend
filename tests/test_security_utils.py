@@ -35,7 +35,14 @@ if "yaml" not in sys.modules:
     sys.modules["yaml"] = types.SimpleNamespace(safe_load=_safe_load_stub, dump=_dump_stub)
 
 from dataset_utils import safe_dataset_name
-from security_utils import contained_path, named_file_lock, safe_extract_zip, validate_slug
+from security_utils import (
+    ReversibleDirectoryRemoval,
+    ReversibleDirectoryReplace,
+    contained_path,
+    named_file_lock,
+    safe_extract_zip,
+    validate_slug,
+)
 
 
 class SecurityUtilsTests(unittest.TestCase):
@@ -65,7 +72,41 @@ class SecurityUtilsTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     with named_file_lock(root, "shared_dataset", "dataset name"):
                         pass
-            self.assertFalse((root / ".locks" / "shared_dataset.lock").exists())
+                with self.assertRaises(FileExistsError):
+                    with named_file_lock(root, "shared_dataset", "dataset name"):
+                        pass
+            self.assertTrue((root / ".locks" / "shared_dataset.lock").exists())
+
+    def test_stale_lock_file_does_not_block_new_writer(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            locks = root / ".locks"
+            locks.mkdir()
+            (locks / "shared_dataset.lock").write_text("999999", encoding="utf-8")
+            with named_file_lock(root, "shared_dataset", "dataset name"):
+                pass
+
+    def test_directory_replace_rolls_back_to_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "dataset"
+            staging = root / "staging"
+            target.mkdir()
+            staging.mkdir()
+            (target / "value.txt").write_text("old", encoding="utf-8")
+            (staging / "value.txt").write_text("new", encoding="utf-8")
+            operation = ReversibleDirectoryReplace(staging, target).apply()
+            operation.rollback()
+            self.assertEqual((target / "value.txt").read_text(encoding="utf-8"), "old")
+            self.assertEqual((staging / "value.txt").read_text(encoding="utf-8"), "new")
+
+    def test_directory_removal_rolls_back_to_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "run"
+            target.mkdir()
+            operation = ReversibleDirectoryRemoval(target).apply()
+            operation.rollback()
+            self.assertTrue(target.is_dir())
 
     def test_safe_extract_rejects_parent_directory(self):
         archive = io.BytesIO()

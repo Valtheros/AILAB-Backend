@@ -3,12 +3,16 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import math
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+
+from security_utils import named_file_lock, replace_directory
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -41,6 +45,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 MAX_LABEL_FILE_BYTES = _env_int("AILAB_MAX_LABEL_FILE_BYTES", 2 * 1024 * 1024)
+MAX_YAML_FILE_BYTES = _env_int("AILAB_MAX_YAML_FILE_BYTES", 1024 * 1024)
+MAX_YAML_EVENTS = _env_int("AILAB_MAX_YAML_EVENTS", 20_000)
+MAX_YAML_DEPTH = _env_int("AILAB_MAX_YAML_DEPTH", 32)
 MAX_LABEL_ROWS = _env_int("AILAB_MAX_LABEL_ROWS", 100_000)
 MAX_BOXES_PER_IMAGE = _env_int("AILAB_MAX_BOXES_PER_IMAGE", 10_000)
 MAX_OCR_TEXT_CHARS = _env_int("AILAB_MAX_OCR_TEXT_CHARS", 10_000)
@@ -50,7 +57,11 @@ MAX_COCO_ANNOTATIONS = _env_int("AILAB_MAX_COCO_ANNOTATIONS", 1_000_000)
 MAX_COCO_ANNOTATIONS_PER_IMAGE = _env_int("AILAB_MAX_COCO_ANNOTATIONS_PER_IMAGE", 10_000)
 MAX_COCO_POLYGON_POINTS = _env_int("AILAB_MAX_COCO_POLYGON_POINTS", 20_000)
 MAX_COCO_MASKS_PER_IMAGE = _env_int("AILAB_MAX_COCO_MASKS_PER_IMAGE", 1_000)
-MAX_SOURCE_IMAGE_PIXELS = _env_int("AILAB_MAX_SOURCE_IMAGE_PIXELS", 100_000_000)
+MAX_COCO_RLE_COUNTS = _env_int("AILAB_MAX_COCO_RLE_COUNTS", 2_000_000)
+MAX_SOURCE_IMAGE_PIXELS = _env_int("AILAB_MAX_SOURCE_IMAGE_PIXELS", 25_000_000)
+MAX_COCO_DECODED_MASK_PIXELS_PER_IMAGE = _env_int(
+    "AILAB_MAX_COCO_DECODED_MASK_PIXELS_PER_IMAGE", 256_000_000
+)
 MAX_DATASET_ISSUES_RETURNED = _env_int("AILAB_MAX_DATASET_ISSUES_RETURNED", 12)
 
 
@@ -113,13 +124,36 @@ def _read_json_limited(path: Path, *, max_bytes: int = MAX_COCO_JSON_BYTES, labe
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_yaml_limited(path: Path, *, label: str = "dataset YAML") -> Any:
+    _ensure_file_size(path, MAX_YAML_FILE_BYTES, label)
+    text = path.read_text(encoding="utf-8")
+    depth = 0
+    event_count = 0
+    try:
+        for event in yaml.parse(text, Loader=yaml.SafeLoader):
+            event_count += 1
+            if event_count > MAX_YAML_EVENTS:
+                raise ValueError(f"{label} exceeds {MAX_YAML_EVENTS} YAML events")
+            if isinstance(event, yaml.events.AliasEvent):
+                raise ValueError(f"{label} must not contain YAML aliases")
+            if isinstance(event, (yaml.events.MappingStartEvent, yaml.events.SequenceStartEvent)):
+                depth += 1
+                if depth > MAX_YAML_DEPTH:
+                    raise ValueError(f"{label} exceeds the maximum YAML nesting depth of {MAX_YAML_DEPTH}")
+            elif isinstance(event, (yaml.events.MappingEndEvent, yaml.events.SequenceEndEvent)):
+                depth -= 1
+        return yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Could not parse {label}: {exc}") from exc
+
+
 def _ensure_ocr_text_length(text: str, label: str) -> None:
     if len(text) > MAX_OCR_TEXT_CHARS:
         raise ValueError(f"{label} exceeds {MAX_OCR_TEXT_CHARS} characters")
 
 
 def _ensure_pixel_budget(width: float, height: float, label: str) -> None:
-    if width <= 0 or height <= 0:
+    if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
         raise ValueError(f"{label} has invalid dimensions {width}x{height}")
     pixels = int(width) * int(height)
     if pixels > MAX_SOURCE_IMAGE_PIXELS:
@@ -152,7 +186,7 @@ def format_bytes(size: int) -> str:
 
 def _iter_visible_files(dataset_dir: Path):
     for root, dirs, files in os.walk(dataset_dir):
-        dirs[:] = [name for name in dirs if name not in {NORMALIZED_DIR_NAME, EXPORTS_DIR_NAME}]
+        dirs[:] = [name for name in dirs if name not in {NORMALIZED_DIR_NAME, EXPORTS_DIR_NAME, ".locks"}]
         for file in files:
             yield Path(root) / file
 
@@ -163,7 +197,7 @@ def _is_export_path(path: Path) -> bool:
 
 def _iter_source_files(dataset_dir: Path):
     for root, dirs, files in os.walk(dataset_dir):
-        dirs[:] = [name for name in dirs if name not in {NORMALIZED_DIR_NAME, EXPORTS_DIR_NAME}]
+        dirs[:] = [name for name in dirs if name not in {NORMALIZED_DIR_NAME, EXPORTS_DIR_NAME, ".locks"}]
         for file in files:
             path = Path(root) / file
             if path.name in SOURCE_FINGERPRINT_SKIP_FILES:
@@ -204,10 +238,7 @@ def find_dataset_yaml(dataset_dir: Path) -> Path | None:
 def read_yaml_classes(yaml_path: Path | None) -> list[str]:
     if not yaml_path or not yaml_path.exists():
         return []
-    try:
-        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return []
+    data = read_yaml_limited(yaml_path) or {}
     if not isinstance(data, dict):
         return []
 
@@ -272,11 +303,49 @@ def _yolo_row_kind(parts: list[str], class_count: int) -> str:
     return "invalid"
 
 
-def _inspect_yolo_labels(dataset_dir: Path, class_count: int = 0) -> dict[str, int]:
-    stats = {"files": 0, "box_rows": 0, "polygon_rows": 0, "invalid_rows": 0, "errors": []}
+def _yolo_label_image(dataset_dir: Path, label_path: Path) -> Path | None:
+    try:
+        relative_parts = list(label_path.relative_to(dataset_dir).parts)
+    except ValueError:
+        return None
+    label_indexes = [index for index, part in enumerate(relative_parts) if part.lower() == "labels"]
+    if label_indexes:
+        image_parts = list(relative_parts)
+        image_parts[label_indexes[-1]] = "images"
+        image_base = dataset_dir.joinpath(*image_parts).with_suffix("")
+        for extension in IMAGE_EXTENSIONS:
+            candidate = image_base.with_suffix(extension)
+            if candidate.is_file():
+                return candidate
+    matches = [
+        path
+        for path in dataset_dir.rglob(f"{label_path.stem}.*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _inspect_yolo_labels(
+    dataset_dir: Path,
+    class_count: int = 0,
+    max_files: int | None = None,
+) -> dict[str, Any]:
+    stats = {
+        "files": 0,
+        "box_rows": 0,
+        "polygon_rows": 0,
+        "invalid_rows": 0,
+        "orphan_labels": 0,
+        "polygon_examples": [],
+        "errors": [],
+    }
 
     for label_path in _iter_yolo_label_files(dataset_dir):
+        if max_files is not None and stats["files"] >= max_files:
+            break
         stats["files"] += 1
+        if _yolo_label_image(dataset_dir, label_path) is None:
+            stats["orphan_labels"] += 1
         row_count = 0
         try:
             for line in _iter_text_lines_limited(label_path, label="YOLO label file"):
@@ -292,6 +361,10 @@ def _inspect_yolo_labels(dataset_dir: Path, class_count: int = 0) -> dict[str, i
                     stats["box_rows"] += 1
                 elif kind == "polygon":
                     stats["polygon_rows"] += 1
+                    if len(stats["polygon_examples"]) < 5:
+                        stats["polygon_examples"].append(
+                            f"{label_path.relative_to(dataset_dir).as_posix()}:{row_count}"
+                        )
                 else:
                     stats["invalid_rows"] += 1
         except (OSError, ValueError) as exc:
@@ -317,6 +390,19 @@ def _imagefolder_classes(dataset_dir: Path) -> list[str]:
                 classes.append(item.name)
         if classes:
             return sorted(classes)
+    return []
+
+
+def _imagefolder_split_classes(dataset_dir: Path, split_names: tuple[str, ...]) -> list[str]:
+    for split_name in split_names:
+        split_dir = dataset_dir / split_name
+        if not split_dir.is_dir():
+            continue
+        return sorted(
+            item.name
+            for item in split_dir.iterdir()
+            if item.is_dir() and any(path.suffix.lower() in IMAGE_EXTENSIONS for path in item.rglob("*"))
+        )
     return []
 
 
@@ -354,12 +440,13 @@ def _matching_mask_path(masks_dir: Path, image_path: Path) -> Path | None:
     return None
 
 
-def _inspect_semantic_masks(dataset_dir: Path) -> dict[str, Any]:
+def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "train_images": 0,
         "mask_files": 0,
         "missing_masks": [],
         "splits": [],
+        "errors": [],
     }
     for split in ("train", "val", "test"):
         split_dirs = _semantic_split_dirs(dataset_dir, split)
@@ -375,12 +462,32 @@ def _inspect_semantic_masks(dataset_dir: Path) -> dict[str, Any]:
         if split == "train":
             stats["train_images"] = len(images)
         stats["mask_files"] += len(mask_files)
+        inspected_pairs = 0
         for image_path in images:
-            if _matching_mask_path(masks_dir, image_path) is None:
+            if max_pairs is not None and inspected_pairs >= max_pairs:
+                break
+            inspected_pairs += 1
+            mask_path = _matching_mask_path(masks_dir, image_path)
+            if mask_path is None:
                 try:
                     stats["missing_masks"].append(str(image_path.relative_to(dataset_dir)))
                 except ValueError:
                     stats["missing_masks"].append(image_path.name)
+                continue
+            try:
+                from PIL import Image
+
+                if not hasattr(Image, "open"):
+                    continue
+
+                with Image.open(image_path) as image, Image.open(mask_path) as mask:
+                    if image.size != mask.size:
+                        stats["errors"].append(
+                            f"Semantic image {image_path.name} is {image.width}x{image.height} but mask "
+                            f"{mask_path.name} is {mask.width}x{mask.height}."
+                        )
+            except Exception as exc:
+                stats["errors"].append(f"Could not inspect semantic pair {image_path.name}: {exc}")
     return stats
 
 
@@ -456,10 +563,53 @@ def _valid_bbox(bbox: Any) -> bool:
     if not isinstance(bbox, list) or len(bbox) != 4:
         return False
     try:
-        _x, _y, width, height = [float(value) for value in bbox]
+        x, y, width, height = [float(value) for value in bbox]
     except (TypeError, ValueError):
         return False
-    return width > 0 and height > 0
+    return all(math.isfinite(value) for value in (x, y, width, height)) and width > 0 and height > 0
+
+
+def _validate_coco_structure(data: dict[str, Any], label: str) -> None:
+    images = data.get("images", [])
+    annotations = data.get("annotations", [])
+    categories = data.get("categories", [])
+    if not isinstance(images, list) or not isinstance(annotations, list) or not isinstance(categories, list):
+        raise ValueError(f"COCO file {label} must contain list images, annotations, and categories.")
+
+    def valid_id(value: Any) -> bool:
+        return not isinstance(value, bool) and isinstance(value, (int, str)) and str(value).strip() != ""
+
+    image_ids: set[Any] = set()
+    for image in images:
+        if not isinstance(image, dict) or not valid_id(image.get("id")):
+            raise ValueError(f"COCO file {label} contains an image row without a valid id.")
+        if image["id"] in image_ids:
+            raise ValueError(f"COCO file {label} contains duplicate image id {image['id']}.")
+        if not isinstance(image.get("file_name"), str) or not image["file_name"].strip():
+            raise ValueError(f"COCO file {label} image {image['id']} has no file_name.")
+        image_ids.add(image["id"])
+
+    category_ids: set[Any] = set()
+    for category in categories:
+        if not isinstance(category, dict) or not valid_id(category.get("id")):
+            raise ValueError(f"COCO file {label} contains a category row without a valid id.")
+        if category["id"] in category_ids:
+            raise ValueError(f"COCO file {label} contains duplicate category id {category['id']}.")
+        category_ids.add(category["id"])
+    if not category_ids:
+        raise ValueError(f"COCO file {label} requires at least one category.")
+
+    for annotation in annotations:
+        if not isinstance(annotation, dict):
+            raise ValueError(f"COCO file {label} contains a non-object annotation row.")
+        if annotation.get("image_id") not in image_ids:
+            raise ValueError(
+                f"COCO file {label} annotation references unknown image id {annotation.get('image_id')}."
+            )
+        if annotation.get("category_id") not in category_ids:
+            raise ValueError(
+                f"COCO file {label} annotation references unknown category id {annotation.get('category_id')}."
+            )
 
 
 def _valid_coco_segmentation(segmentation: Any, image_dimensions: tuple[float, float] | None = None) -> bool:
@@ -467,16 +617,17 @@ def _valid_coco_segmentation(segmentation: Any, image_dimensions: tuple[float, f
         total_points = 0
         for polygon in segmentation:
             if not isinstance(polygon, list) or len(polygon) < 6 or len(polygon) % 2 != 0:
-                continue
+                return False
             try:
-                [float(value) for value in polygon]
+                coordinates = [float(value) for value in polygon]
             except (TypeError, ValueError):
-                continue
+                return False
+            if not all(math.isfinite(value) for value in coordinates):
+                return False
             total_points += len(polygon) // 2
             if total_points > MAX_COCO_POLYGON_POINTS:
-                return False
-            return True
-        return False
+                raise ValueError(f"COCO polygon segmentation exceeds {MAX_COCO_POLYGON_POINTS} points")
+        return bool(segmentation) and total_points >= 3
     if isinstance(segmentation, dict):
         size = segmentation.get("size")
         if "counts" not in segmentation or not isinstance(size, (list, tuple)) or len(size) != 2:
@@ -489,6 +640,21 @@ def _valid_coco_segmentation(segmentation: Any, image_dimensions: tuple[float, f
             _ensure_pixel_budget(width, height, "COCO RLE mask")
         except ValueError:
             return False
+        counts = segmentation.get("counts")
+        if not isinstance(counts, (str, bytes, list)) or not counts:
+            return False
+        if len(counts) > MAX_COCO_RLE_COUNTS:
+            raise ValueError(f"COCO RLE counts exceed {MAX_COCO_RLE_COUNTS} values")
+        if isinstance(counts, list):
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
+                return False
+            if sum(counts) != width * height:
+                return False
+        elif isinstance(counts, str):
+            try:
+                counts.encode("ascii")
+            except UnicodeEncodeError:
+                return False
         if image_dimensions is not None:
             image_width, image_height = image_dimensions
             if int(round(image_width)) != width or int(round(image_height)) != height:
@@ -497,7 +663,7 @@ def _valid_coco_segmentation(segmentation: Any, image_dimensions: tuple[float, f
     return False
 
 
-def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
+def _inspect_coco_files(dataset_dir: Path, sample_records: int | None = None) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "files": _find_coco_files(dataset_dir),
         "valid_files": [],
@@ -509,6 +675,8 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
         "errors": [],
         "warnings": [],
         "invalid_segmentations": 0,
+        "missing_segmentations": 0,
+        "category_ids": [],
     }
     class_names: dict[Any, str] = {}
     invalid_coco_segmentations = 0
@@ -528,6 +696,11 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
             continue
         if not isinstance(data, dict):
             continue
+        try:
+            _validate_coco_structure(data, relative_file)
+        except ValueError as exc:
+            stats["errors"].append(str(exc))
+            continue
         images = data.get("images", [])
         annotations = data.get("annotations", [])
         categories = data.get("categories", [])
@@ -539,9 +712,11 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
         if len(annotations) > MAX_COCO_ANNOTATIONS:
             stats["errors"].append(f"COCO file {relative_file} has more than {MAX_COCO_ANNOTATIONS} annotations.")
             continue
+        inspected_images = images[:sample_records] if sample_records is not None else images
+        inspected_annotations = annotations[: sample_records * 20] if sample_records is not None else annotations
         annotations_per_image: dict[Any, int] = {}
         masks_per_image: dict[Any, int] = {}
-        for annotation in annotations:
+        for annotation in inspected_annotations:
             if isinstance(annotation, dict):
                 image_id_for_count = annotation.get("image_id")
                 annotations_per_image[image_id_for_count] = annotations_per_image.get(image_id_for_count, 0) + 1
@@ -556,11 +731,17 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
         if isinstance(categories, list):
             for category in categories:
                 if isinstance(category, dict) and "id" in category:
-                    class_names[category.get("id")] = str(category.get("name", category.get("id")))
+                    category_id = category.get("id")
+                    category_name = str(category.get("name", category_id))
+                    if category_id in class_names and class_names[category_id] != category_name:
+                        stats["errors"].append(
+                            f"COCO category id {category_id} has conflicting names '{class_names[category_id]}' and '{category_name}'."
+                        )
+                    class_names[category_id] = category_name
 
         found_image_ids = set()
         image_dimensions_by_id: dict[Any, tuple[float, float]] = {}
-        for image in images:
+        for image in inspected_images:
             if not isinstance(image, dict):
                 continue
             image_id = image.get("id")
@@ -579,7 +760,8 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
 
         file_box_annotations = 0
         file_mask_annotations = 0
-        for annotation in annotations:
+        decoded_mask_pixels: dict[Any, int] = {}
+        for annotation in inspected_annotations:
             if not isinstance(annotation, dict):
                 stats["invalid_annotations"] += 1
                 continue
@@ -592,8 +774,20 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
             elif annotation.get("bbox") is not None:
                 stats["invalid_annotations"] += 1
             segmentation = annotation.get("segmentation")
+            if has_bbox and segmentation is None:
+                stats["missing_segmentations"] += 1
             if has_bbox and segmentation is not None:
                 if _valid_coco_segmentation(segmentation, image_dimensions_by_id.get(annotation.get("image_id"))):
+                    dimensions = image_dimensions_by_id.get(annotation.get("image_id"))
+                    if dimensions is not None:
+                        width, height = dimensions
+                        image_id = annotation.get("image_id")
+                        decoded_mask_pixels[image_id] = decoded_mask_pixels.get(image_id, 0) + int(width) * int(height)
+                        if decoded_mask_pixels[image_id] > MAX_COCO_DECODED_MASK_PIXELS_PER_IMAGE:
+                            stats["errors"].append(
+                                f"COCO image {image_id} exceeds the decoded mask memory budget."
+                            )
+                            continue
                     stats["mask_annotations"] += 1
                     file_mask_annotations += 1
                 else:
@@ -614,7 +808,9 @@ def _inspect_coco_files(dataset_dir: Path) -> dict[str, Any]:
 
     if class_names:
         sort_key = lambda item: (0, int(item[0])) if str(item[0]).isdigit() else (1, str(item[0]))
-        stats["classes"] = [name for _category_id, name in sorted(class_names.items(), key=sort_key)]
+        sorted_categories = sorted(class_names.items(), key=sort_key)
+        stats["category_ids"] = [category_id for category_id, _name in sorted_categories]
+        stats["classes"] = [name for _category_id, name in sorted_categories]
     return stats
 
 
@@ -680,35 +876,69 @@ def _inspect_tesseract_ground_truth(dataset_dir: Path) -> dict[str, Any]:
     return stats
 
 
-def _inspect_source_pixel_budgets(dataset_dir: Path) -> list[str]:
+def _inspect_source_pixel_budgets(dataset_dir: Path, max_files: int | None = None) -> list[str]:
     errors: list[str] = []
+    inspected = 0
     for path in _iter_visible_files(dataset_dir):
         if path.suffix.lower() not in IMAGE_EXTENSIONS.union(MASK_EXTENSIONS):
             continue
+        if max_files is not None and inspected >= max_files:
+            break
+        inspected += 1
         try:
             from PIL import Image
 
+            if not hasattr(Image, "open"):
+                continue
+
             with Image.open(path) as image:
                 _ensure_pixel_budget(float(image.width), float(image.height), path.name)
+                image.verify()
         except ValueError as exc:
             errors.append(str(exc))
-        except Exception:
-            continue
+        except Exception as exc:
+            errors.append(f"Could not decode image or mask {path.name}: {exc}")
     return errors
 
 
-def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
+def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> dict[str, Any]:
     yaml_path = find_dataset_yaml(dataset_dir)
-    classes = read_yaml_classes(yaml_path)
+    yaml_error: str | None = None
+    try:
+        classes = read_yaml_classes(yaml_path)
+    except (OSError, ValueError) as exc:
+        classes = []
+        yaml_error = str(exc)
 
     formats: list[str] = []
     tasks: list[str] = []
     warnings: list[str] = []
     errors: list[str] = []
+    if yaml_error:
+        errors.append(yaml_error)
 
     has_images = count_images(dataset_dir) > 0
     has_yolo_yaml = yaml_path is not None
-    yolo_stats = _inspect_yolo_labels(dataset_dir, len(classes))
+    yolo_stats = _inspect_yolo_labels(dataset_dir, len(classes), max_files=sample_files)
+    if yaml_path is not None and not yaml_error:
+        try:
+            yaml_data = read_yaml_limited(yaml_path) or {}
+            if not isinstance(yaml_data, dict) or "train" not in yaml_data:
+                raise ValueError("YOLO YAML requires a train path.")
+            for yaml_key in ("train", "val", "test"):
+                raw_value = yaml_data.get(yaml_key)
+                if raw_value is None:
+                    continue
+                values = raw_value if isinstance(raw_value, list) else [raw_value]
+                for value in values:
+                    normalized = _normalize_yolo_yaml_value(dataset_dir, yaml_key, value)
+                    resolved = _safe_child(dataset_dir, normalized)
+                    if resolved is None or not resolved.is_dir():
+                        raise ValueError(f"YOLO YAML '{yaml_key}' path must be an image directory: {value}")
+                    if "images" not in {part.lower() for part in resolved.relative_to(dataset_dir).parts}:
+                        raise ValueError(f"YOLO YAML '{yaml_key}' path must include an images directory: {value}")
+        except (OSError, ValueError) as exc:
+            yolo_stats["errors"].append(str(exc))
     has_yolo_labels = yolo_stats["files"] > 0 and (yolo_stats["box_rows"] > 0 or yolo_stats["polygon_rows"] > 0)
     has_yolo_detection = (
         has_yolo_yaml
@@ -725,10 +955,18 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     imagefolder_classes = [] if has_yolo_yaml and has_yolo_labels else _imagefolder_classes(dataset_dir)
     if imagefolder_classes:
         classes = imagefolder_classes
+        if len(imagefolder_classes) < 2:
+            errors.append("Image classification requires at least two train class folders.")
+        validation_classes = _imagefolder_split_classes(dataset_dir, ("valid", "val", "validation"))
+        unknown_validation_classes = sorted(set(validation_classes) - set(imagefolder_classes))
+        if unknown_validation_classes:
+            errors.append(
+                "Validation contains classes not present in training: " + ", ".join(unknown_validation_classes)
+            )
 
-    semantic_stats = _inspect_semantic_masks(dataset_dir)
+    semantic_stats = _inspect_semantic_masks(dataset_dir, max_pairs=sample_files)
     has_semantic_masks = semantic_stats["train_images"] > 0 and semantic_stats["mask_files"] > 0
-    coco_stats = _inspect_coco_files(dataset_dir)
+    coco_stats = _inspect_coco_files(dataset_dir, sample_records=sample_files)
     paddleocr_stats = _inspect_paddleocr_labels(dataset_dir)
     tesseract_stats = _inspect_tesseract_ground_truth(dataset_dir)
 
@@ -746,19 +984,30 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     warnings.extend(coco_stats.get("warnings", []))
     errors.extend(paddleocr_stats.get("errors", []))
     errors.extend(tesseract_stats.get("errors", []))
-    errors.extend(_inspect_source_pixel_budgets(dataset_dir))
+    errors.extend(_inspect_source_pixel_budgets(dataset_dir, max_files=sample_files))
     if has_yolo_yaml and yolo_stats["invalid_rows"]:
         errors.append(f"YOLO labels contain {yolo_stats['invalid_rows']} invalid rows.")
     if has_yolo_yaml and yolo_stats["box_rows"] and yolo_stats["polygon_rows"]:
-        dominant = "box" if has_yolo_detection and not has_yolo_segmentation else "polygon"
-        warnings.append(f"YOLO labels contain mixed box and polygon rows; using the dominant {dominant} format.")
+        examples = ", ".join(yolo_stats.get("polygon_examples", []))
+        suffix = f" Polygon rows: {examples}." if examples else ""
+        errors.append("YOLO labels must not mix bounding-box and polygon rows in one dataset." + suffix)
+    if has_yolo_yaml and yolo_stats.get("orphan_labels"):
+        errors.append(
+            f"YOLO contains {yolo_stats['orphan_labels']} label files without a uniquely matching image."
+        )
     if has_semantic_masks:
         formats.append("semantic_masks")
         tasks.append("segmentation")
     if semantic_stats["missing_masks"]:
         preview = ", ".join(semantic_stats["missing_masks"][:5])
         errors.append(f"Semantic masks are missing for {len(semantic_stats['missing_masks'])} images: {preview}")
-    has_reliable_coco_masks = coco_stats["mask_annotations"] > 0 and not coco_stats.get("invalid_segmentations")
+    errors.extend(semantic_stats.get("errors", []))
+    has_reliable_coco_masks = (
+        coco_stats["mask_annotations"] > 0
+        and not coco_stats.get("invalid_segmentations")
+        and not coco_stats.get("missing_segmentations")
+        and not coco_stats.get("errors")
+    )
     if coco_stats["box_annotations"] or coco_stats["mask_annotations"]:
         formats.append("coco_instances")
         if coco_stats["box_annotations"]:
@@ -771,6 +1020,11 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
         errors.append(f"COCO annotations reference {coco_stats['missing_images']} image files that were not found in the dataset.")
     if coco_stats["invalid_annotations"]:
         warnings.append(f"COCO annotations include {coco_stats['invalid_annotations']} invalid annotation rows that will be ignored.")
+    if coco_stats.get("missing_segmentations"):
+        warnings.append(
+            f"COCO contains {coco_stats['missing_segmentations']} bounding boxes without instance masks; "
+            "Mask R-CNN will not be offered for this dataset."
+        )
     if paddleocr_stats["tasks"]:
         formats.append("paddleocr_labels")
         tasks.append("ocr")
@@ -807,11 +1061,16 @@ def inspect_dataset(dataset_dir: Path) -> dict[str, Any]:
     }
 
 
-def validate_dataset_for_upload(dataset_dir: Path) -> dict[str, Any]:
-    metadata = inspect_dataset(dataset_dir)
+def validate_dataset_for_upload(
+    dataset_dir: Path,
+    metadata: dict[str, Any] | None = None,
+    *,
+    strict: bool = True,
+) -> dict[str, Any]:
+    metadata = metadata or inspect_dataset(dataset_dir)
     if metadata["image_count"] == 0:
         raise ValueError("No supported image files were found in the uploaded dataset.")
-    if metadata.get("errors"):
+    if strict and metadata.get("errors"):
         raise ValueError(" ".join(metadata["errors"]))
     if not metadata["formats"]:
         raise ValueError(
@@ -825,6 +1084,17 @@ def validate_dataset_for_upload(dataset_dir: Path) -> dict[str, Any]:
             f"Detected formats {metadata['formats']} are not trainable by the current model catalog. "
             f"Supported trainable formats: {sorted(TRAINABLE_FORMATS)}."
         )
+    return metadata
+
+
+def inspect_dataset_for_upload(dataset_dir: Path) -> dict[str, Any]:
+    sample_files = max(1, int(os.getenv("AILAB_UPLOAD_INSPECTION_SAMPLE_FILES", "1")))
+    metadata = inspect_dataset(dataset_dir, sample_files=sample_files)
+    # Upload only checks the first representative file for each supported layout.
+    # A bad sample is rejected; later bad files are handled during training.
+    metadata["warnings"] = []
+    metadata["validation_deferred"] = True
+    metadata["inspection_sample_files"] = sample_files
     return metadata
 
 
@@ -941,7 +1211,13 @@ def _model_compatibility_reason(model_id: str, metadata: dict[str, Any], task_id
         return ok, "Requires bounding boxes in YOLO or COCO; COCO can be used directly."
     if model_id == "mask_rcnn":
         coco = metadata.get("coco", {})
-        ok = "coco_instances" in formats and coco.get("mask_annotations", 0) > 0 and not coco.get("invalid_segmentations", 0)
+        ok = (
+            "coco_instances" in formats
+            and coco.get("mask_annotations", 0) > 0
+            and not coco.get("invalid_segmentations", 0)
+            and not coco.get("missing_segmentations", 0)
+            and not coco.get("errors")
+        )
         return ok, "Requires COCO instance masks, not box-only annotations."
     if model_id == "deeplabv3plus":
         return "semantic_masks" in formats, "Requires image/mask semantic segmentation pairs."
@@ -1084,6 +1360,10 @@ def _convert_coco_to_yolo(dataset_dir: Path, normalized_root: Path, metadata: di
     output_root.mkdir(parents=True, exist_ok=True)
     image_index = _build_image_basename_index(dataset_dir)
     classes = metadata.get("classes", []) or ["object"]
+    canonical_category_ids = metadata.get("coco", {}).get("category_ids", [])
+    canonical_category_to_index = {
+        category_id: index for index, category_id in enumerate(canonical_category_ids)
+    }
     wrote_labels = False
     splits: set[str] = set()
 
@@ -1100,10 +1380,11 @@ def _convert_coco_to_yolo(dataset_dir: Path, normalized_root: Path, metadata: di
         if not isinstance(images, list) or not isinstance(annotations, list):
             continue
 
-        category_ids = [category.get("id") for category in categories if isinstance(category, dict) and "id" in category]
-        category_to_index = {category_id: index for index, category_id in enumerate(category_ids)}
-        if not category_to_index:
-            category_to_index = {1: 0}
+        category_to_index = canonical_category_to_index or {
+            category.get("id"): index
+            for index, category in enumerate(categories)
+            if isinstance(category, dict) and "id" in category
+        }
         annotations_by_image: dict[Any, list[dict[str, Any]]] = {}
         for annotation in annotations:
             if isinstance(annotation, dict):
@@ -1139,7 +1420,10 @@ def _convert_coco_to_yolo(dataset_dir: Path, normalized_root: Path, metadata: di
                 if not _valid_bbox(bbox):
                     continue
                 x, y, box_width, box_height = [float(value) for value in bbox]
-                class_index = category_to_index.get(annotation.get("category_id"), 0)
+                category_id = annotation.get("category_id")
+                if category_id not in category_to_index:
+                    raise ValueError(f"COCO annotation references unknown category id {category_id}.")
+                class_index = category_to_index[category_id]
                 x_center = (x + box_width / 2) / width
                 y_center = (y + box_height / 2) / height
                 rows.append(
@@ -1300,7 +1584,7 @@ def _write_source_yolo_export(dataset_dir: Path, output_root: Path) -> Path:
     original_yaml = find_dataset_yaml(dataset_dir)
     if original_yaml is None:
         raise ValueError(f"Dataset '{dataset_dir.name}' is missing data.yaml for YOLO-style labels.")
-    config = yaml.safe_load(original_yaml.read_text(encoding="utf-8")) or {}
+    config = read_yaml_limited(original_yaml) or {}
     if not isinstance(config, dict):
         raise ValueError("YOLO YAML root must be an object")
     if not isinstance(config.get("names"), (dict, list)) or not config["names"]:
@@ -1329,6 +1613,10 @@ def _write_coco_yolo_export(dataset_dir: Path, output_root: Path, metadata: dict
         raise ValueError(f"Dataset '{dataset_dir.name}' has no COCO bounding-box annotations to export for YOLO.")
 
     classes = metadata.get("classes", []) or ["object"]
+    canonical_category_ids = metadata.get("coco", {}).get("category_ids", [])
+    canonical_category_to_index = {
+        category_id: index for index, category_id in enumerate(canonical_category_ids)
+    }
     wrote_labels = False
     splits: set[str] = set()
     output_root.mkdir(parents=True, exist_ok=True)
@@ -1347,8 +1635,11 @@ def _write_coco_yolo_export(dataset_dir: Path, output_root: Path, metadata: dict
         if not isinstance(images, list) or not isinstance(annotations, list):
             continue
 
-        category_ids = [category.get("id") for category in categories if isinstance(category, dict) and "id" in category]
-        category_to_index = {category_id: index for index, category_id in enumerate(category_ids)} or {1: 0}
+        category_to_index = canonical_category_to_index or {
+            category.get("id"): index
+            for index, category in enumerate(categories)
+            if isinstance(category, dict) and "id" in category
+        }
         annotations_by_image: dict[Any, list[dict[str, Any]]] = {}
         for annotation in annotations:
             if isinstance(annotation, dict):
@@ -1384,7 +1675,10 @@ def _write_coco_yolo_export(dataset_dir: Path, output_root: Path, metadata: dict
                 if not _valid_bbox(bbox):
                     continue
                 x, y, box_width, box_height = [float(value) for value in bbox]
-                class_index = category_to_index.get(annotation.get("category_id"), 0)
+                category_id = annotation.get("category_id")
+                if category_id not in category_to_index:
+                    raise ValueError(f"COCO annotation references unknown category id {category_id}.")
+                class_index = category_to_index[category_id]
                 x_center = (x + box_width / 2) / width
                 y_center = (y + box_height / 2) / height
                 rows.append(
@@ -1501,13 +1795,20 @@ def _cached_generated_export(
     writer,
 ) -> tuple[Path, bool, str, list[str]]:
     source_fingerprint, export_root, fingerprint = _export_identity(dataset_dir, model_type, extra_args)
-    if _cache_is_valid(export_root, source_fingerprint, export_format, required_files):
-        return export_root, True, fingerprint, []
-    shutil.rmtree(export_root, ignore_errors=True)
-    export_root.mkdir(parents=True, exist_ok=True)
-    warnings = writer(export_root)
-    _write_export_manifest(export_root, model_type, export_format, source_fingerprint, fingerprint, warnings)
-    return export_root, False, fingerprint, warnings
+    lock_name = f"export-{model_type}-{fingerprint}"
+    with named_file_lock(dataset_dir, lock_name, "dataset export"):
+        if _cache_is_valid(export_root, source_fingerprint, export_format, required_files):
+            return export_root, True, fingerprint, []
+        staging_root = export_root.with_name(f".{export_root.name}-{uuid.uuid4().hex}.tmp")
+        shutil.rmtree(staging_root, ignore_errors=True)
+        staging_root.mkdir(parents=True, exist_ok=False)
+        try:
+            warnings = writer(staging_root)
+            _write_export_manifest(staging_root, model_type, export_format, source_fingerprint, fingerprint, warnings)
+            replace_directory(staging_root, export_root)
+        finally:
+            shutil.rmtree(staging_root, ignore_errors=True)
+        return export_root, False, fingerprint, warnings
 
 
 def prepare_dataset_for_model(dataset_dir: Path, model_type: str, extra_args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1527,8 +1828,14 @@ def prepare_dataset_for_model(dataset_dir: Path, model_type: str, extra_args: di
         return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "semantic_masks")
 
     if model_type == "mask_rcnn":
-        if metadata.get("coco", {}).get("mask_annotations", 0) <= 0:
-            raise ValueError(f"Dataset '{dataset_dir.name}' has no COCO instance masks for Mask R-CNN.")
+        coco = metadata.get("coco", {})
+        if (
+            coco.get("mask_annotations", 0) <= 0
+            or coco.get("invalid_segmentations", 0)
+            or coco.get("missing_segmentations", 0)
+            or coco.get("errors")
+        ):
+            raise ValueError(f"Dataset '{dataset_dir.name}' does not have a valid instance mask for every COCO box.")
         return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "coco_instances")
 
     if model_type in {"yolo", "faster_rcnn"}:

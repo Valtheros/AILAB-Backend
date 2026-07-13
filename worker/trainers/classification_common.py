@@ -6,6 +6,7 @@ from .trainer_utils import (
     append_csv_row,
     extra,
     get_device,
+    guarded_image_loader,
     optimizer_for,
     require_positive_batch_size,
     runs_root,
@@ -56,6 +57,27 @@ def _batch_size_for(config: dict, args: dict, family: str) -> int:
     return require_positive_batch_size(int(config.get("batch_size", args.get("batch_size", 16))), family)
 
 
+def _filter_broken_images(dataset, logger, log_path: Path | None, split: str) -> None:
+    valid_samples = []
+    skipped = []
+    for path, target in dataset.samples:
+        try:
+            image = guarded_image_loader(path)
+            image.close()
+            valid_samples.append((path, target))
+        except Exception as exc:
+            skipped.append((path, str(exc)))
+    dataset.samples = valid_samples
+    dataset.imgs = valid_samples
+    dataset.targets = [target for _, target in valid_samples]
+    for path, reason in skipped[:100]:
+        logger(log_path, f"[Dataset warning] Skipping {split} image '{path}': {reason}")
+    if len(skipped) > 100:
+        logger(log_path, f"[Dataset warning] {len(skipped) - 100} additional broken {split} images were skipped.")
+    if not valid_samples:
+        raise ValueError(f"No usable images remain in the {split} classification split.")
+
+
 def train_classifier(config: dict, family: str, log_path: Path | None, logger) -> dict:
     import torch
     import torch.nn as nn
@@ -74,6 +96,8 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     val_dir = dataset_path / "valid"
     if not val_dir.exists():
         val_dir = dataset_path / "val"
+    if not val_dir.exists():
+        val_dir = dataset_path / "validation"
 
     if not train_dir.exists():
         raise ValueError("Image classification requires train/<class_name> image folders.")
@@ -105,6 +129,22 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
 
     train_dataset = ImageFolder(train_dir, transform=train_transform, loader=guarded_image_loader)
     val_dataset = ImageFolder(val_dir, transform=val_transform, loader=guarded_image_loader) if val_dir.exists() else None
+    _filter_broken_images(train_dataset, logger, log_path, "train")
+    if val_dataset is not None:
+        _filter_broken_images(val_dataset, logger, log_path, "validation")
+    if val_dataset is not None:
+        unknown_classes = sorted(set(val_dataset.classes) - set(train_dataset.classes))
+        if unknown_classes:
+            raise ValueError(f"Validation contains classes not present in training: {', '.join(unknown_classes)}")
+        remapped_samples = [
+            (path, train_dataset.class_to_idx[val_dataset.classes[target]])
+            for path, target in val_dataset.samples
+        ]
+        val_dataset.samples = remapped_samples
+        val_dataset.imgs = remapped_samples
+        val_dataset.targets = [target for _, target in remapped_samples]
+        val_dataset.class_to_idx = dict(train_dataset.class_to_idx)
+        val_dataset.classes = list(train_dataset.classes)
     num_classes = len(train_dataset.classes)
     if num_classes < 2:
         raise ValueError("Image classification requires at least two class folders.")
@@ -127,9 +167,12 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
 
     batch_size = _batch_size_for(config, args, family)
     workers = int(args.get("workers", 4))
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers)
+    worker_options = {"prefetch_factor": 1} if workers > 0 else {}
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers, **worker_options
+    )
     val_loader = (
-        DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers)
+        DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers, **worker_options)
         if val_dataset is not None
         else None
     )

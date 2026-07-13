@@ -1,12 +1,42 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import traceback
 from pathlib import Path
 
 from rq import get_current_job
 from security_utils import contained_path, validate_slug
 from trainers.trainer_utils import runs_root
+
+
+def _persist_status(
+    job_id: str | None,
+    status: str,
+    error_detail: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    database_url = os.getenv("DATABASE_URL", "")
+    if not database_url or (not job_id and not run_id):
+        return
+    for attempt in range(3):
+        try:
+            import psycopg
+
+            with psycopg.connect(database_url, connect_timeout=3) as connection:
+                connection.execute(
+                    "update training_runs set status = %s, error_detail = %s, updated_at = now(), "
+                    "finished_at = case when %s in ('completed','failed','stopped','cancelled') then now() else finished_at end "
+                    "where (%s::uuid is not null and id = %s::uuid) or (%s::text is not null and rq_job_id = %s)",
+                    (status, error_detail, status, run_id, run_id, job_id, job_id),
+                )
+            return
+        except Exception as exc:
+            if attempt == 2:
+                print(f"[Worker] Could not persist run status after 3 attempts: {exc}", flush=True)
+            else:
+                time.sleep(0.25 * (attempt + 1))
 
 
 def _build_registry():
@@ -58,20 +88,32 @@ def run_training(config: dict) -> dict:
     log(f"[Worker] Task: {task_type}")
     log(f"[Worker] Model type: {model_type}")
     log(f"[Worker] Project: {project_name}")
+    metadata = config.get("dataset_metadata") or {}
+    actionable_issues = list(metadata.get("errors", [])) + [
+        warning
+        for warning in metadata.get("warnings", [])
+        if not str(warning).startswith("Upload inspection sampled")
+    ]
+    for warning in actionable_issues[:20]:
+        log(f"[Dataset warning] {warning}")
 
-    registry = _build_registry()
-    trainer_class = registry.get(model_type)
-    if trainer_class is None:
-        available = ", ".join(sorted(registry))
-        raise ValueError(f"Unknown model_type '{model_type}'. Available: {available}")
-
+    run_id = str(config.get("run_id") or "") or None
     try:
+        _persist_status(job.id if job else config.get("job_id"), "running", run_id=run_id)
+        log("[Worker] Loading training dependencies and model. The first run can take a while while model weights are prepared.")
+        registry = _build_registry()
+        trainer_class = registry.get(model_type)
+        if trainer_class is None:
+            available = ", ".join(sorted(registry))
+            raise ValueError(f"Unknown model_type '{model_type}'. Available: {available}")
         trainer = trainer_class()
         log(f"[Worker] Starting training with {trainer_class.__name__}")
         result = trainer.train(config=config, log_path=log_path)
+        _persist_status(job.id if job else config.get("job_id"), "completed", run_id=run_id)
         log(f"[Worker] Training completed: {result}")
         return result
     except Exception:
         error_detail = traceback.format_exc()
+        _persist_status(job.id if job else config.get("job_id"), "failed", error_detail[-8000:], run_id=run_id)
         log(f"[Worker] FAILED:\n{error_detail}")
         raise

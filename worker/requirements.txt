@@ -16,3 +16,4 @@ numpy<2.0
 # Queue runtime.
 redis
 rq
+psycopg[binary]
