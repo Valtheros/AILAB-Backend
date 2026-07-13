@@ -6,7 +6,8 @@ import random
 from pathlib import Path
 from typing import Any, Iterable
 
-import yaml
+from .input_limits import read_yaml_limited
+from security_utils import contained_path
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -56,7 +57,7 @@ def read_yaml(data_yaml_path: str | None) -> dict[str, Any]:
     path = Path(data_yaml_path)
     if not path.exists():
         return {}
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return read_yaml_limited(path) or {}
 
 
 def read_classes_from_yaml(data_yaml_path: str | None) -> list[str]:
@@ -86,6 +87,30 @@ def split_image_dir(dataset_path: str, split: str) -> Path:
             images_dir = split_dir / "images"
             return images_dir if images_dir.exists() else split_dir
     return base / candidates[0] / "images"
+
+
+def yolo_split_image_dirs(dataset_path: str, data_yaml_path: str | None, split: str) -> list[Path]:
+    dataset_root = Path(dataset_path).resolve()
+    data = read_yaml(data_yaml_path)
+    value = data.get(split) if isinstance(data, dict) else None
+    if value is None:
+        fallback = split_image_dir(dataset_path, split)
+        return [fallback] if fallback.is_dir() else []
+    values = value if isinstance(value, list) else [value]
+    yaml_root_raw = data.get("path", str(dataset_root))
+    yaml_root = Path(str(yaml_root_raw))
+    if not yaml_root.is_absolute():
+        yaml_root = dataset_root / yaml_root
+    yaml_root = contained_path(dataset_root, yaml_root)
+    directories: list[Path] = []
+    for item in values:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"YOLO YAML '{split}' paths must be non-empty text")
+        candidate = contained_path(yaml_root, item.strip())
+        if not candidate.is_dir():
+            raise ValueError(f"YOLO YAML '{split}' path is not an image directory: {item}")
+        directories.append(candidate)
+    return directories
 
 
 def list_images(directory: Path) -> list[Path]:

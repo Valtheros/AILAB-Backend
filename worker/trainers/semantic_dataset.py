@@ -17,8 +17,25 @@ class SemanticMaskDataset:
         self.ignore_index = ignore_index
         self.images_dir, self.masks_dir = self._find_split_dirs()
         self.images = list_images(self.images_dir)
+        self.warnings: list[str] = []
+        usable_images = []
+        for image_path in self.images:
+            try:
+                mask_path = self._mask_path(image_path)
+                image = open_rgb_image_checked(image_path)
+                mask = open_image_checked(mask_path)
+                if image.size != mask.size:
+                    raise ValueError(
+                        f"image is {image.width}x{image.height}, mask is {mask.width}x{mask.height}"
+                    )
+                image.close()
+                mask.close()
+                usable_images.append(image_path)
+            except Exception as exc:
+                self.warnings.append(f"Skipping {split} semantic image '{image_path}': {exc}")
+        self.images = usable_images
         if not self.images:
-            raise ValueError(f"No semantic segmentation images found in {self.images_dir}")
+            raise ValueError(f"No usable semantic segmentation images found in {self.images_dir}")
 
     def __len__(self) -> int:
         return len(self.images)
@@ -33,6 +50,11 @@ class SemanticMaskDataset:
         mask_path = self._mask_path(image_path)
         image = open_rgb_image_checked(image_path)
         mask = open_image_checked(mask_path)
+        if image.size != mask.size:
+            raise ValueError(
+                f"Semantic image {image_path.name} is {image.width}x{image.height} but mask "
+                f"{mask_path.name} is {mask.width}x{mask.height}."
+            )
         if mask.mode not in {"L", "P", "I", "I;16"}:
             mask = mask.convert("L")
         image = F.resize(image, [self.image_size, self.image_size], interpolation=InterpolationMode.BILINEAR)

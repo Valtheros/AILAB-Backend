@@ -312,6 +312,12 @@ def validate_resource_plan(
             warnings.append("Tesseract max_iterations is very high and may run for a long time on CPU.")
 
     estimated_vram_mb = estimate_training_memory(model_type, normalized_params, normalized_batch_size)
+    safe_vram_mb = int(profile["safe_limits"]["gpu_vram_mb"])
+    if not is_cpu and estimated_vram_mb > safe_vram_mb:
+        errors.append(
+            f"Estimated GPU memory {estimated_vram_mb} MB exceeds the safe {safe_vram_mb} MB limit."
+        )
+        suggestions.append("Reduce batch size or image size until the estimated GPU memory fits the safe limit.")
     plan = {
         "policy": "auto_safe",
         "ok": not errors,
@@ -323,7 +329,7 @@ def validate_resource_plan(
         "errors": errors,
         "suggestions": suggestions,
         "estimated_vram_mb": estimated_vram_mb,
-        "safe_vram_mb": profile["safe_limits"]["gpu_vram_mb"],
+        "safe_vram_mb": safe_vram_mb,
         "safe_system_ram_gb": profile["safe_limits"]["system_ram_gb"],
     }
     return plan

@@ -3,3 +3,4 @@ rq
 pyyaml
 Pillow
 numpy<2.0
+psycopg[binary]

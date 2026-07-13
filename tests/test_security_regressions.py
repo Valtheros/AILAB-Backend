@@ -69,8 +69,9 @@ from fastapi import HTTPException
 
 import dataset_utils
 from dataset_utils import inspect_dataset, validate_dataset_for_upload
-from main import _assert_owned_resource_visible, _require_request_user_id
+from main import _assert_owned_resource_visible, _flatten_single_root_folder, _require_request_user_id
 from services.training_service import TrainingService
+from worker.trainers import input_limits
 from worker.trainers.input_limits import iter_text_lines_limited, validate_coco_segmentation
 
 
@@ -80,6 +81,87 @@ class _FakeRequest:
 
 
 class SecurityRegressionTests(unittest.TestCase):
+    def test_dataset_yaml_rejects_aliases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "data.yaml"
+            path.write_text("names: &names [car]\ncopy: *names\ntrain: images/train\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "aliases"):
+                dataset_utils.read_yaml_limited(path)
+
+    def test_dataset_yaml_size_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "data.yaml"
+            path.write_text("names: [car]\n", encoding="utf-8")
+            original = dataset_utils.MAX_YAML_FILE_BYTES
+            try:
+                dataset_utils.MAX_YAML_FILE_BYTES = 4
+                with self.assertRaisesRegex(ValueError, "exceeds"):
+                    dataset_utils.read_yaml_limited(path)
+            finally:
+                dataset_utils.MAX_YAML_FILE_BYTES = original
+
+    def test_single_train_directory_is_not_flattened(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "item.txt").write_text("data", encoding="utf-8")
+            _flatten_single_root_folder(root)
+            self.assertTrue((train / "item.txt").is_file())
+
+    def test_all_coco_polygons_count_toward_budget_in_upload_and_worker(self):
+        polygons = [[0, 0, 1, 0, 1, 1], [2, 2, 3, 2, 3, 3]]
+        original_upload = dataset_utils.MAX_COCO_POLYGON_POINTS
+        original_worker = input_limits.MAX_COCO_POLYGON_POINTS
+        try:
+            dataset_utils.MAX_COCO_POLYGON_POINTS = 5
+            input_limits.MAX_COCO_POLYGON_POINTS = 5
+            with self.assertRaises(ValueError):
+                dataset_utils._valid_coco_segmentation(polygons, (10, 10))
+            with self.assertRaises(ValueError):
+                validate_coco_segmentation(polygons, 10, 10)
+        finally:
+            dataset_utils.MAX_COCO_POLYGON_POINTS = original_upload
+            input_limits.MAX_COCO_POLYGON_POINTS = original_worker
+
+    def test_non_finite_coco_polygon_is_not_valid(self):
+        polygon = [[0, 0, 1, 0, float("nan"), 1]]
+        self.assertFalse(dataset_utils._valid_coco_segmentation(polygon, (10, 10)))
+        self.assertFalse(validate_coco_segmentation(polygon, 10, 10))
+
+    def test_coco_rle_counts_budget_matches_upload_and_worker(self):
+        original_upload = dataset_utils.MAX_COCO_RLE_COUNTS
+        original_worker = input_limits.MAX_COCO_RLE_COUNTS
+        try:
+            dataset_utils.MAX_COCO_RLE_COUNTS = 3
+            input_limits.MAX_COCO_RLE_COUNTS = 3
+            segmentation = {"counts": "abcd", "size": [10, 10]}
+            with self.assertRaises(ValueError):
+                dataset_utils._valid_coco_segmentation(segmentation, (10, 10))
+            with self.assertRaises(ValueError):
+                validate_coco_segmentation(segmentation, 10, 10)
+        finally:
+            dataset_utils.MAX_COCO_RLE_COUNTS = original_upload
+            input_limits.MAX_COCO_RLE_COUNTS = original_worker
+
+    def test_log_chunks_are_bounded_and_resume_from_offset(self):
+        service = TrainingService.__new__(TrainingService)
+        service.redis = object()
+        with tempfile.TemporaryDirectory() as temp:
+            log_path = Path(temp) / "train.log"
+            log_path.write_text("0123456789abcdefghij", encoding="utf-8")
+            service._job_log_path = lambda _job_id: log_path
+            first, offset, replace = service.read_job_log_chunk("job", -1, max_bytes=8)
+            self.assertEqual(first, "cdefghij")
+            self.assertEqual(offset, 20)
+            self.assertTrue(replace)
+            with log_path.open("a", encoding="utf-8") as output:
+                output.write("klmnop")
+            second, offset, replace = service.read_job_log_chunk("job", offset, max_bytes=3)
+            self.assertEqual(second, "klm")
+            self.assertEqual(offset, 23)
+            self.assertFalse(replace)
+
     def test_workspace_routes_require_user_identity(self):
         with self.assertRaises(HTTPException) as caught:
             _require_request_user_id(_FakeRequest())
