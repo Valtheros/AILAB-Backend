@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import os
 import tempfile
@@ -9,6 +10,11 @@ import types
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _safe_load_stub(text: str):
@@ -172,7 +178,8 @@ class TrainerLogicTests(unittest.TestCase):
             labels = list(Path(prepared["dataset_path"]).rglob("*.txt"))
             self.assertTrue(labels)
             self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
-            self.assertEqual(prepared["metadata"]["classes"], ["first", "second"])
+            self.assertEqual(prepared["metadata"]["classes"], ["second"])
+            self.assertEqual(prepared["metadata"]["coco"]["classes"], ["first", "second"])
 
     def test_partial_coco_masks_are_not_mask_rcnn_ready(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -231,7 +238,7 @@ class TrainerLogicTests(unittest.TestCase):
             root = Path(temp)
             train = root / "train"
             train.mkdir()
-            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "image_001.jpg").write_bytes(PNG_1X1)
             (train / "_annotations.coco.json").write_text(
                 json.dumps(
                     {
