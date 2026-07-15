@@ -9,7 +9,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import yaml
 from redis import Redis
 from rq import Queue
 from rq.command import send_stop_job_command
@@ -21,7 +20,7 @@ except ImportError:  # Lightweight unit-test stubs do not expose rq.exceptions.
     class NoSuchJobError(Exception):
         pass
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model, read_yaml_limited
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model
 from dataset_storage import registered_storage_path
 from model_catalog import get_model
 from security_utils import contained_path, validate_slug
@@ -29,7 +28,6 @@ from settings import DATASET_DIR, REDIS_URL, RUNS_DIR, ensure_runtime_dirs
 from resource_repository import resource_repository
 
 
-OCR_MODEL_TYPES = {"paddleocr", "tesseract"}
 MAX_LOG_RESPONSE_BYTES = 1024 * 1024
 MAX_RUN_FILES_RETURNED = 1000
 
@@ -81,7 +79,6 @@ class TrainingService:
                 self.redis = connection
                 self.queues = {
                     "cv_training": Queue("cv_training", connection=connection),
-                    "ocr_training": Queue("ocr_training", connection=connection),
                 }
                 self._redis_backoff = 1.0
                 self._next_redis_attempt = 0.0
@@ -103,9 +100,6 @@ class TrainingService:
         self.redis = None
         self.queues = {}
         self._next_redis_attempt = 0.0
-
-    def _queue_name_for_model(self, model_type: str) -> str:
-        return "ocr_training" if model_type in OCR_MODEL_TYPES else "cv_training"
 
     def _dataset_meta_path(self, dataset_path: Path) -> Path:
         return dataset_path / ".ailab_dataset.json"
@@ -178,14 +172,6 @@ class TrainingService:
                 f"Dataset '{dataset_path.name}' does not advertise task '{task_type}'. "
                 f"Detected tasks: {metadata['tasks'] or ['none']}."
             )
-        if model_type == "paddleocr":
-            requested_task = str(extra_args.get("ocr_task", "rec"))
-            available_tasks = set(metadata.get("paddleocr_tasks", []))
-            if available_tasks and requested_task not in available_tasks:
-                raise ValueError(
-                    f"Dataset '{dataset_path.name}' has PaddleOCR labels for {sorted(available_tasks)}, "
-                    f"but the selected PaddleOCR task is '{requested_task}'."
-                )
         if model_type == "mask_rcnn":
             coco = metadata.get("coco", {})
             if (
@@ -221,55 +207,6 @@ class TrainingService:
             except ValueError:
                 continue
         raise FileNotFoundError(f"No uploaded dataset is compatible with {model_type}. Please upload or select one first.")
-
-    def _normalize_yolo_yaml_path(self, dataset_folder: Path, yaml_key: str, value: str) -> str:
-        if not isinstance(value, str) or not value.strip():
-            raise ValueError(f"YOLO YAML '{yaml_key}' paths must be non-empty text")
-
-        normalized = value.strip().replace("\\", "/")
-        candidates = [normalized]
-        stripped = normalized
-        while stripped.startswith("../"):
-            stripped = stripped[3:]
-            candidates.append(stripped)
-        if stripped.startswith("./"):
-            candidates.append(stripped[2:])
-
-        seen: set[str] = set()
-        for candidate_value in candidates:
-            if candidate_value in seen:
-                continue
-            seen.add(candidate_value)
-            try:
-                candidate = contained_path(dataset_folder, candidate_value)
-            except ValueError:
-                continue
-            if candidate.exists():
-                return candidate_value
-
-        raise ValueError(f"YOLO YAML '{yaml_key}' path was not found inside the dataset: {value}")
-
-    def _create_worker_yaml(self, original_yaml_path: Path, dataset_folder: Path) -> str:
-        config = read_yaml_limited(original_yaml_path) or {}
-        if not isinstance(config, dict):
-            raise ValueError("YOLO YAML root must be an object")
-        if not isinstance(config.get("names"), (dict, list)) or not config["names"]:
-            raise ValueError("YOLO YAML requires a non-empty names list or mapping")
-        config["path"] = str(dataset_folder)
-        for yaml_key in ("train", "val", "test"):
-            value = config.get(yaml_key)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                config[yaml_key] = [self._normalize_yolo_yaml_path(dataset_folder, yaml_key, item) for item in value]
-            else:
-                config[yaml_key] = self._normalize_yolo_yaml_path(dataset_folder, yaml_key, value)
-        if "train" not in config:
-            raise ValueError("YOLO YAML requires a train path")
-
-        worker_yaml_path = dataset_folder / "data_worker.yaml"
-        worker_yaml_path.write_text(yaml.dump(config, default_flow_style=False), encoding="utf-8")
-        return str(worker_yaml_path)
 
     def start_training_container(
         self,
@@ -326,7 +263,7 @@ class TrainingService:
                 }
                 if model_type == "yolo":
                     job_config["task"] = "detect"
-                queue_name = self._queue_name_for_model(model_type)
+                queue_name = "cv_training"
                 queue = self.queues[queue_name]
                 run_record = resource_repository.create_run(
                     owner_id=owner_id, owner_email=owner_email, dataset=dataset_record, project_name=project_name,
