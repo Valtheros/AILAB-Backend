@@ -213,7 +213,8 @@ class TrainerLogicTests(unittest.TestCase):
             labels = list(Path(prepared["dataset_path"]).rglob("*.txt"))
             self.assertTrue(labels)
             self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
-            self.assertEqual(prepared["metadata"]["classes"], ["first", "second"])
+            self.assertEqual(prepared["metadata"]["classes"], ["second"])
+            self.assertEqual(prepared["metadata"]["coco"]["classes"], ["first", "second"])
 
     def test_partial_coco_masks_are_not_mask_rcnn_ready(self):
         with tempfile.TemporaryDirectory() as temp:
