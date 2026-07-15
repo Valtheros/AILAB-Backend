@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import base64
 import tempfile
 import unittest
 from pathlib import Path
 import sys
 import types
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _install_optional_dependency_stubs() -> None:
@@ -239,7 +245,7 @@ class SecurityRegressionTests(unittest.TestCase):
             root = Path(temp)
             train = root / "train"
             train.mkdir()
-            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "image_001.jpg").write_bytes(PNG_1X1)
             (train / "_annotations.coco.json").write_text(
                 json.dumps(
                     {

@@ -140,16 +140,6 @@ RESOURCE_METADATA: dict[str, dict[str, Any]] = {
         "hard_limits": {"batch_size": 4, "image_size": 1024, "workers": 4},
         "memory_notes": ["Semantic segmentation scales quickly with image size; 1024px should use batch 1."],
     },
-    "paddleocr": {
-        "safe_defaults": {"batch_size_per_card": 32, "ocr_task": "rec", "workers": 4},
-        "hard_limits": {"rec_batch_size_per_card": 64, "det_batch_size_per_card": 8, "workers": 4},
-        "memory_notes": ["OCR recognition can use larger batches than text detection.", "Detection should stay conservative to reduce memory errors."],
-    },
-    "tesseract": {
-        "safe_defaults": {"workers": 2},
-        "hard_limits": {"workers": 2},
-        "memory_notes": ["Tesseract training is CPU/RAM-bound; keep parallel work low to reduce memory errors."],
-    },
 }
 
 
@@ -243,7 +233,7 @@ def validate_resource_plan(
     is_cpu = _device(normalized_params) == "cpu"
 
     workers = _int(normalized_params, "workers", 4)
-    worker_cap = 2 if is_cpu or model_type == "tesseract" else SAFE_WORKERS_MAX
+    worker_cap = 2 if is_cpu else SAFE_WORKERS_MAX
     if workers > worker_cap:
         normalized_params["workers"] = worker_cap
         warnings.append(f"Data workers reduced from {workers} to {worker_cap} for the available system RAM.")
@@ -295,21 +285,6 @@ def validate_resource_plan(
         if normalized_batch_size > batch_cap:
             errors.append(f"DeepLabV3+ image_size {image_size} with batch_size {normalized_batch_size} exceeds the safe limit.")
             suggestions.append(f"Use batch_size <= {batch_cap}.")
-
-    elif model_type == "paddleocr":
-        ocr_task = str(normalized_params.get("ocr_task", "rec"))
-        batch_per_card = _int(normalized_params, "batch_size_per_card", 32)
-        cap = 8 if ocr_task == "det" else 64
-        if is_cpu:
-            cap = min(cap, 8)
-        if batch_per_card > cap:
-            errors.append(f"PaddleOCR {ocr_task} batch_size_per_card {batch_per_card} exceeds the safe limit.")
-            suggestions.append(f"Use batch_size_per_card <= {cap}.")
-
-    elif model_type == "tesseract":
-        max_iterations = _int(normalized_params, "max_iterations", 10000)
-        if is_cpu and max_iterations > 500000:
-            warnings.append("Tesseract max_iterations is very high and may run for a long time on CPU.")
 
     estimated_vram_mb = estimate_training_memory(model_type, normalized_params, normalized_batch_size)
     safe_vram_mb = int(profile["safe_limits"]["gpu_vram_mb"])
@@ -363,7 +338,4 @@ def estimate_training_memory(model_type: str, params: dict[str, Any], batch_size
     if model_type == "deeplabv3plus":
         image_size = _int(params, "image_size", 512)
         return int(2000 + batch_size * (image_size / 512) ** 2 * 2100)
-    if model_type == "paddleocr":
-        batch = _int(params, "batch_size_per_card", 32)
-        return int(1500 + batch * (120 if params.get("ocr_task") == "det" else 55))
     return 0

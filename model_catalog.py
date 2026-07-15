@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import os
-from pathlib import Path
 import subprocess
 from typing import Any
 
@@ -255,128 +253,6 @@ DEEPLAB_PARAMS = [
 ] + OPTIMIZER_PARAMS
 
 
-OCR_COMMON_PARAMS = [
-    _select(
-        "ocr_task",
-        "OCR task",
-        "rec",
-        [
-            {"value": "det", "label": "Text detection"},
-            {"value": "rec", "label": "Text recognition"},
-        ],
-    ),
-    _number("learning_rate", "Learning rate", 0.001, 0.000001, 1, 0.0001),
-    _text("character_dict_path", "Character dictionary path", ""),
-    _boolean("use_space_char", "Use space character", True),
-    _number("max_text_length", "Max text length", 25, 1, 512, 1),
-]
-
-
-PADDLEOCR_BASE_MODEL_PRESETS = [
-    {
-        "id": "ppocrv4-rec",
-        "label": "PP-OCRv4 Recognition",
-        "task": "rec",
-        "config_path": "/opt/PaddleOCR/configs/rec/PP-OCRv4/ch_PP-OCRv4_rec.yml",
-        "pretrained_model": "",
-        "labels": ["rec_gt_train.txt", "rec_gt_val.txt"],
-        "description": "General text recognition. The PaddleOCR config provides the default starting weights unless a checkpoint is selected.",
-        "available": True,
-    },
-    {
-        "id": "ppocrv4-det",
-        "label": "PP-OCRv4 Detection",
-        "task": "det",
-        "config_path": "/opt/PaddleOCR/configs/det/ch_PP-OCRv4/ch_PP-OCRv4_det.yml",
-        "pretrained_model": "",
-        "labels": ["det_gt_train.txt", "det_gt_val.txt"],
-        "description": "General text detection for boxes or polygons. The PaddleOCR config provides the default starting weights unless a checkpoint is selected.",
-        "available": True,
-    },
-]
-
-
-DEFAULT_TESSERACT_BASE_MODELS = {
-    "eng": {
-        "label": "English",
-        "description": "Bundled with the OCR worker image and suitable as a default Latin-script start model.",
-        "available": True,
-    },
-    "tha": {
-        "label": "Thai",
-        "description": "Bundled with the OCR worker image for Thai language and font adaptation.",
-        "available": True,
-    },
-}
-
-
-def _configured_tesseract_base_models() -> dict[str, dict[str, Any]]:
-    configured: dict[str, dict[str, Any]] = {}
-    raw_value = os.getenv("TESSERACT_START_MODELS", "")
-    for raw_item in raw_value.split(","):
-        item = raw_item.strip()
-        if not item:
-            continue
-        code, _, label = item.partition(":")
-        code = code.strip()
-        if not code:
-            continue
-        configured[code] = {
-            "label": label.strip() or code,
-            "description": "Configured by TESSERACT_START_MODELS.",
-            "available": True,
-        }
-    return configured
-
-
-def _detected_tessdata_codes() -> set[str]:
-    roots = [
-        os.getenv("TESSDATA_PREFIX", ""),
-        "/usr/share/tesseract-ocr/5/tessdata",
-        "/usr/share/tesseract-ocr/4.00/tessdata",
-        "/usr/share/tessdata",
-        "/usr/local/share/tessdata",
-    ]
-    codes: set[str] = set()
-    for raw_root in roots:
-        if not raw_root:
-            continue
-        root = Path(raw_root)
-        if not root.exists():
-            continue
-        for path in root.glob("*.traineddata"):
-            codes.add(path.stem)
-    return codes
-
-
-def _tesseract_base_model_presets() -> list[dict[str, Any]]:
-    detected = _detected_tessdata_codes()
-    entries = deepcopy(DEFAULT_TESSERACT_BASE_MODELS)
-    entries.update(_configured_tesseract_base_models())
-
-    for code in detected:
-        entries.setdefault(
-            code,
-            {
-                "label": code,
-                "description": "Detected from installed Tesseract traineddata files.",
-                "available": True,
-            },
-        )
-        entries[code]["available"] = True
-
-    return [
-        {
-            "id": code,
-            "value": code,
-            "label": f"{meta['label']} ({code})",
-            "description": meta["description"],
-            "available": bool(meta["available"]),
-        }
-        for code, meta in sorted(entries.items(), key=lambda item: (not item[1]["available"], item[0]))
-    ]
-
-
 CV_MODEL_CATALOG: dict[str, Any] = {
     "version": "2026-06-13",
     "common_params": COMMON_TRAINING_PARAMS,
@@ -430,45 +306,6 @@ CV_MODEL_CATALOG: dict[str, Any] = {
                     "dataset_formats": ["coco_instances"],
                     "reason": "TorchVision includes pretrained Mask R-CNN and a standard fine-tuning path for instance segmentation.",
                     "params": DETECTION_PARAMS,
-                },
-            ],
-        },
-        {
-            "id": "ocr",
-            "label": "OCR / Document Vision",
-            "description": "Train or fine-tune OCR engines with OCR-specific annotation files.",
-            "dataset_formats": ["paddleocr_labels", "tesseract_ground_truth"],
-            "models": [
-                {
-                    "id": "paddleocr",
-                    "label": "PaddleOCR",
-                    "model_name": "paddleocr",
-                    "runtime": "paddlepaddle/paddle + PaddleOCR",
-                    "dataset_formats": ["paddleocr_labels"],
-                    "reason": "PaddleOCR has an official Docker-based workflow for text detection and recognition training.",
-                    "base_model_presets": PADDLEOCR_BASE_MODEL_PRESETS,
-                    "params": [
-                        _text("config_path", "PaddleOCR config path", "/opt/PaddleOCR/configs/rec/PP-OCRv4/ch_PP-OCRv4_rec.yml"),
-                        _text("pretrained_model", "Pretrained model path", ""),
-                        _number("batch_size_per_card", "Batch per card", 32, 1, 512, 1),
-                    ]
-                    + OCR_COMMON_PARAMS,
-                },
-                {
-                    "id": "tesseract",
-                    "label": "Tesseract",
-                    "model_name": "tesseract_lstm",
-                    "runtime": "tesseract-ocr/tesstrain",
-                    "dataset_formats": ["tesseract_ground_truth"],
-                    "reason": "Tesseract training is supported through the official tesstrain workflow and is practical for language/font adaptation.",
-                    "base_model_presets": _tesseract_base_model_presets(),
-                    "params": [
-                        _text("model_name", "Output language/model code", "custom"),
-                        _text("start_model", "Start model", "eng"),
-                        _number("max_iterations", "Max iterations", 10000, 100, 1000000, 100),
-                        _number("target_error_rate", "Target CER", 0.01, 0.0001, 1, 0.001),
-                        _number("ratio_train", "Train split ratio", 0.9, 0.1, 0.99, 0.01),
-                    ],
                 },
             ],
         },
@@ -594,24 +431,6 @@ DATASET_INTERFACES = {
         "canonical_format": "coco_instance_masks",
         "conversion_targets": ["coco_instances"],
         "train_export_format": "coco_instances",
-    },
-    "paddleocr": {
-        "dataset_task": "ocr_recognition_or_detection",
-        "required_annotations": ["OCR recognition text labels or OCR detection boxes"],
-        "accepted_source_formats": ["paddleocr_labels", "tesseract_ground_truth"],
-        "accepted_canonical_formats": ["ocr_recognition_labels", "ocr_detection_labels"],
-        "canonical_format": "ocr_labels",
-        "conversion_targets": ["paddleocr_labels"],
-        "train_export_format": "paddleocr_labels",
-    },
-    "tesseract": {
-        "dataset_task": "ocr_recognition",
-        "required_annotations": ["OCR recognition ground truth text"],
-        "accepted_source_formats": ["tesseract_ground_truth", "paddleocr_recognition_labels"],
-        "accepted_canonical_formats": ["ocr_recognition_labels"],
-        "canonical_format": "ocr_recognition_labels",
-        "conversion_targets": ["tesseract_ground_truth"],
-        "train_export_format": "tesseract_ground_truth",
     },
 }
 

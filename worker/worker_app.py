@@ -44,9 +44,7 @@ def _build_registry():
     from trainers.efficientnet_trainer import EfficientNetTrainer
     from trainers.faster_rcnn_trainer import FasterRCNNTrainer
     from trainers.mask_rcnn_trainer import MaskRCNNTrainer
-    from trainers.paddleocr_trainer import PaddleOCRTrainer
     from trainers.resnet_trainer import ResNetTrainer
-    from trainers.tesseract_trainer import TesseractTrainer
     from trainers.yolo_trainer import YOLOTrainer
 
     return {
@@ -55,8 +53,6 @@ def _build_registry():
         "efficientnet": EfficientNetTrainer,
         "deeplabv3plus": DeepLabV3PlusTrainer,
         "mask_rcnn": MaskRCNNTrainer,
-        "paddleocr": PaddleOCRTrainer,
-        "tesseract": TesseractTrainer,
         "faster_rcnn": FasterRCNNTrainer,
     }
 

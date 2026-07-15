@@ -43,25 +43,12 @@ class ModelCatalogValidationTests(unittest.TestCase):
                     self.assertTrue(model.get("memory_notes"))
                     self.assertEqual(model.get("resource_profile", {}).get("policy"), "auto_safe")
 
-    def test_paddleocr_catalog_exposes_base_model_presets(self):
+    def test_catalog_exposes_only_supported_vision_tasks(self):
         catalog = get_catalog()
-        ocr_task = next(task for task in catalog["tasks"] if task["id"] == "ocr")
-        paddleocr = next(model for model in ocr_task["models"] if model["id"] == "paddleocr")
-        presets = {preset["id"]: preset for preset in paddleocr["base_model_presets"]}
-
-        self.assertEqual(presets["ppocrv4-rec"]["task"], "rec")
-        self.assertIn("rec_gt_train.txt", presets["ppocrv4-rec"]["labels"])
-        self.assertEqual(presets["ppocrv4-det"]["task"], "det")
-        self.assertIn("det_gt_train.txt", presets["ppocrv4-det"]["labels"])
-
-    def test_tesseract_catalog_exposes_start_model_presets(self):
-        catalog = get_catalog()
-        ocr_task = next(task for task in catalog["tasks"] if task["id"] == "ocr")
-        tesseract = next(model for model in ocr_task["models"] if model["id"] == "tesseract")
-        presets = {preset["value"]: preset for preset in tesseract["base_model_presets"]}
-
-        self.assertTrue(presets["eng"]["available"])
-        self.assertTrue(presets["tha"]["available"])
+        self.assertEqual(
+            {task["id"] for task in catalog["tasks"]},
+            {"image_classification", "segmentation", "object_detection"},
+        )
 
 
 if __name__ == "__main__":

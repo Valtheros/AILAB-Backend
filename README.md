@@ -8,9 +8,9 @@ Redis/RQ, streams progress, and serves trained artifacts back to the frontend.
 
 - Upload and validate dataset ZIP files.
 - Expose the model catalog used by the UI.
-- Queue training jobs for CV and OCR workers.
+- Queue training jobs for the Computer Vision worker.
 - Stream live logs, metrics, status, and heartbeats through SSE.
-- Store run outputs such as logs, metrics, weights, and OCR artifacts.
+- Store run outputs such as logs, metrics, weights, and reports.
 - Protect user-owned datasets and runs when requests include authenticated user
   headers from the frontend proxy.
 
@@ -20,7 +20,6 @@ Redis/RQ, streams progress, and serves trained artifacts back to the frontend.
 | --- | --- | --- |
 | Image Classification | ResNet, EfficientNet | ImageFolder |
 | Segmentation | DeepLabV3+, Mask R-CNN | semantic masks, COCO instances |
-| OCR / Document Vision | PaddleOCR, Tesseract | PaddleOCR labels, `.gt.txt` |
 | Object Detection | YOLOv11, Faster R-CNN | YOLO detection |
 
 ## Run Locally

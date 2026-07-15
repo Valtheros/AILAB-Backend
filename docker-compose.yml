@@ -54,23 +54,6 @@ services:
       - redis
     restart: unless-stopped
 
-  ocr-worker:
-    build:
-      context: ./worker
-      dockerfile: Dockerfile.ocr
-    container_name: cv_ocr_worker
-    shm_size: "8gb"
-    volumes:
-      - ./dataset:/app/dataset
-      - ./runs:/app/runs
-      - ocr_model_cache:/root/.cache
-    environment:
-      RUNS_DIR: /app/runs
-      REDIS_URL: redis://redis:6379
-    depends_on:
-      - redis
-    restart: unless-stopped
-
   postgres:
     image: postgres:16-alpine
     container_name: cv_postgres
@@ -99,4 +82,3 @@ volumes:
   redis_data:
   postgres_data:
   model_cache:
-  ocr_model_cache:

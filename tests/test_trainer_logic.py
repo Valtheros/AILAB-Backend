@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import os
 import tempfile
@@ -9,6 +10,11 @@ import types
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+
+
+PNG_1X1 = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _safe_load_stub(text: str):
@@ -50,11 +56,10 @@ if "rq.command" not in sys.modules:
 if "rq.job" not in sys.modules:
     sys.modules["rq.job"] = types.SimpleNamespace(Job=types.SimpleNamespace, JobStatus=types.SimpleNamespace)
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, inspect_dataset_for_upload, normalize_dataset_for_training, prepare_dataset_for_model, validate_dataset_for_upload
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, inspect_dataset_for_upload, prepare_dataset_for_model, validate_dataset_for_upload
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
-from worker.trainers.paddleocr_trainer import PaddleOCRTrainer
 from worker.trainers.trainer_utils import require_positive_batch_size, split_image_dir
 from model_catalog import get_catalog
 from services.training_service import TrainingService
@@ -64,21 +69,7 @@ class TrainerLogicTests(unittest.TestCase):
     def test_classification_batch_size_uses_model_family(self):
         self.assertEqual(_batch_size_for({"batch_size": 4}, {}, "resnet"), 4)
 
-    def test_ocr_formats_are_detected_independently(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "sample.png").write_bytes(b"not-an-image")
-            (root / "sample.gt.txt").write_text("hello", encoding="utf-8")
-            metadata = inspect_dataset(root)
-            self.assertIn("tesseract_ground_truth", metadata["formats"])
-            self.assertNotIn("paddleocr_labels", metadata["formats"])
 
-    def test_generic_train_text_is_not_misclassified_as_paddleocr(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "image.png").write_bytes(b"not-an-image")
-            (root / "train.txt").write_text("image.png\\thello", encoding="utf-8")
-            self.assertNotIn("paddleocr_labels", inspect_dataset(root)["formats"])
 
     def test_yolo_polygon_labels_are_not_advertised_as_detection(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -166,32 +157,6 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertNotIn("segmentation", metadata["tasks"])
             self.assertEqual(metadata["classes"], ["space"])
 
-    def test_coco_box_dataset_normalizes_to_yolo_detection(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            train = root / "train"
-            train.mkdir()
-            (train / "image_001.jpg").write_bytes(b"not-an-image")
-            (train / "_annotations.coco.json").write_text(
-                json.dumps(
-                    {
-                        "images": [{"id": 1, "file_name": "image_001.jpg", "width": 10, "height": 10}],
-                        "categories": [{"id": 5, "name": "space"}],
-                        "annotations": [{"id": 1, "image_id": 1, "category_id": 5, "bbox": [1, 1, 4, 4]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            metadata = normalize_dataset_for_training(root)
-            validate_dataset_for_upload(root)
-            ready = {item["id"] for item in compatible_models_for_metadata(metadata, get_catalog()) if item["ready"]}
-
-            self.assertIn("coco_instances", metadata["formats"])
-            self.assertIn("yolo_detection", metadata["formats"])
-            self.assertTrue((root / ".ailab_normalized" / "yolo_detection" / "data.yaml").is_file())
-            self.assertIn("yolo", ready)
-            self.assertIn("faster_rcnn", ready)
-            self.assertNotIn("mask_rcnn", ready)
 
     def test_coco_to_yolo_uses_canonical_category_order(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -273,7 +238,7 @@ class TrainerLogicTests(unittest.TestCase):
             root = Path(temp)
             train = root / "train"
             train.mkdir()
-            (train / "image_001.jpg").write_bytes(b"not-an-image")
+            (train / "image_001.jpg").write_bytes(PNG_1X1)
             (train / "_annotations.coco.json").write_text(
                 json.dumps(
                     {
@@ -331,51 +296,8 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertTrue(second["export"]["cache_hit"])
             self.assertEqual(first["export"]["fingerprint"], second["export"]["fingerprint"])
 
-    def test_prepare_ocr_recognition_exports_between_paddleocr_and_tesseract(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "line_001.png").write_bytes(b"not-an-image")
-            (root / "line_001.gt.txt").write_text("hello", encoding="utf-8")
 
-            paddle = prepare_dataset_for_model(root, "paddleocr", {"ocr_task": "rec"})
-            paddle_path = Path(paddle["dataset_path"])
-            self.assertIn(".ailab_exports", paddle_path.parts)
-            self.assertTrue((paddle_path / "rec_gt_train.txt").is_file())
 
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "line_001.png").write_bytes(b"not-an-image")
-            (root / "rec_gt_train.txt").write_text("line_001.png\thello", encoding="utf-8")
-
-            tesseract = prepare_dataset_for_model(root, "tesseract")
-            tesseract_path = Path(tesseract["dataset_path"])
-            self.assertIn(".ailab_exports", tesseract_path.parts)
-            self.assertTrue((tesseract_path / "line_001.gt.txt").is_file())
-
-    def test_tesseract_ground_truth_exports_paddleocr_rec_labels(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "line_001.png").write_bytes(b"not-an-image")
-            (root / "line_001.gt.txt").write_text("hello", encoding="utf-8")
-            metadata = normalize_dataset_for_training(root)
-            validate_dataset_for_upload(root)
-
-            self.assertIn("tesseract_ground_truth", metadata["formats"])
-            self.assertIn("paddleocr_labels", metadata["formats"])
-            self.assertIn("rec", metadata["paddleocr_tasks"])
-            self.assertTrue((root / ".ailab_normalized" / "paddleocr_rec" / "rec_gt_train.txt").is_file())
-
-    def test_paddleocr_rec_labels_export_tesseract_ground_truth(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            (root / "line_001.png").write_bytes(b"not-an-image")
-            (root / "rec_gt_train.txt").write_text("line_001.png\thello", encoding="utf-8")
-            metadata = normalize_dataset_for_training(root)
-            validate_dataset_for_upload(root)
-
-            self.assertIn("paddleocr_labels", metadata["formats"])
-            self.assertIn("tesseract_ground_truth", metadata["formats"])
-            self.assertGreater(metadata["tesseract"]["pairs"], 0)
 
     def test_coco_missing_images_are_rejected_on_upload(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -512,40 +434,7 @@ class TrainerLogicTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_dataset_for_upload(root, metadata)
 
-    def test_paddle_overrides_bind_uploaded_dataset(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            label = root / "rec_gt_train.txt"
-            label.write_text("image.png\\thello", encoding="utf-8")
-            overrides = PaddleOCRTrainer()._build_overrides(
-                {"dataset_path": str(root), "epochs": 2},
-                {"ocr_task": "rec", "max_text_length": 12},
-                root / "run",
-            )
-            self.assertIn(f"Train.dataset.data_dir={root.resolve().as_posix()}", overrides)
-            self.assertIn(f"Train.dataset.label_file_list=['{label.resolve().as_posix()}']", overrides)
-            self.assertIn("Global.max_text_length=12", overrides)
 
-
-    def test_paddle_overrides_reject_path_outside_allowed_roots(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            paddle_root = root / "PaddleOCR"
-            dataset = root / "dataset"
-            runs = root / "runs"
-            paddle_root.mkdir()
-            dataset.mkdir()
-            runs.mkdir()
-            (dataset / "rec_gt_train.txt").write_text("image.png\thello", encoding="utf-8")
-            outside = root / "outside_dict.txt"
-            outside.write_text("abc", encoding="utf-8")
-            with patch.dict(os.environ, {"PADDLEOCR_ROOT": str(paddle_root), "RUNS_DIR": str(runs)}, clear=False):
-                with self.assertRaises(ValueError):
-                    PaddleOCRTrainer()._build_overrides(
-                        {"dataset_path": str(dataset), "epochs": 1},
-                        {"ocr_task": "rec", "character_dict_path": str(outside)},
-                        runs / "run",
-                    )
 
     def test_yolo_split_image_dir_supports_images_train_layout(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -554,14 +443,6 @@ class TrainerLogicTests(unittest.TestCase):
             images.mkdir(parents=True)
             self.assertEqual(split_image_dir(str(root), "train"), images)
 
-    def test_paddle_overrides_reject_unimplemented_e2e_task(self):
-        with tempfile.TemporaryDirectory() as temp:
-            with self.assertRaises(ValueError):
-                PaddleOCRTrainer()._build_overrides(
-                    {"dataset_path": temp},
-                    {"ocr_task": "e2e"},
-                    Path(temp) / "run",
-                )
 
     def test_non_yolo_trainers_reject_auto_batch(self):
         with self.assertRaises(ValueError):
@@ -617,7 +498,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
     def _queued_service(self, root: Path) -> TrainingService:
         service = self._service(root)
         service.redis = object()
-        service.queues = {"cv_training": _FakeQueue(), "ocr_training": _FakeQueue()}
+        service.queues = {"cv_training": _FakeQueue()}
         return service
 
     def _imagefolder_dataset(self, root: Path, name: str, owner_id: str | None = None) -> Path:
@@ -657,44 +538,7 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
                     owner_id="owner-a",
                 )
 
-    def test_worker_yaml_normalizes_roboflow_parent_paths(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            dataset = root / "car-park.yolov11"
-            (dataset / "train" / "images").mkdir(parents=True)
-            (dataset / "valid" / "images").mkdir(parents=True)
-            (dataset / "test" / "images").mkdir(parents=True)
-            yaml_path = dataset / "data.yaml"
-            yaml_path.write_text(
-                "train: ../train/images\n"
-                "val: ../valid/images\n"
-                "test: ../test/images\n"
-                "names: ['space-empty']\n",
-                encoding="utf-8",
-            )
-            service = self._service(root)
-            worker_yaml = Path(service._create_worker_yaml(yaml_path, dataset))
-            worker_text = worker_yaml.read_text(encoding="utf-8")
-            self.assertIn("train: train/images", worker_text)
-            self.assertIn("val: valid/images", worker_text)
-            self.assertIn("test: test/images", worker_text)
 
-
-    def test_paddleocr_task_mismatch_is_rejected_before_enqueue(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            service = self._service(root)
-            dataset = root / "paddle_det"
-            dataset.mkdir()
-            (dataset / "image_001.jpg").write_bytes(b"not-an-image")
-            (dataset / "det_gt_train.txt").write_text("image_001.jpg\t[]", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "selected PaddleOCR task"):
-                service._assert_dataset_matches_model(
-                    dataset,
-                    "paddleocr",
-                    "ocr",
-                    extra_args={"ocr_task": "rec"},
-                )
 
     def test_mask_rcnn_rejects_coco_box_only_dataset(self):
         with tempfile.TemporaryDirectory() as temp:
