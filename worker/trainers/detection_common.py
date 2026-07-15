@@ -10,6 +10,7 @@ from .trainer_utils import (
     get_device,
     optimizer_for,
     require_positive_batch_size,
+    read_yaml,
     runs_root,
     scheduler_for,
     set_seed,
@@ -83,29 +84,58 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
     dataset_path = config["dataset_path"]
     data_yaml_path = config.get("data_yaml_path")
     dataset_formats = set(config.get("dataset_metadata", {}).get("formats", []))
+    dataset_root = Path(dataset_path)
+    has_val_dir = any((dataset_root / name).is_dir() for name in ("valid", "val", "validation"))
+    has_val_coco = any(
+        path.is_file()
+        for name in ("instances_val.json", "instances_valid.json", "instances_validation.json", "val.json", "valid.json", "validation.json")
+        for path in dataset_root.rglob(name)
+    )
+    has_val_yaml = bool(data_yaml_path and read_yaml(data_yaml_path).get("val"))
+    has_validation = has_val_dir or has_val_coco or has_val_yaml
     use_coco_boxes = model_kind == "faster_rcnn" and "coco_instances" in dataset_formats and not data_yaml_path
 
     if model_kind == "mask_rcnn":
         train_dataset = CocoInstanceDataset(dataset_path, "train", include_masks=True)
-        try:
-            val_dataset = CocoInstanceDataset(dataset_path, "val", include_masks=True)
-        except Exception:
+        if has_validation:
+            val_dataset = CocoInstanceDataset(
+                dataset_path,
+                "val",
+                include_masks=True,
+                category_to_label=train_dataset.category_to_label,
+                classes=train_dataset.classes,
+            )
+        else:
             val_dataset = None
         model_builder = build_mask_rcnn
     elif use_coco_boxes:
         train_dataset = CocoInstanceDataset(dataset_path, "train", include_masks=False)
-        try:
-            val_dataset = CocoInstanceDataset(dataset_path, "val", include_masks=False)
-        except Exception:
+        if has_validation:
+            val_dataset = CocoInstanceDataset(
+                dataset_path,
+                "val",
+                include_masks=False,
+                category_to_label=train_dataset.category_to_label,
+                classes=train_dataset.classes,
+            )
+        else:
             val_dataset = None
         model_builder = build_faster_rcnn
     else:
         train_dataset = YoloBoxDataset(dataset_path, data_yaml_path, "train")
-        try:
+        if has_validation:
             val_dataset = YoloBoxDataset(dataset_path, data_yaml_path, "val")
-        except Exception:
+        else:
             val_dataset = None
         model_builder = build_faster_rcnn
+
+    dataset_warnings = list(getattr(train_dataset, "warnings", []))
+    if val_dataset is not None:
+        dataset_warnings.extend(getattr(val_dataset, "warnings", []))
+    for warning in dataset_warnings[:100]:
+        logger(log_path, f"[Dataset warning] {warning}")
+    if len(dataset_warnings) > 100:
+        logger(log_path, f"[Dataset warning] {len(dataset_warnings) - 100} additional unusable files were skipped.")
 
     num_classes = _num_classes_from_dataset(train_dataset)
     model = model_builder(config, num_classes)
@@ -114,15 +144,24 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
 
     batch_size = require_positive_batch_size(int(config.get("batch_size", args.get("batch_size", 4))), model_kind)
     workers = int(args.get("workers", 4))
+    worker_options = {"prefetch_factor": 1} if workers > 0 else {}
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=workers,
         collate_fn=collate_detection,
+        **worker_options,
     )
     val_loader = (
-        DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=workers, collate_fn=collate_detection)
+        DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=workers,
+            collate_fn=collate_detection,
+            **worker_options,
+        )
         if val_dataset is not None
         else None
     )

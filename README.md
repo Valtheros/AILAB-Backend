@@ -64,7 +64,9 @@ Next.js proxy instead of calling FastAPI directly.
 | --- | --- |
 | `GET /api/model-catalog` | Tasks, models, and parameter specs |
 | `POST /api/upload-dataset` | Upload a dataset ZIP |
-| `GET /api/datasets` | List visible datasets |
+| `GET /api/datasets` | List visible datasets from the PostgreSQL resource registry |
+| `POST /api/datasets/inspect-upload` | Upload, validate, and stage a ZIP once |
+| `POST /api/datasets/import` | Commit a staged upload token |
 | `POST /api/train` | Queue a training job |
 | `GET /api/jobs/{job_id}/events` | Live SSE updates |
 | `GET /api/status/{job_id}` | Job snapshot |

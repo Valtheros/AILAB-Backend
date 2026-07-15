@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
 pyyaml
+Pillow
 pydantic
 python-multipart
 redis
 rq
+psycopg[binary]

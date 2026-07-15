@@ -43,6 +43,12 @@ create table if not exists datasets (
   unique (workspace_id, slug)
 );
 
+alter table datasets alter column workspace_id drop not null;
+alter table datasets add column if not exists owner_user_id text;
+alter table datasets add column if not exists status text not null default 'active';
+alter table datasets add column if not exists metadata jsonb not null default '{}'::jsonb;
+alter table datasets add column if not exists updated_at timestamptz not null default now();
+
 create table if not exists training_runs (
   id uuid primary key default gen_random_uuid(),
   workspace_id uuid not null references workspaces(id) on delete cascade,
@@ -64,6 +70,11 @@ create table if not exists training_runs (
   unique (workspace_id, run_slug)
 );
 
+alter table training_runs alter column workspace_id drop not null;
+alter table training_runs add column if not exists owner_user_id text;
+alter table training_runs add column if not exists dataset_slug text;
+alter table training_runs add column if not exists error_detail text;
+
 create table if not exists artifacts (
   id uuid primary key default gen_random_uuid(),
   training_run_id uuid not null references training_runs(id) on delete cascade,
@@ -80,3 +91,28 @@ create index if not exists idx_projects_workspace_id on projects(workspace_id);
 create index if not exists idx_datasets_workspace_id on datasets(workspace_id);
 create index if not exists idx_training_runs_workspace_id on training_runs(workspace_id);
 create index if not exists idx_training_runs_created_by on training_runs(created_by);
+create unique index if not exists idx_datasets_owner_slug on datasets(owner_user_id, slug) where owner_user_id is not null;
+create unique index if not exists idx_runs_owner_slug on training_runs(owner_user_id, run_slug) where owner_user_id is not null;
+create index if not exists idx_runs_dataset_status on training_runs(dataset_id, status);
+
+do $$
+begin
+  if to_regclass('"user"') is not null and not exists (select 1 from pg_constraint where conname = 'datasets_owner_user_fk') then
+    alter table datasets add constraint datasets_owner_user_fk foreign key (owner_user_id)
+      references "user"(id) on delete restrict not valid;
+  end if;
+  if to_regclass('"user"') is not null and not exists (select 1 from pg_constraint where conname = 'training_runs_owner_user_fk') then
+    alter table training_runs add constraint training_runs_owner_user_fk foreign key (owner_user_id)
+      references "user"(id) on delete restrict not valid;
+  end if;
+end $$;
+
+do $$
+begin
+  if exists (select 1 from pg_constraint where conname = 'datasets_owner_user_fk' and not convalidated) then
+    alter table datasets validate constraint datasets_owner_user_fk;
+  end if;
+  if exists (select 1 from pg_constraint where conname = 'training_runs_owner_user_fk' and not convalidated) then
+    alter table training_runs validate constraint training_runs_owner_user_fk;
+  end if;
+end $$;

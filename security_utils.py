@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import fcntl
 import re
 import shutil
 import stat
@@ -11,8 +12,8 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
-MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
-MAX_ARCHIVE_ENTRIES = 10_000
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = max(10_000, int(os.getenv("AILAB_MAX_ARCHIVE_ENTRIES", "250000")))
 MAX_ARCHIVE_MEMBER_BYTES = 1024 * 1024 * 1024
 MAX_ARCHIVE_UNCOMPRESSED_BYTES = 5 * 1024 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
@@ -52,17 +53,90 @@ def named_file_lock(root: Path, name: str, label: str = "resource"):
     locks_dir.mkdir(parents=True, exist_ok=True)
     lock_path = contained_path(locks_dir, f"{name}.lock")
     descriptor: int | None = None
+    acquired = False
     try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(descriptor, str(os.getpid()).encode("utf-8"))
-        except FileExistsError as exc:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
             raise FileExistsError(f"{label.title()} '{name}' is already being written.") from exc
+        acquired = True
+        os.ftruncate(descriptor, 0)
+        os.write(descriptor, str(os.getpid()).encode("utf-8"))
         yield lock_path
     finally:
         if descriptor is not None:
+            if acquired:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
             os.close(descriptor)
-            lock_path.unlink(missing_ok=True)
+
+
+class ReversibleDirectoryReplace:
+    def __init__(self, staging_dir: Path, target_dir: Path):
+        self.staging_dir = staging_dir
+        self.target_dir = target_dir
+        self.backup_dir = target_dir.with_name(f".backup-{target_dir.name}-{uuid.uuid4().hex}")
+        self.had_target = target_dir.exists()
+        self.applied = False
+        self.finished = False
+
+    def apply(self) -> "ReversibleDirectoryReplace":
+        if self.had_target:
+            self.target_dir.replace(self.backup_dir)
+        try:
+            self.staging_dir.replace(self.target_dir)
+        except Exception:
+            if self.backup_dir.exists():
+                self.backup_dir.replace(self.target_dir)
+            raise
+        self.applied = True
+        return self
+
+    def commit(self) -> None:
+        if self.finished:
+            return
+        if self.backup_dir.exists():
+            shutil.rmtree(self.backup_dir, ignore_errors=True)
+        self.finished = True
+
+    def rollback(self) -> None:
+        if self.finished:
+            return
+        if self.applied and self.target_dir.exists():
+            self.staging_dir.parent.mkdir(parents=True, exist_ok=True)
+            if self.staging_dir.exists():
+                shutil.rmtree(self.staging_dir)
+            self.target_dir.replace(self.staging_dir)
+        if self.backup_dir.exists():
+            self.backup_dir.replace(self.target_dir)
+        self.finished = True
+
+
+class ReversibleDirectoryRemoval:
+    def __init__(self, target_dir: Path):
+        self.target_dir = target_dir
+        self.removed_dir = target_dir.with_name(f".deleting-{target_dir.name}-{uuid.uuid4().hex}")
+        self.applied = False
+        self.finished = False
+
+    def apply(self) -> "ReversibleDirectoryRemoval":
+        self.target_dir.replace(self.removed_dir)
+        self.applied = True
+        return self
+
+    def commit(self) -> None:
+        if self.finished:
+            return
+        if self.removed_dir.exists():
+            shutil.rmtree(self.removed_dir, ignore_errors=True)
+        self.finished = True
+
+    def rollback(self) -> None:
+        if self.finished:
+            return
+        if self.applied and self.removed_dir.exists() and not self.target_dir.exists():
+            self.removed_dir.replace(self.target_dir)
+        self.finished = True
 
 
 def _validate_archive_member(member: zipfile.ZipInfo, target_dir: Path) -> None:
@@ -143,17 +217,10 @@ def staging_directory(root: Path) -> Path:
 
 
 def replace_directory(staging_dir: Path, target_dir: Path) -> None:
-    backup_dir = target_dir.with_name(f".backup-{target_dir.name}-{uuid.uuid4().hex}")
-    had_target = target_dir.exists()
+    operation = ReversibleDirectoryReplace(staging_dir, target_dir)
     try:
-        if had_target:
-            target_dir.replace(backup_dir)
-        staging_dir.replace(target_dir)
-        if had_target:
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        operation.apply()
+        operation.commit()
     except Exception:
-        if target_dir.exists() and target_dir != staging_dir:
-            shutil.rmtree(target_dir, ignore_errors=True)
-        if backup_dir.exists():
-            backup_dir.replace(target_dir)
+        operation.rollback()
         raise

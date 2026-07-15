@@ -50,7 +50,7 @@ if "rq.command" not in sys.modules:
 if "rq.job" not in sys.modules:
     sys.modules["rq.job"] = types.SimpleNamespace(Job=types.SimpleNamespace, JobStatus=types.SimpleNamespace)
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, normalize_dataset_for_training, prepare_dataset_for_model, validate_dataset_for_upload
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, inspect_dataset_for_upload, normalize_dataset_for_training, prepare_dataset_for_model, validate_dataset_for_upload
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
@@ -126,7 +126,7 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("yolo_detection", metadata["formats"])
             self.assertNotIn("imagefolder", metadata["formats"])
             self.assertNotIn("yolo_segmentation", metadata["formats"])
-            self.assertFalse(metadata["errors"])
+            self.assertTrue(any("must not mix" in error for error in metadata["errors"]))
             self.assertEqual(metadata["classes"], ["space-empty", "space-occupied"])
 
 
@@ -192,6 +192,56 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("yolo", ready)
             self.assertIn("faster_rcnn", ready)
             self.assertNotIn("mask_rcnn", ready)
+
+    def test_coco_to_yolo_uses_canonical_category_order(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 2, "name": "second"}, {"id": 1, "name": "first"}],
+                        "annotations": [{"id": 1, "image_id": 1, "category_id": 2, "bbox": [1, 1, 4, 4]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prepared = prepare_dataset_for_model(root, "yolo", {"model_size": "n"})
+            labels = list(Path(prepared["dataset_path"]).rglob("*.txt"))
+            self.assertTrue(labels)
+            self.assertTrue(labels[0].read_text(encoding="utf-8").startswith("1 "))
+            self.assertEqual(prepared["metadata"]["classes"], ["second"])
+            self.assertEqual(prepared["metadata"]["coco"]["classes"], ["first", "second"])
+
+    def test_partial_coco_masks_are_not_mask_rcnn_ready(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            train = root / "train"
+            train.mkdir()
+            (train / "image.jpg").write_bytes(b"not-an-image")
+            (train / "_annotations.coco.json").write_text(
+                json.dumps(
+                    {
+                        "images": [{"id": 1, "file_name": "image.jpg", "width": 10, "height": 10}],
+                        "categories": [{"id": 1, "name": "object"}],
+                        "annotations": [
+                            {"id": 1, "image_id": 1, "category_id": 1, "bbox": [1, 1, 4, 4], "segmentation": [[1, 1, 5, 1, 5, 5]]},
+                            {"id": 2, "image_id": 1, "category_id": 1, "bbox": [2, 2, 3, 3]},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata = inspect_dataset(root)
+            mask_entry = next(
+                item
+                for item in compatible_models_for_metadata(metadata, get_catalog())
+                if item["id"] == "mask_rcnn"
+            )
+            self.assertFalse(mask_entry["ready"])
 
     def test_coco_box_dataset_is_yolo_compatible_before_export(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -445,6 +495,23 @@ class TrainerLogicTests(unittest.TestCase):
             dataset = CocoInstanceDataset(str(root), "train", include_masks=False)
             self.assertFalse(dataset.include_masks)
 
+    def test_upload_inspection_rejects_invalid_sample(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "train" / "images").mkdir(parents=True)
+            (root / "train" / "labels").mkdir(parents=True)
+            (root / "data.yaml").write_text("train: train/images\nnames: [car]\n", encoding="utf-8")
+            (root / "train" / "images" / "car.jpg").write_bytes(b"not-an-image")
+            (root / "train" / "labels" / "car.txt").write_text("0 bad row\n", encoding="utf-8")
+
+            metadata = inspect_dataset_for_upload(root)
+
+            self.assertTrue(metadata["validation_deferred"])
+            self.assertTrue(metadata["errors"])
+            self.assertEqual(metadata["warnings"], [])
+            with self.assertRaises(ValueError):
+                validate_dataset_for_upload(root, metadata)
+
     def test_paddle_overrides_bind_uploaded_dataset(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -508,6 +575,18 @@ class TrainerLogicTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 dataset._resolve_image_path("../outside.png")
 
+    def test_coco_validation_does_not_fall_back_to_train_annotations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "train").mkdir()
+            (root / "val").mkdir()
+            (root / "train" / "_annotations.coco.json").write_text(
+                json.dumps({"images": [], "categories": [], "annotations": []}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "split 'val'"):
+                CocoInstanceDataset(str(root), "val")
+
 
 class _FakeJob:
     id = "job-1"
@@ -521,10 +600,10 @@ class _FakeJob:
 
 class _FakeQueue:
     def __init__(self):
-        self.jobs: list[tuple[str, dict]] = []
+        self.jobs: list[tuple[str, dict, dict]] = []
 
-    def enqueue(self, target: str, config: dict, **_kwargs):
-        self.jobs.append((target, config))
+    def enqueue(self, target: str, config: dict, **kwargs):
+        self.jobs.append((target, config, kwargs))
         return _FakeJob()
 
 
@@ -546,6 +625,9 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
         image = dataset / "train" / "class_a" / "sample.jpg"
         image.parent.mkdir(parents=True)
         image.write_bytes(b"not-an-image")
+        second_image = dataset / "train" / "class_b" / "sample.jpg"
+        second_image.parent.mkdir(parents=True)
+        second_image.write_bytes(b"not-an-image")
         if owner_id:
             (dataset / ".ailab_dataset.json").write_text(
                 json.dumps({"created_by": owner_id}),
@@ -644,7 +726,6 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
             train = dataset / "train"
             train.mkdir(parents=True)
             (dataset / ".ailab_dataset.json").write_text(json.dumps({"created_by": "owner-a"}), encoding="utf-8")
-            (dataset / "data.yaml").write_text("train: train/images\nnames: ['space']", encoding="utf-8")
             (train / "image_001.jpg").write_bytes(b"not-an-image")
             (train / "_annotations.coco.json").write_text(
                 json.dumps(
@@ -704,6 +785,8 @@ class TrainingServiceOwnershipTests(unittest.TestCase):
 
             self.assertEqual(job_id, "job-1")
             queued_config = service.queues["cv_training"].jobs[0][1]
+            enqueue_options = service.queues["cv_training"].jobs[0][2]
+            self.assertEqual(enqueue_options["job_id"], queued_config["job_id"])
             self.assertEqual(queued_config["source_dataset_path"], str(dataset))
             self.assertIn(".ailab_exports", Path(queued_config["dataset_path"]).parts)
             self.assertTrue(Path(queued_config["data_yaml_path"]).is_file())

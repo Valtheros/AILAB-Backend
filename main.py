@@ -19,21 +19,26 @@ from dataset_utils import (
     find_dataset_yaml,
     format_bytes,
     inspect_dataset,
+    inspect_dataset_for_upload,
     safe_dataset_name,
     validate_dataset_for_upload,
 )
+from dataset_storage import dataset_lock_name, owner_dataset_path, registered_storage_path
 from model_catalog import get_catalog, get_model, validate_model_params
 from resource_guard import ResourcePlanError, enforce_resource_plan, get_resource_profile
 from security_utils import (
     contained_path,
     named_file_lock,
-    replace_directory,
+    ReversibleDirectoryRemoval,
+    ReversibleDirectoryReplace,
     safe_extract_zip,
     save_upload_to_temp,
     staging_directory,
     validate_slug,
 )
 from services.training_service import TrainingService
+from resource_repository import resource_repository
+from staged_uploads import StagedUploadStore
 from settings import BACKEND_INTERNAL_TOKEN, CORS_ORIGINS, DATASET_DIR, RUNS_DIR, ensure_runtime_dirs
 from sse_utils import TERMINAL_STATUSES, heartbeat, sse_event
 
@@ -65,6 +70,8 @@ async def require_internal_token(request: Request, call_next):
 
 ensure_runtime_dirs()
 training_service = TrainingService()
+staged_uploads = StagedUploadStore(DATASET_DIR)
+staged_uploads.cleanup()
 
 
 class TrainRequest(BaseModel):
@@ -84,6 +91,14 @@ class TrainRequest(BaseModel):
         extra = "forbid"
 
 
+class StagedImportRequest(BaseModel):
+    uploadToken: str = Field(min_length=20, max_length=128)
+
+
+class TransferResourcesRequest(BaseModel):
+    targetUserId: str = Field(min_length=1, max_length=255)
+
+
 def _request_user_id(request: Request) -> str | None:
     value = request.headers.get("x-user-id")
     return value.strip() if value and value.strip() else None
@@ -98,6 +113,15 @@ def _require_request_user_id(request: Request) -> str:
     user_id = _request_user_id(request)
     if not user_id:
         raise HTTPException(status_code=401, detail="Authenticated user identity is required")
+    return user_id
+
+
+def _require_admin(request: Request) -> str:
+    user_id = _require_request_user_id(request)
+    try:
+        resource_repository.assert_admin(user_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     return user_id
 
 
@@ -142,6 +166,8 @@ def _assert_owned_resource_visible(owner_id: str | None, request: Request) -> No
 
 
 def _run_owner(project_name: str) -> str | None:
+    if resource_repository.enabled:
+        return resource_repository.get_run_owner_by_slug(project_name)
     config_path = contained_path(RUNS_DIR, project_name, "job_config.json")
     owner = _read_json_file(config_path).get("created_by")
     return str(owner) if owner else None
@@ -189,11 +215,14 @@ def _extra_args_from_request(request: TrainRequest) -> dict[str, Any]:
     return validate_model_params(request.model_type, extra_args)
 
 
-def _safe_extract(zip_file: zipfile.ZipFile, target_dir: Path) -> None:
-    try:
-        safe_extract_zip(zip_file, target_dir)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+def _extract_and_validate_upload(temp_zip_path: Path, staging_dir: Path) -> tuple[Path, dict[str, Any]]:
+    with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
+        extract_dir = staging_dir / "extracted"
+        safe_extract_zip(zip_ref, extract_dir)
+    _flatten_single_root_folder(extract_dir)
+    metadata = inspect_dataset_for_upload(extract_dir)
+    validate_dataset_for_upload(extract_dir, metadata)
+    return extract_dir, metadata
 
 
 def _flatten_single_root_folder(target_dir: Path) -> None:
@@ -201,6 +230,9 @@ def _flatten_single_root_folder(target_dir: Path) -> None:
     if len(contents) != 1 or not contents[0].is_dir():
         return
     single_dir = contents[0]
+    structural_names = {"train", "training", "valid", "val", "validation", "test", "images", "labels", "masks", "annotations"}
+    if single_dir.name.lower() in structural_names:
+        return
     for item in single_dir.iterdir():
         shutil.move(str(item), str(target_dir / item.name))
     single_dir.rmdir()
@@ -255,7 +287,7 @@ def _dataset_response(dataset_name: str, metadata: dict[str, Any]) -> dict[str, 
     }
 
 
-async def _inspect_uploaded_zip(file: UploadFile) -> tuple[str, dict[str, Any]]:
+async def _inspect_uploaded_zip(request: Request, file: UploadFile) -> dict[str, Any]:
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
     if not file.filename.lower().endswith(".zip"):
@@ -266,13 +298,21 @@ async def _inspect_uploaded_zip(file: UploadFile) -> tuple[str, dict[str, Any]]:
     temp_zip_path: Path | None = None
     try:
         temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
-        with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
-            extract_dir = staging_dir / "extracted"
-            _safe_extract(zip_ref, extract_dir)
-        _flatten_single_root_folder(extract_dir)
-        metadata = inspect_dataset(extract_dir)
-        validate_dataset_for_upload(extract_dir)
-        return dataset_name, metadata
+        extract_dir, metadata = await asyncio.to_thread(_extract_and_validate_upload, temp_zip_path, staging_dir)
+        profile = _dataset_profile(metadata)
+        staged = await asyncio.to_thread(
+            staged_uploads.create,
+            _require_request_user_id(request),
+            dataset_name,
+            extract_dir,
+            profile,
+        )
+        return {
+            "dataset_name": dataset_name,
+            "profile": profile,
+            "uploadToken": staged["token"],
+            "expiresAt": staged["expires_at"],
+        }
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid ZIP file")
     except ValueError as exc:
@@ -294,41 +334,54 @@ async def _import_uploaded_zip(request: Request, file: UploadFile) -> dict[str, 
         validate_slug(dataset_name, "dataset name")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    target_dir = contained_path(DATASET_DIR, dataset_name)
+    request_owner = _require_request_user_id(request)
+    target_dir = owner_dataset_path(DATASET_DIR, request_owner, dataset_name)
     staging_dir = staging_directory(DATASET_DIR)
     temp_zip_path: Path | None = None
+    replacement: ReversibleDirectoryReplace | None = None
 
     try:
-        with named_file_lock(DATASET_DIR, dataset_name, "dataset name"):
-            target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
-            request_owner = _require_request_user_id(request)
-            if target_dir.exists() and target_owner != request_owner:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Dataset name already exists. Rename the ZIP and upload again.",
-                )
-
-            temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
-            with zipfile.ZipFile(temp_zip_path, "r") as zip_ref:
-                extract_dir = staging_dir / "extracted"
-                _safe_extract(zip_ref, extract_dir)
-
-            _flatten_single_root_folder(extract_dir)
-            metadata = inspect_dataset(extract_dir)
-            validate_dataset_for_upload(extract_dir)
-            replace_directory(extract_dir, target_dir)
-            workflow = dataset_workflow_metadata(metadata, get_catalog())
-            _write_dataset_metadata(target_dir, request, workflow)
-            return _dataset_response(dataset_name, metadata)
+        temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
+        extract_dir, metadata = await asyncio.to_thread(_extract_and_validate_upload, temp_zip_path, staging_dir)
+        with named_file_lock(DATASET_DIR, dataset_lock_name(request_owner, dataset_name), "dataset name"):
+            with resource_repository.dataset_guard(request_owner, dataset_name) as connection:
+                existing = resource_repository.get_dataset(request_owner, dataset_name, connection)
+                if existing:
+                    target_dir = registered_storage_path(DATASET_DIR, existing["storage_path"])
+                active = resource_repository.active_runs_for_dataset(existing.get("id") if existing else None, connection)
+                if active:
+                    names = ", ".join(str(run["run_slug"]) for run in active)
+                    raise HTTPException(status_code=409, detail=f"Dataset is in use by active training run(s): {names}")
+                target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
+                if target_dir.exists() and target_owner not in {None, request_owner}:
+                    raise HTTPException(status_code=409, detail="Dataset storage ownership is inconsistent. Contact an administrator.")
+                target_dir.parent.mkdir(parents=True, exist_ok=True)
+                replacement = ReversibleDirectoryReplace(extract_dir, target_dir).apply()
+                metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
+                workflow = dataset_workflow_metadata(metadata, get_catalog())
+                _write_dataset_metadata(target_dir, request, workflow)
+                record = resource_repository.upsert_dataset(request_owner, _request_user_email(request), dataset_name, target_dir, metadata, connection)
+            replacement.commit()
+            return {**_dataset_response(dataset_name, metadata), "id": str(record.get("id", dataset_name))}
     except HTTPException:
+        if replacement is not None:
+            replacement.rollback()
         raise
     except zipfile.BadZipFile:
+        if replacement is not None:
+            replacement.rollback()
         raise HTTPException(status_code=400, detail="Invalid ZIP file")
     except FileExistsError as exc:
+        if replacement is not None:
+            replacement.rollback()
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:
+        if replacement is not None:
+            replacement.rollback()
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
+        if replacement is not None:
+            replacement.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -452,8 +505,8 @@ def get_metrics(project_name: str, request: Request):
 def stop_train(job_id: str, request: Request):
     _assert_job_visible(job_id, request)
     try:
-        training_service.stop_training_container(job_id)
-        return {"status": "success"}
+        status = training_service.stop_training_container(job_id)
+        return {"status": status}
     except Exception as exc:
         import traceback
 
@@ -464,12 +517,14 @@ def stop_train(job_id: str, request: Request):
 @app.get("/api/jobs/{job_id}/events")
 async def job_events(job_id: str, request: Request):
     _assert_job_visible(job_id, request)
-    snapshot = training_service.get_job_snapshot(job_id)
+    snapshot = await asyncio.to_thread(training_service.get_job_snapshot, job_id)
     if snapshot["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def stream():
-        log_offset = int(snapshot.get("log_offset", 0))
+        initial_log, log_offset, _ = await asyncio.to_thread(training_service.read_job_log_chunk, job_id, -1)
+        snapshot["logs"] = initial_log
+        snapshot["log_offset"] = log_offset
         previous_metrics = json.dumps(snapshot["metrics"], sort_keys=True)
         previous_status = snapshot["status"]
         yield sse_event("snapshot", snapshot)
@@ -480,12 +535,12 @@ async def job_events(job_id: str, request: Request):
         heartbeat_ticks = 0
         while True:
             await asyncio.sleep(1)
-            current = training_service.get_job_snapshot(job_id)
+            current = await asyncio.to_thread(training_service.get_job_snapshot, job_id)
             current_status = current["status"]
             current_metrics = json.dumps(current["metrics"], sort_keys=True)
             sent_event = False
 
-            chunk, log_offset, replace = training_service.read_job_log_chunk(job_id, log_offset)
+            chunk, log_offset, replace = await asyncio.to_thread(training_service.read_job_log_chunk, job_id, log_offset)
             if chunk:
                 yield sse_event("log", {"text": chunk, "replace": replace})
                 sent_event = True
@@ -520,20 +575,35 @@ def list_datasets(request: Request):
     if not DATASET_DIR.exists():
         return {"datasets": []}
 
-    for item in sorted(DATASET_DIR.iterdir(), key=lambda path: path.name.lower()):
+    records = resource_repository.list_datasets(request_owner) if resource_repository.enabled else []
+    items = [(registered_storage_path(DATASET_DIR, row["storage_path"]), row) for row in records]
+    if not resource_repository.enabled:
+        items = [(item, None) for item in DATASET_DIR.iterdir() if item.is_dir() and not item.name.startswith(".")]
+    for item, record in sorted(items, key=lambda pair: pair[0].name.lower()):
         if not item.is_dir() or item.name.startswith("."):
             continue
-        owner_id = _dataset_owner(item)
+        owner_id = record.get("owner_user_id") if record else _dataset_owner(item)
         if owner_id != request_owner:
             continue
 
-        metadata = inspect_dataset(item)
+        stored_metadata = record.get("metadata") if record else None
+        if isinstance(stored_metadata, str):
+            try:
+                stored_metadata = json.loads(stored_metadata)
+            except json.JSONDecodeError:
+                stored_metadata = None
+        required_metadata = {"formats", "tasks", "classes", "image_count", "size_bytes", "warnings", "errors"}
+        metadata = (
+            dict(stored_metadata)
+            if isinstance(stored_metadata, dict) and required_metadata.issubset(stored_metadata)
+            else inspect_dataset(item)
+        )
         metadata["export_cache"] = export_cache_metadata(item)
         profile = _dataset_profile(metadata)
         created = time.strftime("%Y-%m-%d", time.localtime(item.stat().st_ctime))
         datasets.append(
             {
-                "id": item.name,
+                "id": str(record.get("id")) if record else item.name,
                 "name": item.name,
                 "images": metadata["image_count"],
                 "classes": metadata["classes"],
@@ -566,13 +636,59 @@ def list_datasets(request: Request):
 @app.post("/api/datasets/inspect-upload")
 async def inspect_dataset_upload(request: Request, file: UploadFile = File(...)):
     _require_request_user_id(request)
-    dataset_name, metadata = await _inspect_uploaded_zip(file)
-    return {"status": "success", "dataset_name": dataset_name, "profile": _dataset_profile(metadata)}
+    result = await _inspect_uploaded_zip(request, file)
+    return {"status": "success", **result}
 
 
 @app.post("/api/datasets/import")
-async def import_dataset(request: Request, file: UploadFile = File(...)):
-    return await _import_uploaded_zip(request, file)
+def import_dataset(payload: StagedImportRequest, request: Request):
+    owner_id = _require_request_user_id(request)
+    replacement: ReversibleDirectoryReplace | None = None
+    try:
+        manifest, extracted_dir, _pending_stage_dir = staged_uploads.peek(payload.uploadToken, owner_id)
+        dataset_name = str(manifest["dataset_name"])
+        validate_slug(dataset_name, "dataset name")
+        metadata = inspect_dataset_for_upload(extracted_dir)
+        validate_dataset_for_upload(extracted_dir, metadata)
+        with resource_repository.dataset_guard(owner_id, dataset_name) as connection:
+            existing = resource_repository.get_dataset(owner_id, dataset_name, connection)
+            target_dir = (
+                registered_storage_path(DATASET_DIR, existing["storage_path"])
+                if existing
+                else owner_dataset_path(DATASET_DIR, owner_id, dataset_name)
+            )
+            active = resource_repository.active_runs_for_dataset(existing.get("id") if existing else None, connection)
+            if active:
+                names = ", ".join(str(run["run_slug"]) for run in active)
+                raise HTTPException(status_code=409, detail=f"Dataset is in use by active training run(s): {names}")
+            if target_dir.exists() and existing is None:
+                raise HTTPException(status_code=409, detail="Dataset storage exists without a registry record. Contact an administrator.")
+            _manifest, extracted_dir, stage_dir = staged_uploads.consume(payload.uploadToken, owner_id)
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            replacement = ReversibleDirectoryReplace(extracted_dir, target_dir).apply()
+            metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
+            workflow = dataset_workflow_metadata(metadata, get_catalog())
+            _write_dataset_metadata(target_dir, request, workflow)
+            record = resource_repository.upsert_dataset(owner_id, _request_user_email(request), dataset_name, target_dir, metadata, connection)
+        replacement.commit()
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        return {**_dataset_response(dataset_name, metadata), "id": str(record.get("id", dataset_name))}
+    except HTTPException:
+        if replacement is not None:
+            replacement.rollback()
+        raise
+    except FileNotFoundError as exc:
+        if replacement is not None:
+            replacement.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        if replacement is not None:
+            replacement.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception:
+        if replacement is not None:
+            replacement.rollback()
+        raise
 
 
 @app.post("/api/upload-dataset")
@@ -582,18 +698,39 @@ async def upload_dataset(request: Request, file: UploadFile = File(...)):
 
 @app.delete("/api/datasets/{dataset_name}")
 def delete_dataset(dataset_name: str, request: Request):
+    owner_id = _require_request_user_id(request)
     try:
         validate_slug(dataset_name, "dataset name")
-        target_dir = contained_path(DATASET_DIR, dataset_name)
+        record = resource_repository.get_dataset(owner_id, dataset_name) if resource_repository.enabled else None
+        target_dir = registered_storage_path(DATASET_DIR, record["storage_path"]) if record else owner_dataset_path(DATASET_DIR, owner_id, dataset_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
-    _assert_owned_resource_visible(_dataset_owner(target_dir), request)
+    removal: ReversibleDirectoryRemoval | None = None
     try:
-        shutil.rmtree(target_dir)
+        with resource_repository.dataset_guard(owner_id, dataset_name) as connection:
+            record = resource_repository.get_dataset(owner_id, dataset_name, connection)
+            if resource_repository.enabled and not record:
+                raise HTTPException(status_code=404, detail="Dataset not found")
+            if not resource_repository.enabled:
+                _assert_owned_resource_visible(_dataset_owner(target_dir), request)
+            active = resource_repository.active_runs_for_dataset(record.get("id") if record else None, connection)
+            if active:
+                names = ", ".join(str(run["run_slug"]) for run in active)
+                raise HTTPException(status_code=409, detail=f"Dataset is in use by active training run(s): {names}")
+            removal = ReversibleDirectoryRemoval(target_dir).apply()
+            if record:
+                resource_repository.mark_dataset_deleted(record["id"], connection)
+        removal.commit()
         return {"status": "success"}
+    except HTTPException:
+        if removal is not None:
+            removal.rollback()
+        raise
     except Exception as exc:
+        if removal is not None:
+            removal.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -604,6 +741,10 @@ def list_runs(request: Request):
 
 @app.delete("/api/runs/{project_name}")
 def delete_run(project_name: str, request: Request):
+    owner_id = _require_request_user_id(request)
+    record = resource_repository.get_run(owner_id, project_name)
+    if record and record.get("status") in {"queued", "running", "started", "stopping"}:
+        raise HTTPException(status_code=409, detail="Stop the active training run before deleting it")
     try:
         validate_slug(project_name, "project name")
         _assert_run_visible(project_name, request)
@@ -612,10 +753,15 @@ def delete_run(project_name: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not project_dir.exists() or not project_dir.is_dir():
         raise HTTPException(status_code=404, detail="Run not found")
+    removal: ReversibleDirectoryRemoval | None = None
     try:
-        shutil.rmtree(project_dir)
+        removal = ReversibleDirectoryRemoval(project_dir).apply()
+        resource_repository.delete_run_by_slug(owner_id, project_name)
+        removal.commit()
         return {"status": "success"}
     except Exception as exc:
+        if removal is not None:
+            removal.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -633,16 +779,89 @@ def download_run_file(project_name: str, file_path: str, request: Request):
     return FileResponse(target, filename=target.name)
 
 
+@app.get("/api/admin/users/{user_id}/resource-impact")
+def admin_user_resource_impact(user_id: str, request: Request):
+    _require_admin(request)
+    return resource_repository.user_impact(user_id)
+
+
+@app.post("/api/admin/users/{user_id}/transfer-resources")
+def admin_transfer_user_resources(user_id: str, payload: TransferResourcesRequest, request: Request):
+    _require_admin(request)
+    impact = resource_repository.user_impact(user_id)
+    if impact["activeJobs"]:
+        raise HTTPException(status_code=409, detail="Stop active training jobs before transferring ownership")
+    try:
+        return {"status": "success", **resource_repository.transfer_user_resources(user_id, payload.targetUserId)}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/admin/users/{user_id}/resources")
+def admin_delete_user_resources(user_id: str, request: Request):
+    _require_admin(request)
+    datasets, runs = resource_repository.delete_user_resource_records(user_id)
+    errors: list[str] = []
+    for run in runs:
+        job_id = run.get("rq_job_id")
+        if job_id and run.get("status") in {"queued", "running", "started", "stopping"}:
+            try:
+                training_service.stop_training_container(str(job_id))
+            except Exception as exc:
+                errors.append(f"Could not stop {run.get('run_slug')}: {exc}")
+    if errors:
+        raise HTTPException(status_code=409, detail=" ".join(errors))
+    deadline = time.monotonic() + 15
+    for run in runs:
+        job_id = run.get("rq_job_id")
+        if not job_id:
+            continue
+        while time.monotonic() < deadline:
+            if training_service.get_container_status(str(job_id)) in TERMINAL_STATUSES | {"not_found", "stopped"}:
+                break
+            time.sleep(0.25)
+        else:
+            errors.append(f"Training run {run.get('run_slug')} is still stopping; retry cleanup shortly")
+    if errors:
+        raise HTTPException(status_code=409, detail=" ".join(errors))
+    for run in runs:
+        try:
+            shutil.rmtree(contained_path(RUNS_DIR, Path(str(run["storage_path"]))))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            errors.append(f"Could not delete run {run.get('run_slug')}: {exc}")
+    for dataset in datasets:
+        try:
+            shutil.rmtree(contained_path(DATASET_DIR, Path(str(dataset["storage_path"]))))
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            errors.append(f"Could not delete dataset {dataset.get('slug')}: {exc}")
+    if errors:
+        raise HTTPException(status_code=500, detail=" ".join(errors))
+    resource_repository.finalize_user_resource_delete(user_id)
+    return {"status": "success", "datasets": len(datasets), "runs": len(runs)}
+
+
 @app.get("/api/datasets/{dataset_name}/metadata")
 def dataset_metadata(dataset_name: str, request: Request):
+    owner_id = _require_request_user_id(request)
     try:
         validate_slug(dataset_name, "dataset name")
-        target_dir = contained_path(DATASET_DIR, dataset_name)
+        record = resource_repository.get_dataset(owner_id, dataset_name) if resource_repository.enabled else None
+        target_dir = registered_storage_path(DATASET_DIR, record["storage_path"]) if record else owner_dataset_path(DATASET_DIR, owner_id, dataset_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
-    _assert_owned_resource_visible(_dataset_owner(target_dir), request)
+    if resource_repository.enabled:
+        if not resource_repository.get_dataset(owner_id, dataset_name):
+            raise HTTPException(status_code=404, detail="Dataset not found")
+    else:
+        _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     metadata = inspect_dataset(target_dir)
     metadata["export_cache"] = export_cache_metadata(target_dir)
     metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
@@ -652,14 +871,20 @@ def dataset_metadata(dataset_name: str, request: Request):
 
 @app.get("/api/datasets/{dataset_name}/compatibility")
 def dataset_compatibility(dataset_name: str, request: Request):
+    owner_id = _require_request_user_id(request)
     try:
         validate_slug(dataset_name, "dataset name")
-        target_dir = contained_path(DATASET_DIR, dataset_name)
+        record = resource_repository.get_dataset(owner_id, dataset_name) if resource_repository.enabled else None
+        target_dir = registered_storage_path(DATASET_DIR, record["storage_path"]) if record else owner_dataset_path(DATASET_DIR, owner_id, dataset_name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not target_dir.exists():
         raise HTTPException(status_code=404, detail="Dataset not found")
-    _assert_owned_resource_visible(_dataset_owner(target_dir), request)
+    if resource_repository.enabled:
+        if not resource_repository.get_dataset(owner_id, dataset_name):
+            raise HTTPException(status_code=404, detail="Dataset not found")
+    else:
+        _assert_owned_resource_visible(_dataset_owner(target_dir), request)
     metadata = inspect_dataset(target_dir)
     metadata["export_cache"] = export_cache_metadata(target_dir)
     return {"dataset_name": dataset_name, **_dataset_profile(metadata)}
