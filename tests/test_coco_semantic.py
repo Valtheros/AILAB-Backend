@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from dataset_utils import dataset_workflow_metadata, inspect_dataset, prepare_dataset_for_model
+from dataset_utils import DATASET_METADATA_VERSION, dataset_workflow_metadata, inspect_dataset, prepare_dataset_for_model
 from model_catalog import get_catalog
 
 
@@ -43,6 +43,7 @@ class CocoSemanticTests(unittest.TestCase):
             )
 
             metadata = inspect_dataset(root)
+            self.assertEqual(metadata["metadata_version"], DATASET_METADATA_VERSION)
             workflow = dataset_workflow_metadata(metadata, get_catalog())
             ready = {item["id"] for item in workflow["compatible_models"] if item["ready"]}
             self.assertEqual(metadata["classes"], ["road"])

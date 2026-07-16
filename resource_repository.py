@@ -114,6 +114,24 @@ class ResourceRepository:
             if owned:
                 connection.close()
 
+    def update_dataset_metadata(self, dataset_id: Any, metadata: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                update datasets set formats = %s::jsonb, tasks = %s::jsonb, classes = %s::jsonb,
+                  metadata = %s::jsonb, updated_at = now() where id = %s
+                """,
+                (
+                    json.dumps(metadata.get("formats", [])),
+                    json.dumps(metadata.get("tasks", [])),
+                    json.dumps(metadata.get("classes", [])),
+                    json.dumps(metadata),
+                    dataset_id,
+                ),
+            )
+
     def mark_dataset_deleted(self, dataset_id: Any, connection=None) -> None:
         if not self.enabled:
             return

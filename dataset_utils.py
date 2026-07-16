@@ -18,6 +18,7 @@ from security_utils import named_file_lock, replace_directory
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MASK_EXTENSIONS = {".png", ".bmp", ".tif", ".tiff"}
+DATASET_METADATA_VERSION = 1
 EXPORTS_DIR_NAME = ".ailab_exports"
 SOURCE_FINGERPRINT_SKIP_FILES = {".ailab_dataset.json"}
 TRAINABLE_FORMATS = {
@@ -1054,6 +1055,7 @@ def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> di
         image_count = semantic_stats["image_files"]
 
     return {
+        "metadata_version": DATASET_METADATA_VERSION,
         "formats": formats,
         "tasks": tasks,
         "classes": classes,

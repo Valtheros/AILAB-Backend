@@ -75,7 +75,7 @@ from fastapi import HTTPException
 
 import dataset_utils
 from dataset_utils import inspect_dataset, validate_dataset_for_upload
-from main import _assert_owned_resource_visible, _flatten_single_root_folder, _require_request_user_id
+from main import _assert_owned_resource_visible, _dataset_metadata_is_current, _flatten_single_root_folder, _require_request_user_id
 from services.training_service import TrainingService
 from worker.trainers import input_limits
 from worker.trainers.input_limits import iter_text_lines_limited, validate_coco_segmentation
@@ -87,6 +87,20 @@ class _FakeRequest:
 
 
 class SecurityRegressionTests(unittest.TestCase):
+    def test_old_dataset_metadata_is_reinspected(self):
+        metadata = {
+            "formats": ["coco_instances"],
+            "tasks": ["segmentation"],
+            "classes": ["road"],
+            "image_count": 1,
+            "size_bytes": 1,
+            "warnings": [],
+            "errors": [],
+        }
+        self.assertFalse(_dataset_metadata_is_current(metadata))
+        metadata["metadata_version"] = dataset_utils.DATASET_METADATA_VERSION
+        self.assertTrue(_dataset_metadata_is_current(metadata))
+
     def test_dataset_yaml_rejects_aliases(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "data.yaml"

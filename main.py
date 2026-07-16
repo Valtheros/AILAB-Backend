@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from dataset_utils import (
+    DATASET_METADATA_VERSION,
     dataset_workflow_metadata,
     export_cache_metadata,
     find_dataset_yaml,
@@ -261,6 +262,15 @@ def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
         "ready_models": ready_models,
         "export_cache": workflow.get("export_cache", []),
     }
+
+
+def _dataset_metadata_is_current(metadata: Any) -> bool:
+    required = {"formats", "tasks", "classes", "image_count", "size_bytes", "warnings", "errors"}
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("metadata_version") == DATASET_METADATA_VERSION
+        and required.issubset(metadata)
+    )
 
 
 def _dataset_response(dataset_name: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -590,12 +600,10 @@ def list_datasets(request: Request):
                 stored_metadata = json.loads(stored_metadata)
             except json.JSONDecodeError:
                 stored_metadata = None
-        required_metadata = {"formats", "tasks", "classes", "image_count", "size_bytes", "warnings", "errors"}
-        metadata = (
-            dict(stored_metadata)
-            if isinstance(stored_metadata, dict) and required_metadata.issubset(stored_metadata)
-            else inspect_dataset(item)
-        )
+        metadata_is_current = _dataset_metadata_is_current(stored_metadata)
+        metadata = dict(stored_metadata) if metadata_is_current else inspect_dataset(item)
+        if record and not metadata_is_current:
+            resource_repository.update_dataset_metadata(record["id"], metadata)
         metadata["export_cache"] = export_cache_metadata(item)
         profile = _dataset_profile(metadata)
         created = time.strftime("%Y-%m-%d", time.localtime(item.stat().st_ctime))
