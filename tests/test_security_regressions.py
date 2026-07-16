@@ -78,7 +78,7 @@ from fastapi import HTTPException
 
 import dataset_utils
 from dataset_utils import inspect_dataset, validate_dataset_for_upload
-from main import _assert_owned_resource_visible, _dataset_metadata_is_current, _flatten_single_root_folder, _require_request_user_id, _task_response
+from main import _assert_owned_resource_visible, _dataset_metadata_is_current, _flatten_single_root_folder, _model_name_from_request, _require_request_user_id, _task_response
 from services.training_service import TrainingService
 from worker.trainers import input_limits
 from worker.trainers.input_limits import iter_text_lines_limited, validate_coco_segmentation
@@ -90,6 +90,18 @@ class _FakeRequest:
 
 
 class SecurityRegressionTests(unittest.TestCase):
+    def test_classification_model_name_matches_selected_architecture(self):
+        model = {"model_name": "resnet50"}
+        request = types.SimpleNamespace(
+            model_type="resnet", model_name="resnet18",
+            params={"architecture": "resnet18"}, model_size=None,
+        )
+        self.assertEqual(_model_name_from_request(request, model), "resnet18")
+
+        request.model_name = "resnet50"
+        with self.assertRaises(HTTPException):
+            _model_name_from_request(request, model)
+
     def test_task_response_keeps_display_name_separate_from_internal_slug(self):
         task = _task_response({
             "id": "task-1", "display_name": "car_detection", "run_slug": "car_detection_a1b2c3d4",
