@@ -215,12 +215,14 @@ def _model_name_from_request(request: TrainRequest, model_entry: dict[str, Any] 
         return model_name
 
     if model_entry:
-        if request.model_name and request.model_name.removesuffix(".pt") != str(model_entry["model_name"]):
-            architecture = request.params.get("architecture")
-            if architecture != request.model_name.removesuffix(".pt"):
-                raise HTTPException(status_code=400, detail=f"Unsupported model_name for {request.model_type}")
-            return str(architecture)
-        return str(model_entry["model_name"])
+        model_name = str(
+            (request.params.get("architecture") or model_entry["model_name"])
+            if request.model_type in {"resnet", "efficientnet"}
+            else model_entry["model_name"]
+        )
+        if request.model_name and request.model_name.removesuffix(".pt") != model_name:
+            raise HTTPException(status_code=400, detail=f"Unsupported model_name for {request.model_type}")
+        return model_name
 
     if request.model_size:
         return request.model_size.removesuffix(".pt")
