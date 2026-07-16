@@ -90,7 +90,7 @@ def migrate_owner_scoped_storage(connection, valid_users: set[str], apply: bool,
         if source == destination:
             continue
         active = connection.execute(
-            "select run_slug from training_runs where dataset_id = %s and status = any(%s)",
+            "select run_slug from training_tasks where dataset_id = %s and status = any(%s)",
             (row["id"], ["queued", "running", "started", "stopping", "recovery_pending"]),
         ).fetchall()
         if active:
@@ -117,7 +117,7 @@ def migrate_owner_scoped_storage(connection, valid_users: set[str], apply: bool,
             if moved and destination.exists() and not source.exists():
                 destination.replace(source)
             raise
-        for run in connection.execute("select storage_path from training_runs where dataset_id = %s", (row["id"],)).fetchall():
+        for run in connection.execute("select storage_path from training_tasks where dataset_id = %s", (row["id"],)).fetchall():
             config_path = Path(run["storage_path"]) / "job_config.json"
             config = read_json(config_path)
             if not config:
@@ -178,13 +178,14 @@ def main() -> int:
                 inferred_status = infer_run_status(path, config)
                 connection.execute(
                     """
-                    insert into training_runs
-                      (dataset_id, dataset_slug, rq_job_id, run_slug, task_type, model_type, model_name,
+                    insert into training_tasks
+                      (dataset_id, dataset_slug, rq_job_id, run_slug, display_name, task_type, model_type, model_name,
                        params, status, storage_path, created_by, owner_user_id)
-                    values (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
+                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s)
                     on conflict (owner_user_id, run_slug) where owner_user_id is not null do nothing
                     """,
                     (dataset.get("id") if dataset else None, config.get("dataset_name"), config.get("job_id"), path.name,
+                     path.name.rsplit("_", 1)[0] if path.name.rsplit("_", 1)[-1].isdigit() else path.name,
                      config.get("task_type") or "unknown", config.get("model_type") or "unknown", config.get("model_name"),
                      json.dumps(config.get("extra_args") or {}), inferred_status, str(path),
                      config.get("created_by_email") or owner, owner),

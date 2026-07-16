@@ -26,7 +26,7 @@ def _persist_status(
 
             with psycopg.connect(database_url, connect_timeout=3) as connection:
                 connection.execute(
-                    "update training_runs set status = %s, error_detail = %s, updated_at = now(), "
+                    "update training_tasks set status = %s, error_detail = %s, updated_at = now(), "
                     "finished_at = case when %s in ('completed','failed','stopped','cancelled') then now() else finished_at end "
                     "where (%s::uuid is not null and id = %s::uuid) or (%s::text is not null and rq_job_id = %s)",
                     (status, error_detail, status, run_id, run_id, job_id, job_id),

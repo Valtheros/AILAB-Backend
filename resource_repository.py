@@ -18,6 +18,7 @@ except ImportError:  # Local unit tests may run without production dependencies.
 
 
 ACTIVE_RUN_STATUSES = ("queued", "running", "started", "stopping", "recovery_pending")
+TERMINAL_TASK_STATUSES = ("completed", "exited", "failed", "stopped", "cancelled")
 
 
 class ResourceRepository:
@@ -80,7 +81,7 @@ class ResourceRepository:
         connection = connection or self._connect()
         try:
             rows = connection.execute(
-                "select id, run_slug, rq_job_id, status from training_runs where dataset_id = %s and status = any(%s)",
+                "select id, run_slug, rq_job_id, status from training_tasks where dataset_id = %s and status = any(%s)",
                 (dataset_id, list(ACTIVE_RUN_STATUSES)),
             ).fetchall()
             return [dict(row) for row in rows]
@@ -155,13 +156,13 @@ class ResourceRepository:
         try:
             row = connection.execute(
                 """
-                insert into training_runs
-                  (dataset_id, dataset_slug, rq_job_id, run_slug, task_type, model_type, model_name, params, status,
+                insert into training_tasks
+                  (dataset_id, dataset_slug, rq_job_id, run_slug, display_name, task_type, model_type, model_name, params, status,
                    storage_path, created_by, owner_user_id)
-                values (%s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'queued', %s, %s, %s)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'queued', %s, %s, %s)
                 returning *
                 """,
-                (dataset.get("id"), dataset.get("slug"), job_id, project_name, task_type, model_type, model_name,
+                (dataset.get("id"), dataset.get("slug"), job_id, project_name, project_name, task_type, model_type, model_name,
                  json.dumps(params), str(storage_path), owner_email or owner_id, owner_id),
             ).fetchone()
             if owned:
@@ -171,27 +172,138 @@ class ResourceRepository:
             if owned:
                 connection.close()
 
+    def create_task(self, owner_id: str, owner_email: str | None, display_name: str = "cv_run") -> dict[str, Any]:
+        if not self.enabled:
+            raise RuntimeError("Resource database is unavailable")
+        params = {
+            "epochs": 50,
+            "batch_size": 16,
+            "device": "cpu",
+            "workers": 4,
+            "amp": True,
+            "seed": 0,
+        }
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                insert into training_tasks
+                  (display_name, task_type, model_type, model_name, params, status, created_by, owner_user_id)
+                values (%s, 'object_detection', 'yolo', 'yolo11n', %s::jsonb, 'draft', %s, %s)
+                returning *
+                """,
+                (display_name, json.dumps(params), owner_email or owner_id, owner_id),
+            ).fetchone()
+            return dict(row)
+
+    def list_tasks(self, owner_id: str) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                "select * from training_tasks where owner_user_id = %s order by updated_at desc",
+                (owner_id,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_task(self, owner_id: str, task_id: Any, connection=None, *, for_update: bool = False) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        owned = connection is None
+        connection = connection or self._connect()
+        try:
+            suffix = " for update" if for_update else ""
+            row = connection.execute(
+                f"select * from training_tasks where owner_user_id = %s and id = %s{suffix}",
+                (owner_id, task_id),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            if owned:
+                connection.close()
+
+    def update_task_draft(self, owner_id: str, task_id: Any, values: dict[str, Any]) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                update training_tasks set
+                  display_name = %s, task_type = %s, model_type = %s, model_name = %s,
+                  dataset_slug = nullif(%s, ''), params = %s::jsonb, updated_at = now()
+                where owner_user_id = %s and id = %s and status = 'draft'
+                returning *
+                """,
+                (
+                    values["display_name"], values["task_type"], values["model_type"], values["model_name"],
+                    values.get("dataset_slug", ""), json.dumps(values["params"]), owner_id, task_id,
+                ),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def activate_task(self, *, owner_id: str, task_id: Any, dataset: dict[str, Any], run_slug: str,
+                      task_type: str, model_type: str, model_name: str, params: dict[str, Any],
+                      storage_path: Path, job_id: str, connection) -> dict[str, Any]:
+        task = self.get_task(owner_id, task_id, connection, for_update=True)
+        if not task:
+            raise FileNotFoundError("Training task was not found")
+        if task["status"] != "draft":
+            raise FileExistsError("Training task has already been started")
+        row = connection.execute(
+            """
+            update training_tasks set dataset_id = %s, dataset_slug = %s, rq_job_id = %s,
+              run_slug = %s, task_type = %s, model_type = %s, model_name = %s, params = %s::jsonb,
+              status = 'queued', storage_path = %s, error_detail = null, updated_at = now()
+            where id = %s returning *
+            """,
+            (dataset.get("id"), dataset.get("slug"), job_id, run_slug, task_type, model_type, model_name,
+             json.dumps(params), str(storage_path), task_id),
+        ).fetchone()
+        return dict(row)
+
+    def delete_task(self, owner_id: str, task_id: Any) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "delete from training_tasks where owner_user_id = %s and id = %s and not (status = any(%s)) returning *",
+                (owner_id, task_id, list(ACTIVE_RUN_STATUSES)),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def reset_task_after_enqueue_failure(self, task_id: Any, error_detail: str) -> None:
+        if not self.enabled:
+            return
+        with self._connect() as connection:
+            connection.execute(
+                """
+                update training_tasks set status = 'draft', rq_job_id = null, run_slug = null,
+                  storage_path = null, error_detail = %s, updated_at = now()
+                where id = %s
+                """,
+                (error_detail, task_id),
+            )
+
     def set_run_job(self, run_id: Any, job_id: str, connection=None) -> None:
         if not self.enabled:
             return
         if connection is not None:
-            connection.execute("update training_runs set rq_job_id = %s, updated_at = now() where id = %s", (job_id, run_id))
+            connection.execute("update training_tasks set rq_job_id = %s, updated_at = now() where id = %s", (job_id, run_id))
             return
         with self._connect() as owned_connection:
-            owned_connection.execute("update training_runs set rq_job_id = %s, updated_at = now() where id = %s", (job_id, run_id))
+            owned_connection.execute("update training_tasks set rq_job_id = %s, updated_at = now() where id = %s", (job_id, run_id))
 
     def get_run_owner_by_slug(self, run_slug: str) -> str | None:
         if not self.enabled:
             return None
         with self._connect() as connection:
-            row = connection.execute("select owner_user_id from training_runs where run_slug = %s limit 1", (run_slug,)).fetchone()
+            row = connection.execute("select owner_user_id from training_tasks where run_slug = %s limit 1", (run_slug,)).fetchone()
             return str(row["owner_user_id"]) if row and row["owner_user_id"] else None
 
     def get_run_owner_by_job(self, job_id: str) -> str | None:
         if not self.enabled:
             return None
         with self._connect() as connection:
-            row = connection.execute("select owner_user_id from training_runs where rq_job_id = %s limit 1", (job_id,)).fetchone()
+            row = connection.execute("select owner_user_id from training_tasks where rq_job_id = %s limit 1", (job_id,)).fetchone()
             return str(row["owner_user_id"]) if row and row["owner_user_id"] else None
 
     def list_runs(self, owner_id: str) -> list[dict[str, Any]]:
@@ -199,7 +311,7 @@ class ResourceRepository:
             return []
         with self._connect() as connection:
             rows = connection.execute(
-                "select * from training_runs where owner_user_id = %s order by created_at desc", (owner_id,)
+                "select * from training_tasks where owner_user_id = %s and status <> 'draft' and run_slug is not null order by created_at desc", (owner_id,)
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -208,7 +320,7 @@ class ResourceRepository:
             return []
         with self._connect() as connection:
             rows = connection.execute(
-                "select id, rq_job_id, run_slug from training_runs where status = 'queued'"
+                "select id, rq_job_id, run_slug from training_tasks where status = 'queued'"
             ).fetchall()
             return [dict(row) for row in rows]
 
@@ -217,7 +329,7 @@ class ResourceRepository:
             return None
         with self._connect() as connection:
             row = connection.execute(
-                "select * from training_runs where owner_user_id = %s and run_slug = %s limit 1", (owner_id, run_slug)
+                "select * from training_tasks where owner_user_id = %s and run_slug = %s limit 1", (owner_id, run_slug)
             ).fetchone()
             return dict(row) if row else None
 
@@ -225,20 +337,20 @@ class ResourceRepository:
         if not self.enabled:
             return
         with self._connect() as connection:
-            connection.execute("delete from training_runs where owner_user_id = %s and run_slug = %s", (owner_id, run_slug))
+            connection.execute("delete from training_tasks where owner_user_id = %s and run_slug = %s", (owner_id, run_slug))
 
     def delete_run_record(self, run_id: Any) -> None:
         if not self.enabled:
             return
         with self._connect() as connection:
-            connection.execute("delete from training_runs where id = %s", (run_id,))
+            connection.execute("delete from training_tasks where id = %s", (run_id,))
 
     def update_run_status(self, job_id: str, status: str, error_detail: str | None = None) -> None:
         if not self.enabled:
             return
         with self._connect() as connection:
             connection.execute(
-                "update training_runs set status = %s, error_detail = %s, updated_at = now(), finished_at = case when %s = any(%s) then now() else finished_at end where rq_job_id = %s",
+                "update training_tasks set status = %s, error_detail = %s, updated_at = now(), finished_at = case when %s = any(%s) then now() else finished_at end where rq_job_id = %s",
                 (status, error_detail, status, ["completed", "failed", "stopped", "cancelled"], job_id),
             )
 
@@ -247,7 +359,7 @@ class ResourceRepository:
             return
         with self._connect() as connection:
             connection.execute(
-                "update training_runs set status = %s, error_detail = %s, updated_at = now(), "
+                "update training_tasks set status = %s, error_detail = %s, updated_at = now(), "
                 "finished_at = case when %s = any(%s) then now() else finished_at end where id = %s",
                 (status, error_detail, status, ["completed", "failed", "stopped", "cancelled"], run_id),
             )
@@ -275,9 +387,9 @@ class ResourceRepository:
                 "select id, slug, storage_path, status from datasets where owner_user_id = %s", (user_id,)
             ).fetchall()
             runs = connection.execute(
-                "select id, run_slug, rq_job_id, status, storage_path from training_runs where owner_user_id = %s", (user_id,)
+                "select id, run_slug, rq_job_id, status, storage_path from training_tasks where owner_user_id = %s", (user_id,)
             ).fetchall()
-        paths = {str(row["storage_path"]) for row in [*datasets, *runs]}
+        paths = {str(row["storage_path"]) for row in [*datasets, *runs] if row.get("storage_path")}
         total_bytes = 0
         for raw_path in paths:
             path = Path(raw_path)
@@ -317,7 +429,7 @@ class ResourceRepository:
                     (source_user_id,),
                 ).fetchall()
                 active = connection.execute(
-                    "select run_slug from training_runs where owner_user_id = %s and status = any(%s) limit 1",
+                    "select run_slug from training_tasks where owner_user_id = %s and status = any(%s) limit 1",
                     (source_user_id, list(ACTIVE_RUN_STATUSES)),
                 ).fetchone()
                 if active:
@@ -338,7 +450,7 @@ class ResourceRepository:
                         (target_user_id, target["email"], str(destination), row["id"]),
                     )
                 runs = connection.execute(
-                    "update training_runs set owner_user_id = %s, created_by = %s, updated_at = now() where owner_user_id = %s returning storage_path",
+                    "update training_tasks set owner_user_id = %s, created_by = %s, updated_at = now() where owner_user_id = %s returning storage_path",
                     (target_user_id, target["email"], source_user_id),
                 ).fetchall()
                 projects = connection.execute(
@@ -369,6 +481,8 @@ class ResourceRepository:
             except Exception:
                 continue
         for row in runs:
+            if not row.get("storage_path"):
+                continue
             config_path = Path(row["storage_path"]) / "job_config.json"
             try:
                 data = json.loads(config_path.read_text(encoding="utf-8"))
@@ -395,14 +509,14 @@ class ResourceRepository:
                 "update datasets set status = 'deleting', updated_at = now() where owner_user_id = %s and status <> 'deleted' returning *", (user_id,)
             ).fetchall()
             runs = [dict(row) for row in connection.execute(
-                "update training_runs set status = case when status = any(%s) then 'stopping' else status end, updated_at = now() where owner_user_id = %s returning *",
+                "update training_tasks set status = case when status = any(%s) then 'stopping' else status end, updated_at = now() where owner_user_id = %s returning *",
                 (list(ACTIVE_RUN_STATUSES), user_id),
             ).fetchall()]
         return datasets, runs
 
     def finalize_user_resource_delete(self, user_id: str) -> None:
         with self._connect() as connection:
-            connection.execute("delete from training_runs where owner_user_id = %s", (user_id,))
+            connection.execute("delete from training_tasks where owner_user_id = %s", (user_id,))
             connection.execute("delete from datasets where owner_user_id = %s", (user_id,))
             connection.execute("delete from projects where created_by in (%s, (select email from \"user\" where id = %s))", (user_id, user_id))
             connection.execute("delete from workspace_members where user_id = %s", (user_id,))

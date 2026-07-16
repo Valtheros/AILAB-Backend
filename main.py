@@ -92,6 +92,25 @@ class TrainRequest(BaseModel):
         extra = "forbid"
 
 
+class TaskCreateRequest(BaseModel):
+    display_name: str = Field(default="cv_run", min_length=1, max_length=100)
+
+
+class TaskDraftRequest(BaseModel):
+    display_name: str = Field(min_length=1, max_length=100)
+    task_type: str
+    model_type: str
+    model_name: str
+    dataset_name: str = ""
+    epochs: int = Field(ge=1, le=2000)
+    batch_size: int = Field(ge=1, le=256)
+    params: dict[str, Any] = Field(default_factory=dict)
+    device_selection: str = Field(default="auto", pattern="^(auto|manual)$")
+
+    class Config:
+        extra = "forbid"
+
+
 class StagedImportRequest(BaseModel):
     uploadToken: str = Field(min_length=20, max_length=128)
 
@@ -214,6 +233,35 @@ def _extra_args_from_request(request: TrainRequest) -> dict[str, Any]:
     if request.model_type == "yolo" and "model_size" not in extra_args:
         extra_args["model_size"] = request.model_size or "n"
     return validate_model_params(request.model_type, extra_args)
+
+
+def _task_response(row: dict[str, Any], run: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = dict(row.get("params") or {})
+    return {
+        "id": str(row["id"]),
+        "displayName": row.get("display_name") or "cv_run",
+        "status": row.get("status") or "draft",
+        "taskType": row.get("task_type") or "object_detection",
+        "modelType": row.get("model_type") or "yolo",
+        "modelName": row.get("model_name") or "yolo11n",
+        "datasetName": row.get("dataset_slug") or "",
+        "epochs": int(params.get("epochs", 50)),
+        "batchSize": int(params.get("batch_size", 16)),
+        "device": str(params.get("device", "cpu")),
+        "workers": int(params.get("workers", 4)),
+        "amp": bool(params.get("amp", True)),
+        "seed": int(params.get("seed", 0)),
+        "deviceSelection": str(params.get("_device_selection", "auto")),
+        "params": {key: value for key, value in params.items() if not key.startswith("_")},
+        "runSlug": row.get("run_slug"),
+        "jobId": row.get("rq_job_id"),
+        "errorDetail": row.get("error_detail"),
+        "createdAt": row.get("created_at"),
+        "updatedAt": row.get("updated_at"),
+        "finishedAt": row.get("finished_at"),
+        "files": (run or {}).get("files", []),
+        "latestMetrics": (run or {}).get("latest_metrics"),
+    }
 
 
 def _extract_and_validate_upload(temp_zip_path: Path, staging_dir: Path) -> tuple[Path, dict[str, Any]]:
@@ -417,6 +465,10 @@ def resource_profile():
 
 @app.post("/api/train")
 def start_train(train_request: TrainRequest, request: Request):
+    return _start_train_request(train_request, request)
+
+
+def _start_train_request(train_request: TrainRequest, request: Request, task_id: str | None = None):
     model_entry = get_model(train_request.model_type)
     if model_entry is None:
         raise HTTPException(status_code=400, detail=f"Unsupported model_type: {train_request.model_type}")
@@ -465,6 +517,7 @@ def start_train(train_request: TrainRequest, request: Request):
             resource_plan=resource_plan,
             owner_id=_require_request_user_id(request),
             owner_email=_request_user_email(request),
+            task_id=task_id,
         )
         return {"status": "success", "job_id": job_id, "container_id": job_id}
     except PermissionError as exc:
@@ -739,6 +792,155 @@ def delete_dataset(dataset_name: str, request: Request):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@app.get("/api/tasks")
+def list_tasks(request: Request):
+    owner_id = _require_request_user_id(request)
+    runs = {run["id"]: run for run in training_service.list_runs(owner_id=owner_id)}
+    return {"tasks": [_task_response(row, runs.get(str(row["id"]))) for row in resource_repository.list_tasks(owner_id)]}
+
+
+@app.post("/api/tasks", status_code=201)
+def create_task(payload: TaskCreateRequest, request: Request):
+    display_name = payload.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=400, detail="Project name is required")
+    row = resource_repository.create_task(
+        _require_request_user_id(request), _request_user_email(request), display_name
+    )
+    return _task_response(row)
+
+
+@app.get("/api/tasks/{task_id}")
+def get_task(task_id: str, request: Request):
+    owner_id = _require_request_user_id(request)
+    row = resource_repository.get_task(owner_id, task_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Training task not found")
+    run = next((item for item in training_service.list_runs(owner_id=owner_id) if item["id"] == task_id), None)
+    return _task_response(row, run)
+
+
+@app.patch("/api/tasks/{task_id}")
+def update_task(task_id: str, payload: TaskDraftRequest, request: Request):
+    owner_id = _require_request_user_id(request)
+    current = resource_repository.get_task(owner_id, task_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="Training task not found")
+    if current["status"] != "draft":
+        raise HTTPException(status_code=409, detail="Only draft tasks can be edited")
+    model = get_model(payload.model_type)
+    if not model or model["task_type"] != payload.task_type:
+        raise HTTPException(status_code=400, detail="The selected model does not belong to this task")
+    if payload.dataset_name:
+        try:
+            validate_slug(payload.dataset_name, "dataset name")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    params = dict(payload.params)
+    params.update({
+        "epochs": payload.epochs,
+        "batch_size": payload.batch_size,
+        "_device_selection": payload.device_selection,
+    })
+    row = resource_repository.update_task_draft(owner_id, task_id, {
+        "display_name": payload.display_name.strip() or "cv_run",
+        "task_type": payload.task_type,
+        "model_type": payload.model_type,
+        "model_name": payload.model_name,
+        "dataset_slug": payload.dataset_name,
+        "params": params,
+    })
+    if not row:
+        raise HTTPException(status_code=409, detail="Task changed while it was being saved")
+    return _task_response(row)
+
+
+@app.post("/api/tasks/{task_id}/start")
+def start_task(task_id: str, request: Request):
+    owner_id = _require_request_user_id(request)
+    row = resource_repository.get_task(owner_id, task_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Training task not found")
+    if row["status"] != "draft":
+        raise HTTPException(status_code=409, detail="Training task has already been started")
+    if not row.get("dataset_slug"):
+        raise HTTPException(status_code=400, detail="Select a compatible dataset before training")
+    params = dict(row.get("params") or {})
+    run_slug = f"{safe_dataset_name(str(row.get('display_name') or 'cv_run'))}_{str(row['id']).replace('-', '')[:8]}"
+    train_request = TrainRequest(
+        task_type=row["task_type"], model_type=row["model_type"], model_name=row.get("model_name"),
+        dataset_name=row["dataset_slug"], project_name=run_slug,
+        epochs=int(params.get("epochs", 50)), batch_size=int(params.get("batch_size", 16)),
+        params={key: value for key, value in params.items() if not key.startswith("_")},
+    )
+    result = _start_train_request(train_request, request, task_id=task_id)
+    return {**result, "task_id": task_id}
+
+
+@app.post("/api/tasks/{task_id}/stop")
+def stop_task(task_id: str, request: Request):
+    row = resource_repository.get_task(_require_request_user_id(request), task_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Training task not found")
+    if not row.get("rq_job_id") or row["status"] not in {"queued", "running", "started", "stopping"}:
+        raise HTTPException(status_code=409, detail="Training task is not active")
+    try:
+        return {"status": training_service.stop_training_container(row["rq_job_id"])}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/tasks/{task_id}/logs")
+def task_logs(task_id: str, request: Request):
+    row = resource_repository.get_task(_require_request_user_id(request), task_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Training task not found")
+    if row.get("storage_path"):
+        run_dir = registered_storage_path(RUNS_DIR, row["storage_path"])
+        log_path = contained_path(run_dir, "train.log")
+        if log_path.is_file():
+            limit = 1024 * 1024
+            size = log_path.stat().st_size
+            with open(log_path, "rb") as file:
+                file.seek(max(0, size - limit))
+                content = file.read(limit).decode("utf-8", errors="replace")
+            prefix = "[Earlier log output omitted]\n" if size > limit else ""
+            return {"logs": prefix + content}
+    if row.get("rq_job_id"):
+        return {"logs": training_service.get_container_logs(str(row["rq_job_id"]))}
+    return {"logs": ""}
+
+
+@app.delete("/api/tasks/{task_id}")
+def delete_task(task_id: str, request: Request):
+    owner_id = _require_request_user_id(request)
+    row = resource_repository.get_task(owner_id, task_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Training task not found")
+    if row["status"] in {"queued", "running", "started", "stopping", "recovery_pending"}:
+        raise HTTPException(status_code=409, detail="Stop the active training task before deleting it")
+    removal: ReversibleDirectoryRemoval | None = None
+    try:
+        if row.get("storage_path"):
+            path = registered_storage_path(RUNS_DIR, row["storage_path"])
+            if path.is_dir():
+                removal = ReversibleDirectoryRemoval(path).apply()
+        deleted = resource_repository.delete_task(owner_id, task_id)
+        if not deleted:
+            raise HTTPException(status_code=409, detail="Training task could not be deleted")
+        if removal:
+            removal.commit()
+        return {"status": "success"}
+    except HTTPException:
+        if removal:
+            removal.rollback()
+        raise
+    except Exception as exc:
+        if removal:
+            removal.rollback()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @app.get("/api/runs")
 def list_runs(request: Request):
     return {"runs": training_service.list_runs(owner_id=_require_request_user_id(request))}
@@ -832,6 +1034,8 @@ def admin_delete_user_resources(user_id: str, request: Request):
     if errors:
         raise HTTPException(status_code=409, detail=" ".join(errors))
     for run in runs:
+        if not run.get("storage_path"):
+            continue
         try:
             shutil.rmtree(contained_path(RUNS_DIR, Path(str(run["storage_path"]))))
         except FileNotFoundError:

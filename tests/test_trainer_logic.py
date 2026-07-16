@@ -96,6 +96,26 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn("yolo_detection", formats)
             self.assertNotIn("yolo_segmentation", formats)
 
+    def test_yolo_labels_are_not_inspected_as_semantic_masks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "train" / "images"
+            labels = root / "train" / "labels"
+            images.mkdir(parents=True)
+            labels.mkdir(parents=True)
+            (root / "data.yaml").write_text(
+                "train: train/images\nnames: ['item']",
+                encoding="utf-8",
+            )
+            (images / "image.jpg").write_bytes(PNG_1X1)
+            (labels / "image.txt").write_text("0 0.5 0.5 0.25 0.25", encoding="utf-8")
+
+            metadata = inspect_dataset(root)
+
+            self.assertIn("yolo_detection", metadata["formats"])
+            self.assertEqual(metadata["semantic_masks"]["missing_masks"], [])
+            validate_dataset_for_upload(root, metadata)
+
     def test_split_yolo_detection_is_not_misclassified_as_imagefolder(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

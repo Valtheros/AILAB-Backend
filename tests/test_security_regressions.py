@@ -38,6 +38,9 @@ def _install_optional_dependency_stubs() -> None:
             def post(self, *_args, **_kwargs):
                 return lambda fn: fn
 
+            def patch(self, *_args, **_kwargs):
+                return lambda fn: fn
+
             def delete(self, *_args, **_kwargs):
                 return lambda fn: fn
 
@@ -75,7 +78,7 @@ from fastapi import HTTPException
 
 import dataset_utils
 from dataset_utils import inspect_dataset, validate_dataset_for_upload
-from main import _assert_owned_resource_visible, _dataset_metadata_is_current, _flatten_single_root_folder, _require_request_user_id
+from main import _assert_owned_resource_visible, _dataset_metadata_is_current, _flatten_single_root_folder, _require_request_user_id, _task_response
 from services.training_service import TrainingService
 from worker.trainers import input_limits
 from worker.trainers.input_limits import iter_text_lines_limited, validate_coco_segmentation
@@ -87,6 +90,17 @@ class _FakeRequest:
 
 
 class SecurityRegressionTests(unittest.TestCase):
+    def test_task_response_keeps_display_name_separate_from_internal_slug(self):
+        task = _task_response({
+            "id": "task-1", "display_name": "car_detection", "run_slug": "car_detection_a1b2c3d4",
+            "status": "draft", "task_type": "object_detection", "model_type": "yolo", "model_name": "yolo11n",
+            "dataset_slug": None, "params": {"epochs": 10, "batch_size": 2, "_device_selection": "manual"},
+        })
+        self.assertEqual(task["displayName"], "car_detection")
+        self.assertEqual(task["runSlug"], "car_detection_a1b2c3d4")
+        self.assertEqual(task["deviceSelection"], "manual")
+        self.assertNotIn("_device_selection", task["params"])
+
     def test_old_dataset_metadata_is_reinspected(self):
         metadata = {
             "formats": ["coco_instances"],
