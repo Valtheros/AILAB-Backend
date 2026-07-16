@@ -403,7 +403,11 @@ def _semantic_split_dirs(dataset_dir: Path, split: str) -> tuple[Path, Path] | N
             images_dir = split_dir / "image"
         for mask_name in ("masks", "mask", "labels", "label"):
             masks_dir = split_dir / mask_name
-            if images_dir.exists() and masks_dir.exists():
+            if (
+                images_dir.exists()
+                and masks_dir.exists()
+                and any(path.is_file() and path.suffix.lower() in MASK_EXTENSIONS for path in masks_dir.rglob("*"))
+            ):
                 return images_dir, masks_dir
     return None
 

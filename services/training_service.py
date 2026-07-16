@@ -221,6 +221,7 @@ class TrainingService:
         resource_plan: dict[str, Any] | None = None,
         owner_id: str | None = None,
         owner_email: str | None = None,
+        task_id: str | None = None,
     ) -> str:
         self._ensure_redis()
         if not owner_id:
@@ -265,11 +266,18 @@ class TrainingService:
                     job_config["task"] = "detect"
                 queue_name = "cv_training"
                 queue = self.queues[queue_name]
-                run_record = resource_repository.create_run(
-                    owner_id=owner_id, owner_email=owner_email, dataset=dataset_record, project_name=project_name,
-                    task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
-                    storage_path=project_dir, job_id=planned_job_id, connection=connection,
-                )
+                if task_id:
+                    run_record = resource_repository.activate_task(
+                        owner_id=owner_id, task_id=task_id, dataset=dataset_record, run_slug=project_name,
+                        task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
+                        storage_path=project_dir, job_id=planned_job_id, connection=connection,
+                    )
+                else:
+                    run_record = resource_repository.create_run(
+                        owner_id=owner_id, owner_email=owner_email, dataset=dataset_record, project_name=project_name,
+                        task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
+                        storage_path=project_dir, job_id=planned_job_id, connection=connection,
+                    )
                 project_dir.mkdir(parents=False, exist_ok=False)
                 reserved_project_dir = True
                 job_config["run_id"] = str(run_record.get("id"))
@@ -300,7 +308,11 @@ class TrainingService:
                 failure_ttl=86400,
             )
         except Exception as exc:
-            resource_repository.update_run_status_by_id(run_record.get("id"), "failed", f"Redis enqueue failed: {exc}")
+            if task_id:
+                shutil.rmtree(project_dir, ignore_errors=True)
+                resource_repository.reset_task_after_enqueue_failure(task_id, f"Redis enqueue failed: {exc}")
+            else:
+                resource_repository.update_run_status_by_id(run_record.get("id"), "failed", f"Redis enqueue failed: {exc}")
             raise RuntimeError(f"Could not enqueue training job: {exc}") from exc
 
         print(f"[TrainingService] Job enqueued: {job.id} ({queue_name}: {task_type}/{model_type}/{model_name})")
