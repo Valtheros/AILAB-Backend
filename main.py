@@ -25,8 +25,21 @@ from dataset_utils import (
     validate_dataset_for_upload,
 )
 from dataset_storage import dataset_lock_name, owner_dataset_path, registered_storage_path
+from inference_service import (
+    MAX_INFERENCE_IMAGE_BYTES,
+    InferenceError,
+    InferenceUnavailable,
+    RateLimitExceeded,
+    check_rate_limit,
+    predict_image,
+)
 from model_catalog import get_catalog, get_model, validate_model_params
-from resource_guard import ResourcePlanError, enforce_resource_plan, get_resource_profile
+from resource_guard import (
+    ResourcePlanError,
+    enforce_resource_plan,
+    get_resource_profile,
+    validate_resource_plan,
+)
 from security_utils import (
     contained_path,
     named_file_lock,
@@ -106,6 +119,15 @@ class TaskDraftRequest(BaseModel):
     batch_size: int = Field(ge=1, le=256)
     params: dict[str, Any] = Field(default_factory=dict)
     device_selection: str = Field(default="auto", pattern="^(auto|manual)$")
+
+    class Config:
+        extra = "forbid"
+
+
+class ResourcePlanPreviewRequest(BaseModel):
+    model_type: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    batch_size: int = Field(default=16, ge=1, le=256)
 
     class Config:
         extra = "forbid"
@@ -465,6 +487,48 @@ def resource_profile():
     return get_resource_profile()
 
 
+def _resource_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    """Surface the numbers resource_guard already computed, for display only.
+
+    This does not re-derive anything: `estimated_vram_mb` and `safe_vram_mb`
+    come straight from the plan. `isWithinLimit` mirrors the same comparison
+    resource_guard uses internally (CPU runs have no VRAM budget, so they are
+    always within limit).
+    """
+    estimated = int(plan.get("estimated_vram_mb", 0) or 0)
+    safe_limit = int(plan.get("safe_vram_mb", 0) or 0)
+    is_cpu = str(plan.get("device", "")).startswith("cpu")
+    return {
+        "estimatedVramMb": estimated,
+        "safeLimitMb": safe_limit,
+        "isWithinLimit": True if is_cpu else estimated <= safe_limit,
+        "device": plan.get("device"),
+        "batchSize": plan.get("batch_size"),
+        "warnings": plan.get("warnings", []),
+        "errors": plan.get("errors", []),
+        "suggestions": plan.get("suggestions", []),
+    }
+
+
+@app.post("/api/resource-plan/preview")
+def preview_resource_plan(payload: ResourcePlanPreviewRequest, request: Request):
+    """Read-only preview of the memory plan for a draft configuration.
+
+    Uses validate_resource_plan (not enforce_*) so an over-budget config is
+    reported instead of rejected. The training path keeps using
+    enforce_resource_plan unchanged.
+    """
+    _require_request_user_id(request)
+    if get_model(payload.model_type) is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported model_type: {payload.model_type}")
+    plan = validate_resource_plan(
+        payload.model_type,
+        params=dict(payload.params or {}),
+        batch_size=payload.batch_size,
+    )
+    return {"status": "success", "ok": plan["ok"], **_resource_plan_summary(plan)}
+
+
 @app.post("/api/train")
 def start_train(train_request: TrainRequest, request: Request):
     return _start_train_request(train_request, request)
@@ -521,7 +585,12 @@ def _start_train_request(train_request: TrainRequest, request: Request, task_id:
             owner_email=_request_user_email(request),
             task_id=task_id,
         )
-        return {"status": "success", "job_id": job_id, "container_id": job_id}
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "container_id": job_id,
+            "resourcePlan": _resource_plan_summary(resource_plan),
+        }
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     except FileNotFoundError as exc:
@@ -972,6 +1041,76 @@ def delete_run(project_name: str, request: Request):
         if removal is not None:
             removal.rollback()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+def _run_record_for_predict(project_name: str, request: Request) -> dict[str, Any] | None:
+    """Resolve a run the caller owns, or raise the appropriate HTTP error."""
+    validate_slug(project_name, "project name")
+    _assert_run_visible(project_name, request)
+    if not resource_repository.enabled:
+        return None
+    record = resource_repository.get_run(_require_request_user_id(request), project_name)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return record
+
+
+@app.post("/api/runs/{project_name}/predict")
+async def predict_run(project_name: str, request: Request, file: UploadFile = File(...)):
+    """Classify one uploaded image with a completed run's trained model.
+
+    Image classification only. Detection and segmentation runs are rejected
+    because their outputs need box/mask rendering that this endpoint does not
+    produce.
+    """
+    owner_id = _require_request_user_id(request)
+    try:
+        record = _run_record_for_predict(project_name, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    config = _read_json_file(contained_path(RUNS_DIR, project_name, "job_config.json"))
+    task_type = str((record or {}).get("task_type") or config.get("task_type") or "")
+    status = str((record or {}).get("status") or "")
+
+    if task_type != "image_classification":
+        raise HTTPException(
+            status_code=400,
+            detail="Model testing currently supports image classification runs only.",
+        )
+    if record is not None and status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"This run is '{status or 'unknown'}'. Only completed runs can be tested.",
+        )
+
+    try:
+        check_rate_limit(owner_id)
+    except RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+    # Read with a hard cap so an oversized upload cannot be buffered in full.
+    payload = await file.read(MAX_INFERENCE_IMAGE_BYTES + 1)
+    if len(payload) > MAX_INFERENCE_IMAGE_BYTES:
+        limit_mb = MAX_INFERENCE_IMAGE_BYTES / 1024 / 1024
+        raise HTTPException(status_code=400, detail=f"The image is larger than the {limit_mb:.0f} MB limit.")
+
+    run_dir = contained_path(RUNS_DIR, project_name)
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        # Runs off the event loop: loading a checkpoint and the forward pass are
+        # both blocking CPU work.
+        result = await asyncio.to_thread(predict_image, run_dir, payload)
+    except InferenceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except InferenceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
+
+    return {"status": "success", "runSlug": project_name, **result}
 
 
 @app.get("/api/runs/{project_name}/files/{file_path:path}")
