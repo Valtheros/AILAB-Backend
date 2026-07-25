@@ -78,6 +78,115 @@ def _filter_broken_images(dataset, logger, log_path: Path | None, split: str) ->
         raise ValueError(f"No usable images remain in the {split} classification split.")
 
 
+def _evaluate_test_split(
+    dataset_path: Path,
+    val_transform,
+    model,
+    device,
+    criterion,
+    train_dataset,
+    batch_size: int,
+    workers: int,
+    results_dir: Path,
+    family: str,
+    logger,
+    log_path: Path | None,
+) -> dict | None:
+    """One-shot held-out test evaluation, run once after training completes.
+
+    Loads ``best.pt`` (not the in-memory last-epoch weights, and not ``last.pt``)
+    and evaluates it on a ``test/`` split if the dataset ships one. Returns
+    ``None`` when there is no usable test split so the caller can skip silently.
+
+    This never mutates the training loop, the metrics CSV, or the checkpoint
+    selection. The caller wraps it so any failure here cannot fail an otherwise
+    completed run.
+    """
+    import json
+
+    import torch
+    from torch.utils.data import DataLoader
+    from torchvision.datasets import ImageFolder
+
+    test_dir = dataset_path / "test"
+    if not test_dir.exists():
+        test_dir = dataset_path / "testing"
+    if not test_dir.exists() or not test_dir.is_dir():
+        return None
+
+    try:
+        test_dataset = ImageFolder(test_dir, transform=val_transform, loader=guarded_image_loader)
+    except (FileNotFoundError, RuntimeError):
+        # ImageFolder raises when there are no class subfolders/images.
+        return None
+    _filter_broken_images(test_dataset, logger, log_path, "test")
+    if not test_dataset.samples:
+        return None
+
+    # Map test folder names onto the training class order. Images whose class was
+    # never seen during training are skipped rather than raising, so a stray
+    # folder in the test split cannot break a completed run.
+    class_to_idx = dict(train_dataset.class_to_idx)
+    kept, skipped_unknown = [], set()
+    for path, target in test_dataset.samples:
+        class_name = test_dataset.classes[target]
+        if class_name in class_to_idx:
+            kept.append((path, class_to_idx[class_name]))
+        else:
+            skipped_unknown.add(class_name)
+    if skipped_unknown:
+        logger(log_path, f"[{family}] Test split skips unknown classes: {', '.join(sorted(skipped_unknown))}")
+    if not kept:
+        return None
+    test_dataset.samples = kept
+    test_dataset.imgs = kept
+    test_dataset.targets = [target for _, target in kept]
+
+    best_path = results_dir / "best.pt"
+    if best_path.is_file():
+        checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model"])
+        checkpoint_name = "best.pt"
+    else:
+        # Should not happen for a completed run, but fall back to whatever
+        # weights are loaded rather than failing.
+        checkpoint_name = "in-memory"
+
+    worker_options = {"prefetch_factor": 1} if workers > 0 else {}
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=workers, **worker_options)
+
+    model.eval()
+    test_loss = 0.0
+    test_correct = 0
+    test_total = 0
+    with torch.no_grad():
+        for images, labels in test_loader:
+            images = images.to(device)
+            labels = labels.to(device)
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            test_loss += float(loss.item()) * labels.size(0)
+            test_correct += int((outputs.argmax(dim=1) == labels).sum().item())
+            test_total += labels.size(0)
+
+    if test_total == 0:
+        return None
+
+    result = {
+        "task_type": "image_classification",
+        "model_type": family,
+        "checkpoint": checkpoint_name,
+        "test_accuracy": test_correct / test_total,
+        "test_loss": test_loss / test_total,
+        "test_images": test_total,
+        "num_classes": len(train_dataset.classes),
+        "classes": list(train_dataset.classes),
+    }
+    (results_dir / "test_evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    logger(log_path, f"[{family}] Held-out test accuracy: {result['test_accuracy']:.4f} on {test_total} images (from {checkpoint_name})")
+    return result
+
+
 def train_classifier(config: dict, family: str, log_path: Path | None, logger) -> dict:
     import torch
     import torch.nn as nn
@@ -256,6 +365,19 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
             torch.save({"model": model.state_dict(), "classes": train_dataset.classes, "config": config}, results_dir / "best.pt")
         torch.save({"model": model.state_dict(), "classes": train_dataset.classes, "config": config}, results_dir / "last.pt")
 
+    # Optional one-shot held-out test evaluation. Runs after the training loop
+    # has finished and both checkpoints are written, so it cannot affect
+    # training, metrics, or best-checkpoint selection. Any failure here is
+    # logged and swallowed — the run is already complete.
+    test_result = None
+    try:
+        test_result = _evaluate_test_split(
+            dataset_path, val_transform, model, device, criterion, train_dataset,
+            batch_size, workers, results_dir, family, logger, log_path,
+        )
+    except Exception as exc:  # pragma: no cover - defensive, never fail a done run
+        logger(log_path, f"[{family}] Test evaluation was skipped after an error: {exc}")
+
     return {
         "status": "completed",
         "task_type": "image_classification",
@@ -264,4 +386,5 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
         "results_dir": str(results_dir),
         "best_accuracy": best_validation_accuracy,
         "best_train_accuracy": best_train_accuracy,
+        "test_accuracy": test_result["test_accuracy"] if test_result else None,
     }
