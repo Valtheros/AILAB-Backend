@@ -36,6 +36,7 @@ from inference_service import (
 )
 from model_catalog import get_catalog, get_model, validate_model_params
 from run_comparison import build_run_comparison, summarise_comparison
+from run_insights import analyse_run, compare_insights
 from resource_guard import (
     ResourcePlanError,
     enforce_resource_plan,
@@ -632,7 +633,16 @@ def get_metrics(project_name: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not metrics:
         return {"status": "no_data", "metrics": []}
-    return {"status": "success", "metrics": metrics}
+    # Plain-language, rule-based insights over the numbers already in the CSV
+    # (and the test evaluation, if the run wrote one). Read-only; never fails
+    # the metrics response.
+    config = _read_json_file(contained_path(RUNS_DIR, project_name, "job_config.json"))
+    test_eval = _read_json_file(contained_path(RUNS_DIR, project_name, "test_evaluation.json"))
+    try:
+        analysis = analyse_run(metrics, str(config.get("task_type") or ""), test_eval or None)
+    except Exception:
+        analysis = {"metric": None, "insights": []}
+    return {"status": "success", "metrics": metrics, "insights": analysis["insights"]}
 
 
 @app.post("/api/stop/{job_id}")
@@ -1258,6 +1268,7 @@ def compare_dataset_runs(dataset_slug: str, run_ids: str, request: Request):
         "status": "success",
         "datasetSlug": dataset_slug,
         "runs": runs,
+        "insights": compare_insights(runs),
         **summarise_comparison(runs),
     }
 
