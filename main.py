@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from inference_service import (
     predict_image,
 )
 from model_catalog import get_catalog, get_model, validate_model_params
+from run_comparison import build_run_comparison, summarise_comparison
 from resource_guard import (
     ResourcePlanError,
     enforce_resource_plan,
@@ -1194,6 +1196,70 @@ def admin_delete_user_resources(user_id: str, request: Request):
         raise HTTPException(status_code=500, detail=" ".join(errors))
     resource_repository.finalize_user_resource_delete(user_id)
     return {"status": "success", "datasets": len(datasets), "runs": len(runs)}
+
+
+MIN_COMPARE_RUNS = 2
+MAX_COMPARE_RUNS = 4
+
+
+@app.get("/api/datasets/{dataset_slug}/runs/compare")
+def compare_dataset_runs(dataset_slug: str, run_ids: str, request: Request):
+    """Overlay metric series for 2-4 runs trained on the same dataset.
+
+    Runs are addressed by training_tasks id. Ownership is enforced by scoping
+    every lookup to the caller, so a run belonging to someone else is reported
+    as not found rather than acknowledged.
+    """
+    owner_id = _require_request_user_id(request)
+    try:
+        validate_slug(dataset_slug, "dataset name")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    requested = [value.strip() for value in run_ids.split(",") if value.strip()]
+    # Preserve the caller's order while dropping duplicates.
+    unique_ids = list(dict.fromkeys(requested))
+    if len(unique_ids) < MIN_COMPARE_RUNS or len(unique_ids) > MAX_COMPARE_RUNS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Select between {MIN_COMPARE_RUNS} and {MAX_COMPARE_RUNS} runs to compare.",
+        )
+    if not resource_repository.enabled:
+        raise HTTPException(status_code=503, detail="Run comparison requires the resource database.")
+
+    runs: list[dict[str, Any]] = []
+    for run_id in unique_ids:
+        # training_tasks.id is a uuid column, so a malformed id would otherwise
+        # surface as a database error rather than a client error.
+        try:
+            uuid.UUID(run_id)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' was not found.")
+        row = resource_repository.get_task(owner_id, run_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' was not found.")
+        if not row.get("run_slug"):
+            raise HTTPException(status_code=400, detail="A selected task has not been trained yet.")
+        if str(row.get("dataset_slug") or "") != dataset_slug:
+            raise HTTPException(
+                status_code=400,
+                detail="All selected runs must come from the same dataset.",
+            )
+
+        run_slug = str(row["run_slug"])
+        try:
+            metric_rows = training_service.get_training_metrics(run_slug)
+            config = _read_json_file(contained_path(RUNS_DIR, run_slug, "job_config.json"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        runs.append(build_run_comparison(task_row=row, metric_rows=metric_rows, config=config))
+
+    return {
+        "status": "success",
+        "datasetSlug": dataset_slug,
+        "runs": runs,
+        **summarise_comparison(runs),
+    }
 
 
 @app.get("/api/datasets/{dataset_name}/metadata")
