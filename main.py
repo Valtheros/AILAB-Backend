@@ -9,7 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -34,6 +34,7 @@ from inference_service import (
     check_rate_limit,
     predict_image,
 )
+from detection_inference import DETECTION_TASK_TYPE, predict_detection
 from model_catalog import get_catalog, get_model, validate_model_params
 from run_comparison import build_run_comparison, summarise_comparison
 from run_insights import analyse_run, compare_insights
@@ -1068,12 +1069,17 @@ def _run_record_for_predict(project_name: str, request: Request) -> dict[str, An
 
 
 @app.post("/api/runs/{project_name}/predict")
-async def predict_run(project_name: str, request: Request, file: UploadFile = File(...)):
-    """Classify one uploaded image with a completed run's trained model.
+async def predict_run(
+    project_name: str,
+    request: Request,
+    file: UploadFile = File(...),
+    threshold: float | None = Form(None),
+):
+    """Run one uploaded image through a completed run's trained model.
 
-    Image classification only. Detection and segmentation runs are rejected
-    because their outputs need box/mask rendering that this endpoint does not
-    produce.
+    Supports image classification (top-k labels) and object detection (bounding
+    boxes). Segmentation runs are still rejected because their mask output needs
+    rendering this endpoint does not yet produce.
     """
     owner_id = _require_request_user_id(request)
     try:
@@ -1083,12 +1089,13 @@ async def predict_run(project_name: str, request: Request, file: UploadFile = Fi
 
     config = _read_json_file(contained_path(RUNS_DIR, project_name, "job_config.json"))
     task_type = str((record or {}).get("task_type") or config.get("task_type") or "")
+    model_type = str((record or {}).get("model_type") or config.get("model_type") or "")
     status = str((record or {}).get("status") or "")
 
-    if task_type != "image_classification":
+    if task_type not in ("image_classification", DETECTION_TASK_TYPE):
         raise HTTPException(
             status_code=400,
-            detail="Model testing currently supports image classification runs only.",
+            detail="Model testing currently supports image classification and object detection runs only.",
         )
     if record is not None and status != "completed":
         raise HTTPException(
@@ -1114,7 +1121,12 @@ async def predict_run(project_name: str, request: Request, file: UploadFile = Fi
     try:
         # Runs off the event loop: loading a checkpoint and the forward pass are
         # both blocking CPU work.
-        result = await asyncio.to_thread(predict_image, run_dir, payload)
+        if task_type == DETECTION_TASK_TYPE:
+            result = await asyncio.to_thread(
+                predict_detection, run_dir, payload, model_type, threshold
+            )
+        else:
+            result = await asyncio.to_thread(predict_image, run_dir, payload)
     except InferenceError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except InferenceUnavailable as exc:
@@ -1122,7 +1134,7 @@ async def predict_run(project_name: str, request: Request, file: UploadFile = Fi
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 
-    return {"status": "success", "runSlug": project_name, **result}
+    return {"status": "success", "runSlug": project_name, "taskType": task_type, **result}
 
 
 @app.get("/api/runs/{project_name}/files/{file_path:path}")

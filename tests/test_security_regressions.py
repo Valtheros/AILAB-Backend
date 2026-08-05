@@ -47,6 +47,7 @@ def _install_optional_dependency_stubs() -> None:
         sys.modules["fastapi"] = types.SimpleNamespace(
             FastAPI=FastAPI,
             File=lambda *args, **kwargs: None,
+            Form=lambda *args, **kwargs: None,
             HTTPException=HTTPException,
             Request=object,
             UploadFile=object,
