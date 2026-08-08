@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
@@ -14,6 +15,60 @@ from .trainer_utils import (
     scheduler_for,
     set_seed,
 )
+
+
+def _evaluate_semantic_test_split(
+    model, dataset_path, image_size, num_classes, ignore_index, batch_size, results_dir, device, logger, log_path
+):
+    """One-shot held-out test evaluation, run once AFTER training (not in the
+    loop). Reports pixel accuracy and mean IoU; skips cleanly when the dataset
+    has no test split. Writes the same test_evaluation.json contract the UI reads."""
+    import torch
+    from torch.utils.data import DataLoader
+
+    try:
+        test_dataset = SemanticMaskDataset(dataset_path, "test", image_size, num_classes, ignore_index)
+    except Exception as exc:
+        logger(log_path, f"[deeplabv3plus] No test split found; skipping held-out test evaluation. ({exc})")
+        return None
+
+    loader = DataLoader(test_dataset, batch_size=max(1, min(batch_size, 8)), shuffle=False, num_workers=0)
+    model.eval()
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64, device=device)
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            predictions = model(images).argmax(dim=1)
+            valid = masks != ignore_index
+            indices = masks[valid] * num_classes + predictions[valid]
+            confusion += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+
+    confusion = confusion.cpu()
+    total = int(confusion.sum().item())
+    correct = int(confusion.diag().sum().item())
+    pixel_accuracy = correct / max(total, 1)
+    intersection = confusion.diag()
+    union = confusion.sum(0) + confusion.sum(1) - intersection
+    present = union > 0
+    mean_iou = float((intersection[present].float() / union[present].float()).mean().item()) if bool(present.any()) else 0.0
+
+    result = {
+        "task_type": "segmentation",
+        "model_type": "deeplabv3plus",
+        "checkpoint": "best.pt",
+        "test_pixel_accuracy": round(pixel_accuracy, 6),
+        "test_mean_iou": round(mean_iou, 6),
+        "test_images": len(test_dataset),
+        "num_classes": num_classes,
+    }
+    (results_dir / "test_evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    logger(
+        log_path,
+        f"[deeplabv3plus] Held-out test pixel_acc={pixel_accuracy:.4f} mIoU={mean_iou:.4f} "
+        f"on {len(test_dataset)} images (from best.pt)",
+    )
+    return result
 
 
 class DeepLabV3PlusTrainer(BaseTrainer):
@@ -177,6 +232,18 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                 best_loss = score_loss
                 torch.save({"model": model.state_dict(), "config": config}, results_dir / "best.pt")
             torch.save({"model": model.state_dict(), "config": config}, results_dir / "last.pt")
+
+        # Optional one-shot held-out test evaluation on best.pt, after the loop.
+        best_path = results_dir / "best.pt"
+        if best_path.is_file():
+            try:
+                model.load_state_dict(torch.load(best_path, map_location=device)["model"])
+                _evaluate_semantic_test_split(
+                    model, config["dataset_path"], image_size, num_classes, ignore_index,
+                    batch_size, results_dir, device, self._write_log, log_path,
+                )
+            except Exception as exc:
+                self._write_log(log_path, f"[deeplabv3plus] Held-out test evaluation skipped: {exc}")
 
         return {
             "status": "completed",

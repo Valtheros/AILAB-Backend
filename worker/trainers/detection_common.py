@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from .detection_datasets import CocoInstanceDataset, YoloBoxDataset
@@ -226,6 +227,57 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
             best_loss = score_loss
             torch.save({"model": model.state_dict(), "classes": getattr(train_dataset, "classes", []), "config": config}, results_dir / "best.pt")
         torch.save({"model": model.state_dict(), "classes": getattr(train_dataset, "classes", []), "config": config}, results_dir / "last.pt")
+
+    # Optional one-shot held-out test evaluation on best.pt, run once after the
+    # training loop. torchvision detectors only expose losses (not mAP) without a
+    # heavy COCO-eval dependency, so test loss is the held-out metric here,
+    # mirroring the val-loss the loop already tracks. Skips when no test split.
+    try:
+        if model_kind == "mask_rcnn":
+            test_dataset = CocoInstanceDataset(dataset_path, "test", include_masks=True,
+                category_to_label=train_dataset.category_to_label, classes=train_dataset.classes)
+        elif use_coco_boxes:
+            test_dataset = CocoInstanceDataset(dataset_path, "test", include_masks=False,
+                category_to_label=train_dataset.category_to_label, classes=train_dataset.classes)
+        else:
+            test_dataset = YoloBoxDataset(dataset_path, data_yaml_path, "test")
+    except Exception as exc:
+        test_dataset = None
+        logger(log_path, f"[{model_kind}] No test split found; skipping held-out test evaluation. ({exc})")
+
+    if test_dataset is not None and len(test_dataset) > 0:
+        try:
+            best_file = results_dir / "best.pt"
+            if best_file.is_file():
+                model.load_state_dict(torch.load(best_file, map_location=device)["model"])
+            test_loader = DataLoader(
+                test_dataset, batch_size=1, shuffle=False, num_workers=workers,
+                collate_fn=collate_detection, **worker_options,
+            )
+            model.train()  # torchvision detectors return losses only in train mode
+            total_test_loss = 0.0
+            test_batches = 0
+            with torch.no_grad():
+                for images, targets in test_loader:
+                    images = [image.to(device) for image in images]
+                    targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
+                    loss_dict = model(images, targets)
+                    total_test_loss += float(sum(loss for loss in loss_dict.values()).item())
+                    test_batches += 1
+            test_loss = total_test_loss / max(test_batches, 1)
+            result = {
+                "task_type": "segmentation" if model_kind == "mask_rcnn" else "object_detection",
+                "model_type": model_kind,
+                "checkpoint": "best.pt",
+                "test_loss": round(test_loss, 6),
+                "test_images": len(test_dataset),
+                "num_classes": num_classes,
+                "classes": list(getattr(train_dataset, "classes", [])),
+            }
+            (results_dir / "test_evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+            logger(log_path, f"[{model_kind}] Held-out test loss={test_loss:.4f} on {len(test_dataset)} images (from best.pt)")
+        except Exception as exc:
+            logger(log_path, f"[{model_kind}] Held-out test evaluation skipped: {exc}")
 
     return {
         "status": "completed",
