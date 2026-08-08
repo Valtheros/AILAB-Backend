@@ -35,6 +35,7 @@ from inference_service import (
     predict_image,
 )
 from detection_inference import DETECTION_TASK_TYPE, predict_detection
+from segmentation_inference import SEGMENTATION_TASK_TYPE, predict_segmentation
 from model_catalog import get_catalog, get_model, validate_model_params
 from run_comparison import build_run_comparison, summarise_comparison
 from run_insights import analyse_run, compare_insights
@@ -1077,9 +1078,8 @@ async def predict_run(
 ):
     """Run one uploaded image through a completed run's trained model.
 
-    Supports image classification (top-k labels) and object detection (bounding
-    boxes). Segmentation runs are still rejected because their mask output needs
-    rendering this endpoint does not yet produce.
+    Supports image classification (top-k labels), object detection (bounding
+    boxes), and segmentation (semantic or instance mask overlay).
     """
     owner_id = _require_request_user_id(request)
     try:
@@ -1092,10 +1092,10 @@ async def predict_run(
     model_type = str((record or {}).get("model_type") or config.get("model_type") or "")
     status = str((record or {}).get("status") or "")
 
-    if task_type not in ("image_classification", DETECTION_TASK_TYPE):
+    if task_type not in ("image_classification", DETECTION_TASK_TYPE, SEGMENTATION_TASK_TYPE):
         raise HTTPException(
             status_code=400,
-            detail="Model testing currently supports image classification and object detection runs only.",
+            detail="Model testing supports image classification, object detection, and segmentation runs only.",
         )
     if record is not None and status != "completed":
         raise HTTPException(
@@ -1124,6 +1124,10 @@ async def predict_run(
         if task_type == DETECTION_TASK_TYPE:
             result = await asyncio.to_thread(
                 predict_detection, run_dir, payload, model_type, threshold
+            )
+        elif task_type == SEGMENTATION_TASK_TYPE:
+            result = await asyncio.to_thread(
+                predict_segmentation, run_dir, payload, model_type, threshold
             )
         else:
             result = await asyncio.to_thread(predict_image, run_dir, payload)

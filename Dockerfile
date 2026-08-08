@@ -35,6 +35,11 @@ RUN pip install --no-cache-dir \
 # pulling numpy 2.x and breaking torchvision's ToTensor() at runtime.
 RUN pip install --no-cache-dir ultralytics==8.4.56 "numpy<2"
 
+# segmentation-models-pytorch powers DeepLabV3+ semantic-segmentation inference,
+# pinned to the worker so its DeepLabV3Plus state_dict loads identically. Mask
+# R-CNN uses torchvision (already present); only the semantic model needs smp.
+RUN pip install --no-cache-dir segmentation-models-pytorch==0.5.0 "numpy<2"
+
 COPY . .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
