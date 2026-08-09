@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from dataset_utils import DATASET_METADATA_VERSION, dataset_workflow_metadata, inspect_dataset, prepare_dataset_for_model
+from dataset_utils import DATASET_METADATA_VERSION, dataset_workflow_metadata, inspect_dataset, normalize_dataset_metadata, prepare_dataset_for_model
 from model_catalog import get_catalog
 
 
@@ -50,8 +50,15 @@ class CocoSemanticTests(unittest.TestCase):
             self.assertEqual(metadata["image_count"], 1)
             self.assertEqual(workflow["canonical_task"], "segmentation")
             self.assertEqual(workflow["canonical_format"], "coco_segmentation")
+            self.assertNotIn("object_detection", metadata["tasks"])
+            self.assertNotIn("object_detection", workflow["dataset_tasks"])
+            self.assertNotIn("yolo", ready)
+            self.assertNotIn("faster_rcnn", ready)
             self.assertIn("deeplabv3plus", ready)
             self.assertIn("mask_rcnn", ready)
+
+            legacy = {**metadata, "metadata_version": 1, "tasks": ["object_detection", "segmentation"]}
+            self.assertEqual(normalize_dataset_metadata(legacy)["tasks"], ["segmentation"])
 
             prepared = prepare_dataset_for_model(root, "deeplabv3plus")
             export_root = Path(prepared["dataset_path"])

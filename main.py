@@ -22,6 +22,7 @@ from dataset_utils import (
     format_bytes,
     inspect_dataset,
     inspect_dataset_for_upload,
+    normalize_dataset_metadata,
     safe_dataset_name,
     validate_dataset_for_upload,
 )
@@ -317,6 +318,7 @@ def _flatten_single_root_folder(target_dir: Path) -> None:
 
 
 def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
+    metadata = normalize_dataset_metadata(metadata)
     workflow = dataset_workflow_metadata(metadata, get_catalog())
     ready_models = [model for model in workflow.get("compatible_models", []) if model.get("ready")]
     return {
@@ -345,7 +347,7 @@ def _dataset_metadata_is_current(metadata: Any) -> bool:
     required = {"formats", "tasks", "classes", "image_count", "size_bytes", "warnings", "errors"}
     return (
         isinstance(metadata, dict)
-        and metadata.get("metadata_version") == DATASET_METADATA_VERSION
+        and metadata.get("metadata_version") in {1, DATASET_METADATA_VERSION}
         and required.issubset(metadata)
     )
 
@@ -738,9 +740,9 @@ def list_datasets(request: Request):
                 stored_metadata = json.loads(stored_metadata)
             except json.JSONDecodeError:
                 stored_metadata = None
-        metadata_is_current = _dataset_metadata_is_current(stored_metadata)
-        metadata = dict(stored_metadata) if metadata_is_current else inspect_dataset(item)
-        if record and not metadata_is_current:
+        metadata_is_usable = _dataset_metadata_is_current(stored_metadata)
+        metadata = normalize_dataset_metadata(stored_metadata) if metadata_is_usable else inspect_dataset(item)
+        if record and metadata != stored_metadata:
             resource_repository.update_dataset_metadata(record["id"], metadata)
         metadata["export_cache"] = export_cache_metadata(item)
         profile = _dataset_profile(metadata)

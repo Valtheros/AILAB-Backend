@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
+from .evaluation_artifacts import CurveAccumulator, confusion_dict, segmentation_classes, write_evaluation_artifact
 from .semantic_dataset import SemanticMaskDataset
 from .trainer_utils import (
     append_csv_row,
+    format_epoch_metrics,
     extra,
     get_device,
     optimizer_for,
@@ -15,6 +17,20 @@ from .trainer_utils import (
     scheduler_for,
     set_seed,
 )
+
+
+def _segmentation_scores(confusion) -> tuple[float, float, float]:
+    confusion = confusion.float()
+    intersection = confusion.diag()
+    target = confusion.sum(1)
+    predicted = confusion.sum(0)
+    union = target + predicted - intersection
+    present = union > 0
+    pixel_accuracy = float(intersection.sum().item() / max(confusion.sum().item(), 1))
+    mean_iou = float((intersection[present] / union[present]).mean().item()) if bool(present.any()) else 0.0
+    denominator = target + predicted
+    dice = float((2 * intersection[present] / denominator[present]).mean().item()) if bool(present.any()) else 0.0
+    return pixel_accuracy, mean_iou, dice
 
 
 def _evaluate_semantic_test_split(
@@ -44,14 +60,9 @@ def _evaluate_semantic_test_split(
             indices = masks[valid] * num_classes + predictions[valid]
             confusion += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
 
-    confusion = confusion.cpu()
-    total = int(confusion.sum().item())
-    correct = int(confusion.diag().sum().item())
-    pixel_accuracy = correct / max(total, 1)
-    intersection = confusion.diag()
-    union = confusion.sum(0) + confusion.sum(1) - intersection
-    present = union > 0
-    mean_iou = float((intersection[present].float() / union[present].float()).mean().item()) if bool(present.any()) else 0.0
+    # Same helper the per-epoch metrics use, so the held-out numbers and the
+    # training curves always come from one formula.
+    pixel_accuracy, mean_iou, _dice = _segmentation_scores(confusion.cpu())
 
     result = {
         "task_type": "segmentation",
@@ -165,8 +176,7 @@ class DeepLabV3PlusTrainer(BaseTrainer):
         for epoch in range(1, epochs + 1):
             model.train()
             total_loss = 0.0
-            total_pixels = 0
-            correct_pixels = 0
+            train_confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64, device=device)
             batches = 0
             for images, masks in train_loader:
                 images = images.to(device)
@@ -181,18 +191,20 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                 total_loss += float(loss.item())
                 predictions = logits.argmax(dim=1)
                 valid_pixels = masks != ignore_index
-                correct_pixels += int(((predictions == masks) & valid_pixels).sum().item())
-                total_pixels += int(valid_pixels.sum().item())
+                indices = masks[valid_pixels] * num_classes + predictions[valid_pixels]
+                train_confusion += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
                 batches += 1
 
             val_loss = ""
             val_pixel_accuracy = ""
+            val_mean_iou = ""
+            val_dice = ""
+            final_curve = CurveAccumulator() if epoch == epochs and val_loader is not None else None
             if val_loader is not None:
                 model.eval()
                 total_val_loss = 0.0
                 val_batches = 0
-                val_correct = 0
-                val_pixels = 0
+                val_confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64, device=device)
                 with torch.no_grad():
                     for images, masks in val_loader:
                         images = images.to(device)
@@ -201,32 +213,52 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                         loss = criterion(logits, masks)
                         total_val_loss += float(loss.item())
                         valid_pixels = masks != ignore_index
-                        val_correct += int(((logits.argmax(dim=1) == masks) & valid_pixels).sum().item())
-                        val_pixels += int(valid_pixels.sum().item())
+                        predictions = logits.argmax(dim=1)
+                        indices = masks[valid_pixels] * num_classes + predictions[valid_pixels]
+                        val_confusion += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
+                        if final_curve is not None:
+                            probabilities = logits.softmax(dim=1).permute(0, 2, 3, 1)[valid_pixels].cpu()
+                            labels = torch.nn.functional.one_hot(masks[valid_pixels].cpu(), num_classes).bool()
+                            final_curve.update(probabilities, labels, int(valid_pixels.sum().item()))
                         val_batches += 1
                 val_loss = total_val_loss / max(val_batches, 1)
-                val_pixel_accuracy = val_correct / max(val_pixels, 1)
+                val_pixel_accuracy, val_mean_iou, val_dice = _segmentation_scores(val_confusion)
 
             train_loss = total_loss / max(batches, 1)
-            train_pixel_accuracy = correct_pixels / max(total_pixels, 1)
+            train_pixel_accuracy, train_mean_iou, train_dice = _segmentation_scores(train_confusion)
             score_loss = float(val_loss) if val_loss != "" else train_loss
-            append_csv_row(
-                metrics_path,
-                {
-                    "epoch": epoch,
-                    "train/loss": train_loss,
-                    "train/pixel_accuracy": train_pixel_accuracy,
-                    "val/loss": val_loss,
-                    "val/pixel_accuracy": val_pixel_accuracy,
-                    "lr": optimizer.param_groups[0]["lr"],
-                },
-            )
+            row = {
+                "epoch": epoch,
+                "train/loss": train_loss,
+                "train/pixel_accuracy": train_pixel_accuracy,
+                "train/mean_iou": train_mean_iou,
+                "train/dice": train_dice,
+                "val/loss": val_loss,
+                "val/pixel_accuracy": val_pixel_accuracy,
+                "val/mean_iou": val_mean_iou,
+                "val/dice": val_dice,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+            append_csv_row(metrics_path, row)
+            if epoch == epochs and val_loader is not None:
+                class_names = list((config.get("dataset_metadata") or {}).get("classes") or [])
+                if len(class_names) == num_classes - 1:
+                    class_names.insert(0, "background")
+                if len(class_names) != num_classes:
+                    class_names = [f"Class {index}" for index in range(num_classes)]
+                write_evaluation_artifact(
+                    results_dir,
+                    {
+                        "taskType": "segmentation",
+                        "modelType": "deeplabv3plus",
+                        "confusionMatrix": confusion_dict(val_confusion, class_names),
+                        "curves": [final_curve.as_dict("pixels", "Pixels")],
+                        "perClass": segmentation_classes(val_confusion, class_names),
+                    },
+                )
             if scheduler is not None:
                 scheduler.step()
-            self._write_log(
-                log_path,
-                f"[deeplabv3plus] epoch={epoch}/{epochs} train_loss={train_loss:.4f} val_loss={val_loss}",
-            )
+            self._write_log(log_path, format_epoch_metrics("deeplabv3plus", epoch, epochs, row))
 
             if score_loss <= best_loss:
                 best_loss = score_loss

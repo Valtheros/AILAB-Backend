@@ -135,6 +135,19 @@ def append_csv_row(path: Path, row: dict[str, Any]) -> None:
         writer.writerow(row)
 
 
+def format_epoch_metrics(name: str, epoch: int, epochs: int, row: dict[str, Any]) -> str:
+    values = []
+    for key, raw_value in row.items():
+        if key == "epoch" or raw_value == "" or raw_value is None:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        values.append(f"{key}={value:.6g}" if key.startswith("lr") else f"{key}={value:.4f}")
+    return f"[{name}] epoch={epoch}/{epochs} {' '.join(values)}".rstrip()
+
+
 def optimizer_for(parameters: Iterable, name: str, lr: float, momentum: float, weight_decay: float):
     import torch
 

@@ -4,8 +4,10 @@ import json
 from pathlib import Path
 
 from .detection_datasets import CocoInstanceDataset, YoloBoxDataset
+from .evaluation_artifacts import CurveAccumulator, confusion_dict, write_evaluation_artifact
 from .trainer_utils import (
     append_csv_row,
+    format_epoch_metrics,
     collate_detection,
     extra,
     get_device,
@@ -16,6 +18,222 @@ from .trainer_utils import (
     scheduler_for,
     set_seed,
 )
+
+
+def _empty_detection_metrics(include_masks: bool, value="") -> dict:
+    metrics = {
+        "metrics/precision(B)": value,
+        "metrics/recall(B)": value,
+        "metrics/mAP50(B)": value,
+        "metrics/mAP50-95(B)": value,
+    }
+    if include_masks:
+        metrics.update({"metrics/mAP50(M)": value, "metrics/mAP50-95(M)": value})
+    return metrics
+
+
+def _encode_coco_mask(mask) -> dict:
+    import numpy as np
+    from pycocotools import mask as coco_mask
+
+    encoded = coco_mask.encode(np.asfortranarray(mask.numpy().astype("uint8")))
+    if isinstance(encoded["counts"], bytes):
+        encoded["counts"] = encoded["counts"].decode("ascii")
+    return encoded
+
+
+def _coco_ap(images: list[dict], annotations: list[dict], categories: list[dict], detections: list[dict], iou_type: str) -> tuple[float, float]:
+    import contextlib
+    import io
+
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
+
+    if not annotations or not detections:
+        return 0.0, 0.0
+    with contextlib.redirect_stdout(io.StringIO()):
+        ground_truth = COCO()
+        ground_truth.dataset = {"images": images, "annotations": annotations, "categories": categories, "info": {}}
+        ground_truth.createIndex()
+        predictions = ground_truth.loadRes(detections)
+        evaluator = COCOeval(ground_truth, predictions, iou_type)
+        evaluator.evaluate()
+        evaluator.accumulate()
+        evaluator.summarize()
+    return max(float(evaluator.stats[1]), 0.0), max(float(evaluator.stats[0]), 0.0)
+
+
+def _box_overlaps(box, candidates):
+    import torch
+
+    if not len(candidates):
+        return torch.empty(0)
+    top_left = torch.maximum(box[:2], candidates[:, :2])
+    bottom_right = torch.minimum(box[2:], candidates[:, 2:])
+    intersection = (bottom_right - top_left).clamp(min=0).prod(1)
+    box_area = (box[2:] - box[:2]).clamp(min=0).prod()
+    candidate_area = (candidates[:, 2:] - candidates[:, :2]).clamp(min=0).prod(1)
+    return intersection / (box_area + candidate_area - intersection).clamp(min=1e-9)
+
+
+def _update_detection_confusion(matrix, boxes, labels, prediction_boxes, prediction_labels) -> None:
+    import torch
+
+    matched = torch.zeros(len(boxes), dtype=torch.bool)
+    for box, predicted_label in zip(prediction_boxes, prediction_labels):
+        candidates = torch.where(~matched)[0]
+        if len(candidates):
+            overlaps = _box_overlaps(box, boxes[candidates])
+            best = int(overlaps.argmax().item())
+            if float(overlaps[best]) >= 0.5:
+                target_index = int(candidates[best])
+                matched[target_index] = True
+                matrix[int(labels[target_index]), int(predicted_label)] += 1
+                continue
+        matrix[0, int(predicted_label)] += 1
+    for target_index in torch.where(~matched)[0]:
+        matrix[int(labels[target_index]), 0] += 1
+
+
+def _evaluate_detection_metrics(
+    model,
+    loader,
+    device,
+    num_classes: int,
+    include_masks: bool,
+    artifacts: dict | None = None,
+    class_names: list[str] | None = None,
+) -> dict:
+    import torch
+
+    images_json: list[dict] = []
+    annotations: list[dict] = []
+    box_detections: list[dict] = []
+    mask_detections: list[dict] = []
+    true_positives = false_positives = ground_truth_count = 0
+    annotation_id = 1
+    box_curve = CurveAccumulator() if artifacts is not None else None
+    mask_curve = CurveAccumulator() if artifacts is not None and include_masks else None
+    confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64) if artifacts is not None else None
+
+    model.eval()
+    with torch.no_grad():
+        for images, targets in loader:
+            device_images = [image.to(device) for image in images]
+            outputs = [{key: value.detach().cpu() for key, value in output.items()} for output in model(device_images)]
+            for image, target, output in zip(images, targets, outputs):
+                image_id = int(target["image_id"].reshape(-1)[0].item())
+                images_json.append({"id": image_id, "width": int(image.shape[-1]), "height": int(image.shape[-2])})
+                boxes = target["boxes"].cpu()
+                labels = target["labels"].cpu()
+                ground_truth_count += len(boxes)
+                for index, (box, label) in enumerate(zip(boxes, labels)):
+                    x1, y1, x2, y2 = [float(value) for value in box]
+                    annotation = {
+                        "id": annotation_id,
+                        "image_id": image_id,
+                        "category_id": int(label),
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "area": float((x2 - x1) * (y2 - y1)),
+                        "iscrowd": int(target.get("iscrowd", torch.zeros(len(boxes), dtype=torch.int64))[index]),
+                    }
+                    if include_masks:
+                        annotation["segmentation"] = _encode_coco_mask(target["masks"][index].cpu())
+                    annotations.append(annotation)
+                    annotation_id += 1
+
+                prediction_boxes = output.get("boxes", torch.empty((0, 4)))
+                prediction_labels = output.get("labels", torch.empty(0, dtype=torch.int64))
+                prediction_scores = output.get("scores", torch.empty(0))
+                order = prediction_scores.argsort(descending=True)
+                matched = torch.zeros(len(boxes), dtype=torch.bool)
+                box_matches: list[bool] = []
+                mask_matches: list[bool] = []
+                matched_masks = torch.zeros(len(boxes), dtype=torch.bool)
+                for index in order:
+                    box = prediction_boxes[index]
+                    label = prediction_labels[index]
+                    x1, y1, x2, y2 = [float(value) for value in box]
+                    detection = {
+                        "image_id": image_id,
+                        "category_id": int(label),
+                        "bbox": [x1, y1, x2 - x1, y2 - y1],
+                        "score": float(prediction_scores[index]),
+                    }
+                    box_detections.append(detection)
+                    candidates = torch.where((labels == label) & ~matched)[0]
+                    is_box_match = False
+                    if len(candidates):
+                        overlaps = _box_overlaps(box, boxes[candidates])
+                        best = int(overlaps.argmax().item())
+                        if float(overlaps[best]) >= 0.5:
+                            matched[candidates[best]] = True
+                            true_positives += 1
+                            is_box_match = True
+                        else:
+                            false_positives += 1
+                    else:
+                        false_positives += 1
+                    box_matches.append(is_box_match)
+                    if include_masks and "masks" in output:
+                        predicted_mask = output["masks"][index, 0] >= 0.5
+                        mask_detection = dict(detection)
+                        mask_detection.pop("bbox")
+                        mask_detection["segmentation"] = _encode_coco_mask(predicted_mask.to(torch.uint8))
+                        mask_detections.append(mask_detection)
+                        mask_candidates = torch.where((labels == label) & ~matched_masks)[0]
+                        is_mask_match = False
+                        if len(mask_candidates):
+                            target_masks = target["masks"].cpu()[mask_candidates].bool()
+                            intersections = (target_masks & predicted_mask).flatten(1).sum(1).float()
+                            unions = (target_masks | predicted_mask).flatten(1).sum(1).clamp(min=1).float()
+                            overlaps = intersections / unions
+                            best = int(overlaps.argmax().item())
+                            if float(overlaps[best]) >= 0.5:
+                                matched_masks[mask_candidates[best]] = True
+                                is_mask_match = True
+                        mask_matches.append(is_mask_match)
+                    elif include_masks:
+                        mask_matches.append(False)
+
+                if box_curve is not None:
+                    box_curve.update(prediction_scores[order], box_matches, len(boxes))
+                    _update_detection_confusion(
+                        confusion,
+                        boxes,
+                        labels,
+                        prediction_boxes[order],
+                        prediction_labels[order],
+                    )
+                if mask_curve is not None:
+                    mask_curve.update(prediction_scores[order], mask_matches, len(boxes))
+
+    categories = [{"id": label, "name": str(label)} for label in range(1, num_classes)]
+    box_map50, box_map = _coco_ap(images_json, annotations, categories, box_detections, "bbox")
+    metrics = _empty_detection_metrics(include_masks, 0.0)
+    metrics.update({
+        "metrics/precision(B)": true_positives / max(true_positives + false_positives, 1),
+        "metrics/recall(B)": true_positives / max(ground_truth_count, 1),
+        "metrics/mAP50(B)": box_map50,
+        "metrics/mAP50-95(B)": box_map,
+    })
+    if include_masks:
+        mask_map50, mask_map = _coco_ap(images_json, annotations, categories, mask_detections, "segm")
+        metrics.update({"metrics/mAP50(M)": mask_map50, "metrics/mAP50-95(M)": mask_map})
+    if artifacts is not None:
+        names = list(class_names or [])
+        if len(names) != num_classes - 1:
+            names = [f"Class {index}" for index in range(1, num_classes)]
+        artifacts.update(
+            {
+                "confusionMatrix": confusion_dict(confusion, ["background", *names]),
+                "curves": [box_curve.as_dict("box", "Bounding boxes")],
+                "perClass": [],
+            }
+        )
+        if mask_curve is not None:
+            artifacts["curves"].append(mask_curve.as_dict("mask", "Instance masks"))
+    return metrics
 
 
 def _num_classes_from_dataset(dataset, fallback: int = 2) -> int:
@@ -203,6 +421,8 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
 
         avg_train_loss = train_loss / max(batches, 1)
         val_loss = ""
+        validation_metrics = _empty_detection_metrics(model_kind == "mask_rcnn")
+        evaluation_artifact = {} if epoch == epochs else None
         if val_loader is not None:
             model.train()
             total_val_loss = 0.0
@@ -215,13 +435,40 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
                     total_val_loss += float(sum(loss for loss in loss_dict.values()).item())
                     val_batches += 1
             val_loss = total_val_loss / max(val_batches, 1)
+            try:
+                validation_metrics = _evaluate_detection_metrics(
+                    model,
+                    val_loader,
+                    device,
+                    num_classes,
+                    model_kind == "mask_rcnn",
+                    artifacts=evaluation_artifact,
+                    class_names=list(getattr(train_dataset, "classes", [])),
+                )
+            except Exception as exc:
+                logger(log_path, f"[{model_kind}] Validation metrics unavailable: {exc}")
 
         score_loss = float(val_loss) if val_loss != "" else avg_train_loss
-        row = {"epoch": epoch, "train/loss": avg_train_loss, "val/loss": val_loss, "lr": optimizer.param_groups[0]["lr"]}
+        row = {
+            "epoch": epoch,
+            "train/loss": avg_train_loss,
+            "val/loss": val_loss,
+            **validation_metrics,
+            "lr": optimizer.param_groups[0]["lr"],
+        }
         append_csv_row(metrics_path, row)
+        if evaluation_artifact:
+            write_evaluation_artifact(
+                results_dir,
+                {
+                    "taskType": "segmentation" if model_kind == "mask_rcnn" else "object_detection",
+                    "modelType": model_kind,
+                    **evaluation_artifact,
+                },
+            )
         if scheduler is not None:
             scheduler.step()
-        logger(log_path, f"[{model_kind}] epoch={epoch}/{epochs} train_loss={avg_train_loss:.4f} val_loss={val_loss}")
+        logger(log_path, format_epoch_metrics(model_kind, epoch, epochs, row))
 
         if score_loss <= best_loss:
             best_loss = score_loss

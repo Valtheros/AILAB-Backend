@@ -26,6 +26,7 @@ from model_catalog import get_model
 from security_utils import contained_path, validate_slug
 from settings import DATASET_DIR, REDIS_URL, RUNS_DIR, ensure_runtime_dirs
 from resource_repository import resource_repository
+from worker.error_utils import concise_error
 
 
 MAX_LOG_RESPONSE_BYTES = 1024 * 1024
@@ -350,7 +351,8 @@ class TrainingService:
             mapped = status_map.get(status_str, f"unknown ({status_str})")
             persisted = {"running": "running", "exited": "completed", "stopped": "stopped", "failed": "failed", "queued": "queued"}.get(mapped)
             if persisted:
-                resource_repository.update_run_status(job_id, persisted, job.exc_info if persisted == "failed" else None)
+                error_detail = concise_error(job.exc_info) if persisted == "failed" and job.exc_info else None
+                resource_repository.update_run_status(job_id, persisted, error_detail)
             return mapped
         except NoSuchJobError:
             return "not_found"
@@ -377,7 +379,7 @@ class TrainingService:
             status = job.get_status()
             status_str = status.value if isinstance(status, JobStatus) else str(status)
             if status_str == "failed" and job.exc_info:
-                return f"[Job Failed]\n{job.exc_info}"
+                return f"[Job Failed] {concise_error(job.exc_info)}"
             return "No logs available yet. Training may not have started."
         except Exception as exc:
             return f"Error fetching logs: {exc}"
