@@ -18,10 +18,8 @@ from run_comparison import resolve_metric
 # Thresholds (percentage points unless noted). Kept here so they are easy to tune.
 OVERFIT_HIGH = 15.0
 OVERFIT_MILD = 8.0
-UNDERFIT_TRAIN_CEILING = 0.80
 UNSTABLE_STD = 5.0          # std of last-5 validation accuracy, in percent
 TEST_GAP_HIGH = 10.0
-CONVERGE_FRACTION = 0.90    # "reached 90% of its own best" for convergence speed
 
 
 def _f(value: Any) -> float | None:
@@ -106,14 +104,6 @@ def analyse_run(rows: list[dict[str, str]], task_type: str, test_eval: dict | No
         else:
             insights.append({"level": "success", "code": "overfitting.none", "params": {"gap": round(gap, 1)}})
 
-    # 3. Underfitting: validation still climbing over the last 3 epochs and the
-    #    training accuracy has not yet reached the ceiling.
-    if higher_is_better and final_train is not None:
-        tail = [v for v in val_series[-3:] if v is not None]
-        still_climbing = len(tail) == 3 and tail[0] < tail[1] < tail[2]
-        if still_climbing and final_train < UNDERFIT_TRAIN_CEILING:
-            insights.append({"level": "warning", "code": "underfitting", "params": {}})
-
     # 4. Validation instability over the last 5 epochs.
     std5 = _std_percent(val_series[-5:]) if higher_is_better else None
     if std5 is not None and std5 > UNSTABLE_STD:
@@ -164,15 +154,6 @@ def _run_stats(run: dict[str, Any]) -> dict[str, Any] | None:
     if best_value is None:
         return None
 
-    # Epoch at which the run first reached CONVERGE_FRACTION of its own best.
-    converge_epoch = None
-    if higher:
-        target = best_value * CONVERGE_FRACTION
-        for i, v in enumerate(val):
-            if v is not None and v >= target:
-                converge_epoch = epochs[i] if i < len(epochs) else i + 1
-                break
-
     # Final overfit gap (accuracy-like, both curves present).
     gap = None
     if higher and train and any(t is not None for t in train):
@@ -186,7 +167,6 @@ def _run_stats(run: dict[str, Any]) -> dict[str, Any] | None:
         "name": run.get("displayName") or run.get("runSlug"),
         "higher": higher,
         "best_value": best_value,
-        "converge_epoch": converge_epoch,
         "gap": gap,
         "epochs": epochs_used,
     }
@@ -203,12 +183,6 @@ def compare_insights(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if len(directions) != 1:
         return insights
     higher = stats[0]["higher"]
-
-    # Fastest to converge.
-    converged = [s for s in stats if s["converge_epoch"] is not None]
-    if converged:
-        fastest = min(converged, key=lambda s: s["converge_epoch"])
-        insights.append({"level": "info", "code": "compare.fastest", "params": {"run": fastest["name"], "epoch": int(fastest["converge_epoch"])}})
 
     # Overfit most / least (needs the train-vs-val gap for at least two runs).
     with_gap = [s for s in stats if s["gap"] is not None]

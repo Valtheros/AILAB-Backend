@@ -62,7 +62,6 @@ from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
 from worker.trainers.detection_common import _evaluate_detection_metrics
 from worker.trainers.deeplabv3plus_trainer import _segmentation_scores
-from worker.trainers.evaluation_artifacts import CurveAccumulator, confusion_dict, segmentation_classes
 from worker.trainers.trainer_utils import format_epoch_metrics, require_positive_batch_size, split_image_dir
 from worker.trainers.yolo_trainer import _format_epoch_log
 from worker.error_utils import concise_error
@@ -71,20 +70,6 @@ from services.training_service import TrainingService
 
 
 class TrainerLogicTests(unittest.TestCase):
-    def test_bounded_evaluation_artifacts(self):
-        import torch
-
-        curve = CurveAccumulator(3)
-        curve.update([0.9, 0.8, 0.2], [True, False, True], positive_count=2)
-        result = curve.as_dict("box", "Bounding boxes")
-        self.assertEqual(result["thresholds"], [0.0, 0.5, 1.0])
-        self.assertAlmostEqual(result["precision"][1], 0.5)
-        self.assertAlmostEqual(result["recall"][1], 0.5)
-
-        matrix = torch.tensor([[4, 1], [2, 3]])
-        self.assertEqual(confusion_dict(matrix, ["a", "b"])["values"], [[4, 1], [2, 3]])
-        self.assertAlmostEqual(segmentation_classes(matrix, ["a", "b"])[0]["iou"], 4 / 7, places=6)
-
     def test_epoch_log_uses_the_results_row(self):
         row = {
             "epoch": 2,
@@ -118,16 +103,12 @@ class TrainerLogicTests(unittest.TestCase):
             "image_id": torch.tensor([1]),
             "iscrowd": torch.tensor([0]),
         }
-        artifacts = {}
         metrics = _evaluate_detection_metrics(
-            PerfectDetector(), [([torch.zeros(3, 8, 8)], [target])], torch.device("cpu"), 2, False,
-            artifacts=artifacts, class_names=["object"],
+            PerfectDetector(), [([torch.zeros(3, 8, 8)], [target])], torch.device("cpu"), 2, False
         )
         self.assertAlmostEqual(metrics["metrics/precision(B)"], 1.0)
         self.assertAlmostEqual(metrics["metrics/recall(B)"], 1.0)
         self.assertGreater(metrics["metrics/mAP50(B)"], 0.99)
-        self.assertEqual(artifacts["confusionMatrix"]["values"][1][1], 1)
-        self.assertGreater(max(artifacts["curves"][0]["f1"]), 0.99)
 
         class PerfectMaskDetector(PerfectDetector):
             def __call__(self, images):
@@ -137,18 +118,14 @@ class TrainerLogicTests(unittest.TestCase):
 
         mask = torch.zeros((1, 8, 8), dtype=torch.uint8)
         mask[:, 1:5, 1:5] = 1
-        mask_artifacts = {}
         mask_metrics = _evaluate_detection_metrics(
             PerfectMaskDetector(),
             [([torch.zeros(3, 8, 8)], [{**target, "masks": mask}])],
             torch.device("cpu"),
             2,
             True,
-            artifacts=mask_artifacts,
-            class_names=["object"],
         )
         self.assertGreater(mask_metrics["metrics/mAP50(M)"], 0.99)
-        self.assertGreater(max(mask_artifacts["curves"][1]["f1"]), 0.99)
 
         accuracy, mean_iou, dice = _segmentation_scores(torch.tensor([[8, 1], [1, 10]]))
         self.assertAlmostEqual(accuracy, 0.9)
