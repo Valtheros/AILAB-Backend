@@ -1,8 +1,8 @@
 """Rule-boundary tests for run_insights.
 
 Real runs on the demo dataset all overfit hard, so these synthetic rows pin the
-mild / none / underfitting / stable / test-gap branches that live data never
-reaches. Numbers are chosen so the expected code is unambiguous.
+mild / none / stable / test-gap branches that live data never reaches. Numbers
+are chosen so the expected code is unambiguous.
 """
 
 from __future__ import annotations
@@ -56,19 +56,6 @@ class BestEpochTests(unittest.TestCase):
         codes = _codes(analyse_run(rows, "image_classification"))
         self.assertEqual(codes["best_epoch_acc"]["params"]["epoch"], 2)
         self.assertAlmostEqual(codes["best_epoch_acc"]["params"]["value"], 82.0, places=1)
-
-
-class UnderfittingTests(unittest.TestCase):
-    def test_underfitting_when_still_climbing_and_train_low(self):
-        # val strictly increasing over the last 3, train stays under 0.80.
-        rows = _cls_rows([(0.40, 0.40), (0.55, 0.52), (0.62, 0.60), (0.70, 0.66)])
-        codes = _codes(analyse_run(rows, "image_classification"))
-        self.assertIn("underfitting", codes)
-
-    def test_no_underfitting_when_train_high(self):
-        rows = _cls_rows([(0.85, 0.60), (0.90, 0.64), (0.95, 0.68)])
-        codes = _codes(analyse_run(rows, "image_classification"))
-        self.assertNotIn("underfitting", codes)
 
 
 class StabilityTests(unittest.TestCase):
@@ -136,14 +123,15 @@ class CompareInsightTests(unittest.TestCase):
         run = build_run_comparison(task_row=row, metric_rows=rows, config={})
         return run
 
-    def test_flags_fastest_and_overfit_extremes(self):
-        # run A converges fast but overfits hard; run B slower, cleaner.
+    def test_flags_overfit_extremes(self):
+        # run A overfits hard; run B cleaner.
         a = self._run("A", [(0.7, 0.65), (0.99, 0.70)])
         b = self._run("B", [(0.6, 0.58), (0.75, 0.72)])
         codes = {i["code"]: i for i in compare_insights([a, b])}
         self.assertEqual(codes["compare.overfit_most"]["params"]["run"], "A")
         self.assertEqual(codes["compare.overfit_least"]["params"]["run"], "B")
         self.assertIn("compare.best_value", codes)
+        self.assertNotIn("compare.fastest", codes)  # removed: not useful in practice
 
     def test_single_run_has_no_comparison(self):
         a = self._run("A", [(0.7, 0.65), (0.9, 0.70)])

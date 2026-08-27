@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
-from .evaluation_artifacts import CurveAccumulator, confusion_dict, segmentation_classes, write_evaluation_artifact
 from .semantic_dataset import SemanticMaskDataset
 from .trainer_utils import (
     append_csv_row,
@@ -199,7 +198,6 @@ class DeepLabV3PlusTrainer(BaseTrainer):
             val_pixel_accuracy = ""
             val_mean_iou = ""
             val_dice = ""
-            final_curve = CurveAccumulator() if epoch == epochs and val_loader is not None else None
             if val_loader is not None:
                 model.eval()
                 total_val_loss = 0.0
@@ -216,10 +214,6 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                         predictions = logits.argmax(dim=1)
                         indices = masks[valid_pixels] * num_classes + predictions[valid_pixels]
                         val_confusion += torch.bincount(indices, minlength=num_classes * num_classes).reshape(num_classes, num_classes)
-                        if final_curve is not None:
-                            probabilities = logits.softmax(dim=1).permute(0, 2, 3, 1)[valid_pixels].cpu()
-                            labels = torch.nn.functional.one_hot(masks[valid_pixels].cpu(), num_classes).bool()
-                            final_curve.update(probabilities, labels, int(valid_pixels.sum().item()))
                         val_batches += 1
                 val_loss = total_val_loss / max(val_batches, 1)
                 val_pixel_accuracy, val_mean_iou, val_dice = _segmentation_scores(val_confusion)
@@ -240,22 +234,6 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                 "lr": optimizer.param_groups[0]["lr"],
             }
             append_csv_row(metrics_path, row)
-            if epoch == epochs and val_loader is not None:
-                class_names = list((config.get("dataset_metadata") or {}).get("classes") or [])
-                if len(class_names) == num_classes - 1:
-                    class_names.insert(0, "background")
-                if len(class_names) != num_classes:
-                    class_names = [f"Class {index}" for index in range(num_classes)]
-                write_evaluation_artifact(
-                    results_dir,
-                    {
-                        "taskType": "segmentation",
-                        "modelType": "deeplabv3plus",
-                        "confusionMatrix": confusion_dict(val_confusion, class_names),
-                        "curves": [final_curve.as_dict("pixels", "Pixels")],
-                        "perClass": segmentation_classes(val_confusion, class_names),
-                    },
-                )
             if scheduler is not None:
                 scheduler.step()
             self._write_log(log_path, format_epoch_metrics("deeplabv3plus", epoch, epochs, row))

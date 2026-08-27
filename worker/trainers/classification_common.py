@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .evaluation_artifacts import CurveAccumulator, confusion_dict, write_evaluation_artifact
 from .trainer_utils import (
     append_csv_row,
     format_epoch_metrics,
@@ -330,8 +329,6 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
         val_loss = 0.0
         val_correct = 0
         val_total = 0
-        final_confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64)
-        final_curve = CurveAccumulator() if epoch == epochs and val_loader is not None else None
         if val_loader is not None:
             model.eval()
             with torch.no_grad():
@@ -344,16 +341,6 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
                     predictions = outputs.argmax(dim=1)
                     val_correct += int((predictions == labels).sum().item())
                     val_total += labels.size(0)
-                    if final_curve is not None:
-                        cpu_labels = labels.cpu()
-                        cpu_predictions = predictions.cpu()
-                        final_confusion += torch.bincount(
-                            cpu_labels * num_classes + cpu_predictions,
-                            minlength=num_classes * num_classes,
-                        ).reshape(num_classes, num_classes)
-                        probabilities = outputs.softmax(dim=1).cpu()
-                        positives = torch.nn.functional.one_hot(cpu_labels, num_classes).bool()
-                        final_curve.update(probabilities, positives, labels.size(0))
         if scheduler is not None:
             scheduler.step()
 
@@ -373,17 +360,6 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
         }
         append_csv_row(metrics_path, row)
         logger(log_path, format_epoch_metrics(family, epoch, epochs, row))
-        if final_curve is not None:
-            write_evaluation_artifact(
-                results_dir,
-                {
-                    "taskType": "image_classification",
-                    "modelType": family,
-                    "confusionMatrix": confusion_dict(final_confusion, list(train_dataset.classes)),
-                    "curves": [final_curve.as_dict("classification", "Micro average")],
-                    "perClass": [],
-                },
-            )
 
         if monitored_accuracy >= best_score:
             best_score = monitored_accuracy
