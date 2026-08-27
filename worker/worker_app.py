@@ -6,6 +6,7 @@ import time
 import traceback
 from pathlib import Path
 
+from error_utils import concise_error
 from rq import get_current_job
 from security_utils import contained_path, validate_slug
 from trainers.trainer_utils import runs_root
@@ -108,8 +109,14 @@ def run_training(config: dict) -> dict:
         _persist_status(job.id if job else config.get("job_id"), "completed", run_id=run_id)
         log(f"[Worker] Training completed: {result}")
         return result
-    except Exception:
-        error_detail = traceback.format_exc()
-        _persist_status(job.id if job else config.get("job_id"), "failed", error_detail[-8000:], run_id=run_id)
-        log(f"[Worker] FAILED:\n{error_detail}")
+    except Exception as exc:
+        error_detail = concise_error(exc)
+        technical_detail = traceback.format_exc()
+        try:
+            (log_dir / "error.log").write_text(technical_detail[-65536:], encoding="utf-8")
+        except OSError as write_error:
+            print(f"[Worker] Could not save error.log: {write_error}", flush=True)
+        _persist_status(job.id if job else config.get("job_id"), "failed", error_detail, run_id=run_id)
+        log(f"[Worker] FAILED: {error_detail}")
+        log("[Worker] Full technical traceback saved to error.log.")
         raise

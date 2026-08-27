@@ -60,12 +60,137 @@ from dataset_utils import compatible_models_for_metadata, inspect_dataset, inspe
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
-from worker.trainers.trainer_utils import require_positive_batch_size, split_image_dir
+from worker.trainers.detection_common import _evaluate_detection_metrics
+from worker.trainers.deeplabv3plus_trainer import _segmentation_scores
+from worker.trainers.evaluation_artifacts import CurveAccumulator, confusion_dict, segmentation_classes
+from worker.trainers.trainer_utils import format_epoch_metrics, require_positive_batch_size, split_image_dir
+from worker.trainers.yolo_trainer import _format_epoch_log
+from worker.error_utils import concise_error
 from model_catalog import get_catalog
 from services.training_service import TrainingService
 
 
 class TrainerLogicTests(unittest.TestCase):
+    def test_bounded_evaluation_artifacts(self):
+        import torch
+
+        curve = CurveAccumulator(3)
+        curve.update([0.9, 0.8, 0.2], [True, False, True], positive_count=2)
+        result = curve.as_dict("box", "Bounding boxes")
+        self.assertEqual(result["thresholds"], [0.0, 0.5, 1.0])
+        self.assertAlmostEqual(result["precision"][1], 0.5)
+        self.assertAlmostEqual(result["recall"][1], 0.5)
+
+        matrix = torch.tensor([[4, 1], [2, 3]])
+        self.assertEqual(confusion_dict(matrix, ["a", "b"])["values"], [[4, 1], [2, 3]])
+        self.assertAlmostEqual(segmentation_classes(matrix, ["a", "b"])[0]["iou"], 4 / 7, places=6)
+
+    def test_epoch_log_uses_the_results_row(self):
+        row = {
+            "epoch": 2,
+            "train/loss": 1.23456,
+            "val/loss": "",
+            "metrics/mAP50(B)": 0.87654,
+            "lr": 0.00001,
+        }
+        self.assertEqual(
+            format_epoch_metrics("faster_rcnn", 2, 10, row),
+            "[faster_rcnn] epoch=2/10 train/loss=1.2346 metrics/mAP50(B)=0.8765 lr=1e-05",
+        )
+
+    def test_non_yolo_quality_metrics(self):
+        import torch
+
+        class PerfectDetector:
+            def eval(self):
+                return self
+
+            def __call__(self, images):
+                return [{
+                    "boxes": torch.tensor([[1.0, 1.0, 5.0, 5.0]]),
+                    "labels": torch.tensor([1]),
+                    "scores": torch.tensor([0.99]),
+                } for _image in images]
+
+        target = {
+            "boxes": torch.tensor([[1.0, 1.0, 5.0, 5.0]]),
+            "labels": torch.tensor([1]),
+            "image_id": torch.tensor([1]),
+            "iscrowd": torch.tensor([0]),
+        }
+        artifacts = {}
+        metrics = _evaluate_detection_metrics(
+            PerfectDetector(), [([torch.zeros(3, 8, 8)], [target])], torch.device("cpu"), 2, False,
+            artifacts=artifacts, class_names=["object"],
+        )
+        self.assertAlmostEqual(metrics["metrics/precision(B)"], 1.0)
+        self.assertAlmostEqual(metrics["metrics/recall(B)"], 1.0)
+        self.assertGreater(metrics["metrics/mAP50(B)"], 0.99)
+        self.assertEqual(artifacts["confusionMatrix"]["values"][1][1], 1)
+        self.assertGreater(max(artifacts["curves"][0]["f1"]), 0.99)
+
+        class PerfectMaskDetector(PerfectDetector):
+            def __call__(self, images):
+                mask = torch.zeros((1, 1, 8, 8))
+                mask[:, :, 1:5, 1:5] = 1
+                return [{**output, "masks": mask} for output in super().__call__(images)]
+
+        mask = torch.zeros((1, 8, 8), dtype=torch.uint8)
+        mask[:, 1:5, 1:5] = 1
+        mask_artifacts = {}
+        mask_metrics = _evaluate_detection_metrics(
+            PerfectMaskDetector(),
+            [([torch.zeros(3, 8, 8)], [{**target, "masks": mask}])],
+            torch.device("cpu"),
+            2,
+            True,
+            artifacts=mask_artifacts,
+            class_names=["object"],
+        )
+        self.assertGreater(mask_metrics["metrics/mAP50(M)"], 0.99)
+        self.assertGreater(max(mask_artifacts["curves"][1]["f1"]), 0.99)
+
+        accuracy, mean_iou, dice = _segmentation_scores(torch.tensor([[8, 1], [1, 10]]))
+        self.assertAlmostEqual(accuracy, 0.9)
+        self.assertGreater(mean_iou, 0.81)
+        self.assertGreater(dice, 0.89)
+
+    def test_yolo_epoch_log_contains_readable_metrics(self):
+        class Trainer:
+            epoch = 1
+            epochs = 5
+            tloss = object()
+            metrics = {
+                "metrics/precision(B)": 0.830251,
+                "metrics/mAP50(B)": 0.89618,
+                "fitness": 0.75,
+            }
+
+            @staticmethod
+            def label_loss_items(_loss, prefix="train"):
+                return {f"{prefix}/box_loss": 1.251791}
+
+        message = _format_epoch_log(Trainer())
+
+        self.assertEqual(
+            message,
+            "[YOLO] epoch=2/5 train/box_loss=1.2518 "
+            "metrics/precision(B)=0.8303 metrics/mAP50(B)=0.8962",
+        )
+
+    def test_concise_error_keeps_root_cause_without_traceback(self):
+        error = TypeError(
+            "Caught TypeError in DataLoader worker process 0.\n"
+            "Original Traceback (most recent call last):\n"
+            'File "/app/train.py", line 10, in load\n'
+            "ValueError: Mask bad.png contains class IDs outside 0..1: [2]"
+        )
+
+        message = concise_error(error)
+
+        self.assertEqual(message, "ValueError: Mask bad.png contains class IDs outside 0..1: [2]")
+        self.assertNotIn("Traceback", message)
+
     def test_classification_batch_size_uses_model_family(self):
         self.assertEqual(_batch_size_for({"batch_size": 4}, {}, "resnet"), 4)
 

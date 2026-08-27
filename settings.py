@@ -19,9 +19,11 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 BACKEND_INTERNAL_TOKEN = os.getenv("BACKEND_INTERNAL_TOKEN", "")
 CORS_ORIGINS = [
     origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
     if origin.strip()
 ]
+if "*" in CORS_ORIGINS:
+    raise RuntimeError("CORS_ORIGINS must list explicit origins; wildcard '*' is not allowed")
 
 
 def ensure_runtime_dirs() -> None:

@@ -7,3 +7,7 @@ python-multipart
 redis
 rq
 psycopg[binary]
+
+# torch / torchvision are installed separately in the Dockerfile from the
+# CPU-only wheel index (see the comment there). Do not add them here or pip
+# will pull the multi-gigabyte CUDA build from PyPI.

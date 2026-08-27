@@ -6,6 +6,7 @@ from unittest.mock import patch
 from resource_guard import (
     ResourcePlanError,
     enforce_resource_plan,
+    estimate_training_memory,
     get_resource_profile,
     validate_resource_plan,
 )
@@ -89,6 +90,23 @@ class ResourceGuardTests(unittest.TestCase):
         self.assertTrue(plan["ok"])
         self.assertEqual(plan["normalized_params"]["workers"], 4)
         self.assertTrue(plan["warnings"])
+
+    def test_detection_estimate_calibration_preserved_at_defaults(self):
+        # The max_size term must leave the 640x1333 default unchanged.
+        self.assertEqual(
+            estimate_training_memory("faster_rcnn", {"image_size": 640, "max_size": 1333}, 2),
+            6100,
+        )
+        self.assertEqual(
+            estimate_training_memory("mask_rcnn", {"image_size": 640, "max_size": 1333}, 2),
+            6900,
+        )
+
+    def test_detection_estimate_responds_to_max_size(self):
+        # A wider long-side cap must now raise the estimate (previously ignored).
+        narrow = estimate_training_memory("faster_rcnn", {"image_size": 640, "max_size": 1333}, 4)
+        wide = estimate_training_memory("faster_rcnn", {"image_size": 640, "max_size": 1600}, 4)
+        self.assertGreater(wide, narrow)
 
     def test_estimated_vram_above_safe_limit_is_rejected(self):
         plan = validate_resource_plan(

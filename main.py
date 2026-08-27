@@ -4,11 +4,12 @@ import asyncio
 import json
 import shutil
 import time
+import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
@@ -21,12 +22,30 @@ from dataset_utils import (
     format_bytes,
     inspect_dataset,
     inspect_dataset_for_upload,
+    normalize_dataset_metadata,
     safe_dataset_name,
     validate_dataset_for_upload,
 )
 from dataset_storage import dataset_lock_name, owner_dataset_path, registered_storage_path
+from inference_service import (
+    MAX_INFERENCE_IMAGE_BYTES,
+    InferenceError,
+    InferenceUnavailable,
+    RateLimitExceeded,
+    check_rate_limit,
+    predict_image,
+)
+from detection_inference import DETECTION_TASK_TYPE, predict_detection
+from segmentation_inference import SEGMENTATION_TASK_TYPE, predict_segmentation
 from model_catalog import get_catalog, get_model, validate_model_params
-from resource_guard import ResourcePlanError, enforce_resource_plan, get_resource_profile
+from run_comparison import build_run_comparison, summarise_comparison
+from run_insights import analyse_run, compare_insights
+from resource_guard import (
+    ResourcePlanError,
+    enforce_resource_plan,
+    get_resource_profile,
+    validate_resource_plan,
+)
 from security_utils import (
     contained_path,
     named_file_lock,
@@ -106,6 +125,15 @@ class TaskDraftRequest(BaseModel):
     batch_size: int = Field(ge=1, le=256)
     params: dict[str, Any] = Field(default_factory=dict)
     device_selection: str = Field(default="auto", pattern="^(auto|manual)$")
+
+    class Config:
+        extra = "forbid"
+
+
+class ResourcePlanPreviewRequest(BaseModel):
+    model_type: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    batch_size: int = Field(default=16, ge=1, le=256)
 
     class Config:
         extra = "forbid"
@@ -290,6 +318,7 @@ def _flatten_single_root_folder(target_dir: Path) -> None:
 
 
 def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
+    metadata = normalize_dataset_metadata(metadata)
     workflow = dataset_workflow_metadata(metadata, get_catalog())
     ready_models = [model for model in workflow.get("compatible_models", []) if model.get("ready")]
     return {
@@ -318,7 +347,7 @@ def _dataset_metadata_is_current(metadata: Any) -> bool:
     required = {"formats", "tasks", "classes", "image_count", "size_bytes", "warnings", "errors"}
     return (
         isinstance(metadata, dict)
-        and metadata.get("metadata_version") == DATASET_METADATA_VERSION
+        and metadata.get("metadata_version") in {1, DATASET_METADATA_VERSION}
         and required.issubset(metadata)
     )
 
@@ -465,6 +494,48 @@ def resource_profile():
     return get_resource_profile()
 
 
+def _resource_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
+    """Surface the numbers resource_guard already computed, for display only.
+
+    This does not re-derive anything: `estimated_vram_mb` and `safe_vram_mb`
+    come straight from the plan. `isWithinLimit` mirrors the same comparison
+    resource_guard uses internally (CPU runs have no VRAM budget, so they are
+    always within limit).
+    """
+    estimated = int(plan.get("estimated_vram_mb", 0) or 0)
+    safe_limit = int(plan.get("safe_vram_mb", 0) or 0)
+    is_cpu = str(plan.get("device", "")).startswith("cpu")
+    return {
+        "estimatedVramMb": estimated,
+        "safeLimitMb": safe_limit,
+        "isWithinLimit": True if is_cpu else estimated <= safe_limit,
+        "device": plan.get("device"),
+        "batchSize": plan.get("batch_size"),
+        "warnings": plan.get("warnings", []),
+        "errors": plan.get("errors", []),
+        "suggestions": plan.get("suggestions", []),
+    }
+
+
+@app.post("/api/resource-plan/preview")
+def preview_resource_plan(payload: ResourcePlanPreviewRequest, request: Request):
+    """Read-only preview of the memory plan for a draft configuration.
+
+    Uses validate_resource_plan (not enforce_*) so an over-budget config is
+    reported instead of rejected. The training path keeps using
+    enforce_resource_plan unchanged.
+    """
+    _require_request_user_id(request)
+    if get_model(payload.model_type) is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported model_type: {payload.model_type}")
+    plan = validate_resource_plan(
+        payload.model_type,
+        params=dict(payload.params or {}),
+        batch_size=payload.batch_size,
+    )
+    return {"status": "success", "ok": plan["ok"], **_resource_plan_summary(plan)}
+
+
 @app.post("/api/train")
 def start_train(train_request: TrainRequest, request: Request):
     return _start_train_request(train_request, request)
@@ -521,7 +592,12 @@ def _start_train_request(train_request: TrainRequest, request: Request, task_id:
             owner_email=_request_user_email(request),
             task_id=task_id,
         )
-        return {"status": "success", "job_id": job_id, "container_id": job_id}
+        return {
+            "status": "success",
+            "job_id": job_id,
+            "container_id": job_id,
+            "resourcePlan": _resource_plan_summary(resource_plan),
+        }
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     except FileNotFoundError as exc:
@@ -561,7 +637,16 @@ def get_metrics(project_name: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not metrics:
         return {"status": "no_data", "metrics": []}
-    return {"status": "success", "metrics": metrics}
+    # Plain-language, rule-based insights over the numbers already in the CSV
+    # (and the test evaluation, if the run wrote one). Read-only; never fails
+    # the metrics response.
+    config = _read_json_file(contained_path(RUNS_DIR, project_name, "job_config.json"))
+    test_eval = _read_json_file(contained_path(RUNS_DIR, project_name, "test_evaluation.json"))
+    try:
+        analysis = analyse_run(metrics, str(config.get("task_type") or ""), test_eval or None)
+    except Exception:
+        analysis = {"metric": None, "insights": []}
+    return {"status": "success", "metrics": metrics, "insights": analysis["insights"]}
 
 
 @app.post("/api/stop/{job_id}")
@@ -655,9 +740,9 @@ def list_datasets(request: Request):
                 stored_metadata = json.loads(stored_metadata)
             except json.JSONDecodeError:
                 stored_metadata = None
-        metadata_is_current = _dataset_metadata_is_current(stored_metadata)
-        metadata = dict(stored_metadata) if metadata_is_current else inspect_dataset(item)
-        if record and not metadata_is_current:
+        metadata_is_usable = _dataset_metadata_is_current(stored_metadata)
+        metadata = normalize_dataset_metadata(stored_metadata) if metadata_is_usable else inspect_dataset(item)
+        if record and metadata != stored_metadata:
             resource_repository.update_dataset_metadata(record["id"], metadata)
         metadata["export_cache"] = export_cache_metadata(item)
         profile = _dataset_profile(metadata)
@@ -974,6 +1059,90 @@ def delete_run(project_name: str, request: Request):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _run_record_for_predict(project_name: str, request: Request) -> dict[str, Any] | None:
+    """Resolve a run the caller owns, or raise the appropriate HTTP error."""
+    validate_slug(project_name, "project name")
+    _assert_run_visible(project_name, request)
+    if not resource_repository.enabled:
+        return None
+    record = resource_repository.get_run(_require_request_user_id(request), project_name)
+    if not record:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return record
+
+
+@app.post("/api/runs/{project_name}/predict")
+async def predict_run(
+    project_name: str,
+    request: Request,
+    file: UploadFile = File(...),
+    threshold: float | None = Form(None),
+):
+    """Run one uploaded image through a completed run's trained model.
+
+    Supports image classification (top-k labels), object detection (bounding
+    boxes), and segmentation (semantic or instance mask overlay).
+    """
+    owner_id = _require_request_user_id(request)
+    try:
+        record = _run_record_for_predict(project_name, request)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    config = _read_json_file(contained_path(RUNS_DIR, project_name, "job_config.json"))
+    task_type = str((record or {}).get("task_type") or config.get("task_type") or "")
+    model_type = str((record or {}).get("model_type") or config.get("model_type") or "")
+    status = str((record or {}).get("status") or "")
+
+    if task_type not in ("image_classification", DETECTION_TASK_TYPE, SEGMENTATION_TASK_TYPE):
+        raise HTTPException(
+            status_code=400,
+            detail="Model testing supports image classification, object detection, and segmentation runs only.",
+        )
+    if record is not None and status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"This run is '{status or 'unknown'}'. Only completed runs can be tested.",
+        )
+
+    try:
+        check_rate_limit(owner_id)
+    except RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+    # Read with a hard cap so an oversized upload cannot be buffered in full.
+    payload = await file.read(MAX_INFERENCE_IMAGE_BYTES + 1)
+    if len(payload) > MAX_INFERENCE_IMAGE_BYTES:
+        limit_mb = MAX_INFERENCE_IMAGE_BYTES / 1024 / 1024
+        raise HTTPException(status_code=400, detail=f"The image is larger than the {limit_mb:.0f} MB limit.")
+
+    run_dir = contained_path(RUNS_DIR, project_name)
+    if not run_dir.is_dir():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    try:
+        # Runs off the event loop: loading a checkpoint and the forward pass are
+        # both blocking CPU work.
+        if task_type == DETECTION_TASK_TYPE:
+            result = await asyncio.to_thread(
+                predict_detection, run_dir, payload, model_type, threshold
+            )
+        elif task_type == SEGMENTATION_TASK_TYPE:
+            result = await asyncio.to_thread(
+                predict_segmentation, run_dir, payload, model_type, threshold
+            )
+        else:
+            result = await asyncio.to_thread(predict_image, run_dir, payload)
+    except InferenceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except InferenceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
+
+    return {"status": "success", "runSlug": project_name, "taskType": task_type, **result}
+
+
 @app.get("/api/runs/{project_name}/files/{file_path:path}")
 def download_run_file(project_name: str, file_path: str, request: Request):
     try:
@@ -1055,6 +1224,71 @@ def admin_delete_user_resources(user_id: str, request: Request):
         raise HTTPException(status_code=500, detail=" ".join(errors))
     resource_repository.finalize_user_resource_delete(user_id)
     return {"status": "success", "datasets": len(datasets), "runs": len(runs)}
+
+
+MIN_COMPARE_RUNS = 2
+MAX_COMPARE_RUNS = 4
+
+
+@app.get("/api/datasets/{dataset_slug}/runs/compare")
+def compare_dataset_runs(dataset_slug: str, run_ids: str, request: Request):
+    """Overlay metric series for 2-4 runs trained on the same dataset.
+
+    Runs are addressed by training_tasks id. Ownership is enforced by scoping
+    every lookup to the caller, so a run belonging to someone else is reported
+    as not found rather than acknowledged.
+    """
+    owner_id = _require_request_user_id(request)
+    try:
+        validate_slug(dataset_slug, "dataset name")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    requested = [value.strip() for value in run_ids.split(",") if value.strip()]
+    # Preserve the caller's order while dropping duplicates.
+    unique_ids = list(dict.fromkeys(requested))
+    if len(unique_ids) < MIN_COMPARE_RUNS or len(unique_ids) > MAX_COMPARE_RUNS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Select between {MIN_COMPARE_RUNS} and {MAX_COMPARE_RUNS} runs to compare.",
+        )
+    if not resource_repository.enabled:
+        raise HTTPException(status_code=503, detail="Run comparison requires the resource database.")
+
+    runs: list[dict[str, Any]] = []
+    for run_id in unique_ids:
+        # training_tasks.id is a uuid column, so a malformed id would otherwise
+        # surface as a database error rather than a client error.
+        try:
+            uuid.UUID(run_id)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' was not found.")
+        row = resource_repository.get_task(owner_id, run_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Run '{run_id}' was not found.")
+        if not row.get("run_slug"):
+            raise HTTPException(status_code=400, detail="A selected task has not been trained yet.")
+        if str(row.get("dataset_slug") or "") != dataset_slug:
+            raise HTTPException(
+                status_code=400,
+                detail="All selected runs must come from the same dataset.",
+            )
+
+        run_slug = str(row["run_slug"])
+        try:
+            metric_rows = training_service.get_training_metrics(run_slug)
+            config = _read_json_file(contained_path(RUNS_DIR, run_slug, "job_config.json"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        runs.append(build_run_comparison(task_row=row, metric_rows=metric_rows, config=config))
+
+    return {
+        "status": "success",
+        "datasetSlug": dataset_slug,
+        "runs": runs,
+        "insights": compare_insights(runs),
+        **summarise_comparison(runs),
+    }
 
 
 @app.get("/api/datasets/{dataset_name}/metadata")

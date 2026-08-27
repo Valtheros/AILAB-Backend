@@ -409,7 +409,7 @@ DATASET_INTERFACES = {
         "dataset_task": "object_detection",
         "required_annotations": ["bounding boxes"],
         "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
-        "accepted_canonical_formats": ["object_detection_boxes", "coco_segmentation"],
+        "accepted_canonical_formats": ["object_detection_boxes"],
         "canonical_format": "object_detection_boxes",
         "conversion_targets": ["coco_instances", "yolo_detection"],
         "train_export_format": "coco_instances_or_yolo_detection",

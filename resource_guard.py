@@ -333,8 +333,14 @@ def estimate_training_memory(model_type: str, params: dict[str, Any], batch_size
         return int(1800 + batch_size * (imgsz / 640) ** 2 * factor)
     if model_type in {"faster_rcnn", "mask_rcnn"}:
         image_size = _int(params, "image_size", 640)
+        max_size = _int(params, "max_size", 1333)
         factor = 1800 if model_type == "faster_rcnn" else 2200
-        return int(2500 + batch_size * (image_size / 640) ** 2 * factor)
+        # Activation memory scales with the resized image area, which depends on
+        # BOTH the short side (min_size) and the long-side cap (max_size), not
+        # the short side alone. The factor is calibrated at the 640x1333 default,
+        # so this equals the previous short-side-only estimate there while now
+        # responding to a wider long-side cap.
+        return int(2500 + batch_size * (image_size / 640) * (max_size / 1333) * factor)
     if model_type == "deeplabv3plus":
         image_size = _int(params, "image_size", 512)
         return int(2000 + batch_size * (image_size / 512) ** 2 * 2100)

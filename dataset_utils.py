@@ -18,7 +18,7 @@ from security_utils import named_file_lock, replace_directory
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MASK_EXTENSIONS = {".png", ".bmp", ".tif", ".tiff"}
-DATASET_METADATA_VERSION = 1
+DATASET_METADATA_VERSION = 2
 EXPORTS_DIR_NAME = ".ailab_exports"
 SOURCE_FINGERPRINT_SKIP_FILES = {".ailab_dataset.json"}
 TRAINABLE_FORMATS = {
@@ -886,14 +886,21 @@ def _inspect_coco_files(dataset_dir: Path, sample_records: int | None = None) ->
     return stats
 
 
+def _has_complete_coco_masks(coco: dict[str, Any]) -> bool:
+    return bool(
+        coco.get("mask_annotations", 0)
+        and not coco.get("invalid_segmentations", 0)
+        and not coco.get("missing_segmentations", 0)
+        and not coco.get("errors")
+    )
+
+
 def _has_coco_semantic_masks(metadata: dict[str, Any]) -> bool:
     coco = metadata.get("coco", {})
     return bool(
         coco.get("polygon_mask_annotations", 0)
         and not coco.get("rle_mask_annotations", 0)
-        and not coco.get("invalid_segmentations", 0)
-        and not coco.get("missing_segmentations", 0)
-        and not coco.get("errors")
+        and _has_complete_coco_masks(coco)
     )
 
 
@@ -1020,15 +1027,10 @@ def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> di
         preview = ", ".join(semantic_stats["missing_masks"][:5])
         errors.append(f"Semantic masks are missing for {len(semantic_stats['missing_masks'])} images: {preview}")
     errors.extend(semantic_stats.get("errors", []))
-    has_reliable_coco_masks = (
-        coco_stats["mask_annotations"] > 0
-        and not coco_stats.get("invalid_segmentations")
-        and not coco_stats.get("missing_segmentations")
-        and not coco_stats.get("errors")
-    )
+    has_reliable_coco_masks = _has_complete_coco_masks(coco_stats)
     if coco_stats["box_annotations"] or coco_stats["mask_annotations"]:
         formats.append("coco_instances")
-        if coco_stats["box_annotations"]:
+        if coco_stats["box_annotations"] and not has_reliable_coco_masks:
             tasks.append("object_detection")
         if has_reliable_coco_masks:
             tasks.append("segmentation")
@@ -1129,16 +1131,34 @@ def _dataset_tasks_from_metadata(metadata: dict[str, Any]) -> list[str]:
     formats = set(metadata.get("formats", []))
     dataset_tasks: list[str] = []
     coco = metadata.get("coco", {})
+    has_complete_coco_masks = _has_complete_coco_masks(coco)
 
     if "imagefolder" in formats:
         dataset_tasks.append("image_classification")
-    if "yolo_detection" in formats or coco.get("box_annotations", 0) > 0:
+    if "yolo_detection" in formats or (coco.get("box_annotations", 0) > 0 and not has_complete_coco_masks):
         dataset_tasks.append("object_detection")
     if "semantic_masks" in formats or _has_coco_semantic_masks(metadata):
         dataset_tasks.append("semantic_segmentation")
-    if coco.get("mask_annotations", 0) > 0 and not coco.get("invalid_segmentations", 0):
+    if has_complete_coco_masks:
         dataset_tasks.append("instance_segmentation")
     return list(dict.fromkeys(dataset_tasks))
+
+
+def normalize_dataset_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Upgrade derived task labels without rescanning dataset files."""
+    normalized = dict(metadata)
+    formats = set(normalized.get("formats", []))
+    coco = normalized.get("coco", {})
+    tasks: list[str] = []
+    if "imagefolder" in formats:
+        tasks.append("image_classification")
+    if "yolo_detection" in formats or (coco.get("box_annotations", 0) > 0 and not _has_complete_coco_masks(coco)):
+        tasks.append("object_detection")
+    if {"semantic_masks", "yolo_segmentation"}.intersection(formats) or _has_complete_coco_masks(coco):
+        tasks.append("segmentation")
+    normalized["tasks"] = tasks
+    normalized["metadata_version"] = DATASET_METADATA_VERSION
+    return normalized
 
 
 def _canonical_task_from_metadata(metadata: dict[str, Any]) -> str:
@@ -1166,7 +1186,7 @@ def _canonical_format_from_metadata(metadata: dict[str, Any]) -> str:
         return "imagefolder"
     if "semantic_masks" in formats:
         return "semantic_masks"
-    if coco.get("mask_annotations", 0) > 0 and not coco.get("invalid_segmentations", 0):
+    if _has_complete_coco_masks(coco):
         return "coco_segmentation"
     if "yolo_detection" in formats or coco.get("box_annotations", 0) > 0:
         return "object_detection_boxes"
@@ -1204,10 +1224,7 @@ def _model_compatibility_reason(model_id: str, metadata: dict[str, Any], task_id
         coco = metadata.get("coco", {})
         ok = (
             "coco_instances" in formats
-            and coco.get("mask_annotations", 0) > 0
-            and not coco.get("invalid_segmentations", 0)
-            and not coco.get("missing_segmentations", 0)
-            and not coco.get("errors")
+            and _has_complete_coco_masks(coco)
         )
         return ok, "Requires COCO instance masks, not box-only annotations."
     if model_id == "deeplabv3plus":
@@ -1272,6 +1289,7 @@ def export_cache_metadata(dataset_dir: Path) -> list[dict[str, Any]]:
 
 
 def dataset_workflow_metadata(metadata: dict[str, Any], catalog: dict[str, Any] | None = None) -> dict[str, Any]:
+    metadata = normalize_dataset_metadata(metadata)
     dataset_tasks = _dataset_tasks_from_metadata(metadata)
     workflow = {
         "source_format": _source_format_from_metadata(metadata),
@@ -1781,7 +1799,7 @@ def prepare_dataset_for_model(dataset_dir: Path, model_type: str, extra_args: di
                 fingerprint=fingerprint,
                 warnings=warnings,
             )
-        if metadata.get("coco", {}).get("box_annotations", 0) > 0:
+        if metadata.get("coco", {}).get("box_annotations", 0) > 0 and "object_detection" in metadata.get("tasks", []):
             if model_type == "faster_rcnn":
                 return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "coco_instances")
             export_root, cache_hit, fingerprint, warnings = _cached_generated_export(
