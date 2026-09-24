@@ -20,7 +20,14 @@ except ImportError:  # Lightweight unit-test stubs do not expose rq.exceptions.
     class NoSuchJobError(Exception):
         pass
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model
+from dataset_utils import (
+    compatible_models_for_metadata,
+    enrich_ailab_label_metadata,
+    inspect_dataset,
+    model_args_for_dataset,
+    normalize_dataset_metadata,
+    prepare_dataset_for_model,
+)
 from dataset_storage import registered_storage_path
 from model_catalog import get_model
 from security_utils import contained_path, validate_slug
@@ -149,8 +156,9 @@ class TrainingService:
         model_type: str,
         task_type: str,
         extra_args: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        metadata = inspect_dataset(dataset_path)
+        metadata = metadata or inspect_dataset(dataset_path)
         detected_formats = set(metadata["formats"])
         model_entry = get_model(model_type)
         extra_args = extra_args or {}
@@ -248,8 +256,25 @@ class TrainingService:
                 if resource_repository.enabled and not dataset_record:
                     raise FileNotFoundError(f"Dataset '{selected_name}' is not registered. Run the resource backfill first.")
                 dataset_record = dataset_record or {"id": selected_name, "slug": selected_name}
-                self._assert_dataset_matches_model(dataset_path, model_type, task_type, extra_args=extra_args or {})
-                prepared_dataset = prepare_dataset_for_model(dataset_path, model_type, extra_args=extra_args or {})
+                stored_metadata = dataset_record.get("metadata")
+                if isinstance(stored_metadata, str):
+                    try:
+                        stored_metadata = json.loads(stored_metadata)
+                    except json.JSONDecodeError:
+                        stored_metadata = None
+                dataset_metadata = (
+                    normalize_dataset_metadata(stored_metadata)
+                    if isinstance(stored_metadata, dict) and stored_metadata.get("formats")
+                    else inspect_dataset(dataset_path)
+                )
+                dataset_metadata = enrich_ailab_label_metadata(dataset_path, dataset_metadata)
+                resolved_args = model_args_for_dataset(dataset_metadata, model_type, extra_args)
+                self._assert_dataset_matches_model(
+                    dataset_path, model_type, task_type, extra_args=resolved_args, metadata=dataset_metadata
+                )
+                prepared_dataset = prepare_dataset_for_model(
+                    dataset_path, model_type, extra_args=resolved_args, metadata=dataset_metadata
+                )
                 dataset_metadata = prepared_dataset["metadata"]
                 worker_dataset_path = Path(prepared_dataset["dataset_path"])
                 data_yaml_path = prepared_dataset.get("data_yaml_path")
@@ -260,7 +285,7 @@ class TrainingService:
                     "dataset_name": dataset_path.name, "dataset_path": str(worker_dataset_path),
                     "source_dataset_path": str(dataset_path), "data_yaml_path": data_yaml_path,
                     "dataset_metadata": dataset_metadata, "dataset_export": prepared_dataset.get("export"),
-                    "extra_args": extra_args or {}, "resource_plan": resource_plan or {},
+                    "extra_args": resolved_args, "resource_plan": resource_plan or {},
                     "created_by": owner_id, "created_by_email": owner_email,
                 }
                 if model_type == "yolo":
@@ -270,13 +295,13 @@ class TrainingService:
                 if task_id:
                     run_record = resource_repository.activate_task(
                         owner_id=owner_id, task_id=task_id, dataset=dataset_record, run_slug=project_name,
-                        task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
+                        task_type=task_type, model_type=model_type, model_name=model_name, params=resolved_args,
                         storage_path=project_dir, job_id=planned_job_id, connection=connection,
                     )
                 else:
                     run_record = resource_repository.create_run(
                         owner_id=owner_id, owner_email=owner_email, dataset=dataset_record, project_name=project_name,
-                        task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
+                        task_type=task_type, model_type=model_type, model_name=model_name, params=resolved_args,
                         storage_path=project_dir, job_id=planned_job_id, connection=connection,
                     )
                 project_dir.mkdir(parents=False, exist_ok=False)

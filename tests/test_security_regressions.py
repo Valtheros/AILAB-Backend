@@ -41,6 +41,9 @@ def _install_optional_dependency_stubs() -> None:
             def patch(self, *_args, **_kwargs):
                 return lambda fn: fn
 
+            def put(self, *_args, **_kwargs):
+                return lambda fn: fn
+
             def delete(self, *_args, **_kwargs):
                 return lambda fn: fn
 
@@ -80,6 +83,7 @@ from fastapi import HTTPException
 import dataset_utils
 from dataset_utils import inspect_dataset, validate_dataset_for_upload
 from main import _assert_owned_resource_visible, _dataset_metadata_is_current, _flatten_single_root_folder, _model_name_from_request, _require_request_user_id, _task_response
+from resource_repository import resource_repository
 from services.training_service import TrainingService
 from worker.trainers import input_limits
 from worker.trainers.input_limits import iter_text_lines_limited, validate_coco_segmentation
@@ -225,6 +229,9 @@ class SecurityRegressionTests(unittest.TestCase):
         _assert_owned_resource_visible("user-a", request)
 
     def test_training_service_filters_ownerless_datasets_and_runs(self):
+        original_database_url = resource_repository.database_url
+        resource_repository.database_url = ""
+        self.addCleanup(setattr, resource_repository, "database_url", original_database_url)
         service = TrainingService.__new__(TrainingService)
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

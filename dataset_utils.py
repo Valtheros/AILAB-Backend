@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import json
 import os
 import hashlib
@@ -423,63 +422,6 @@ def _matching_mask_path(masks_dir: Path, image_path: Path) -> Path | None:
     return None
 
 
-def _roboflow_semantic_pairs(split_dir: Path) -> list[tuple[Path, Path]]:
-    if not (split_dir / "_classes.csv").is_file():
-        return []
-    files = [path for path in split_dir.iterdir() if path.is_file()]
-    masks = [path for path in files if path.suffix.lower() == ".png"]
-    images = [
-        path
-        for path in files
-        if path.suffix.lower() in IMAGE_EXTENSIONS and not path.stem.lower().endswith("_mask")
-    ]
-    pairs: list[tuple[Path, Path]] = []
-    for image_path in images:
-        candidates = [
-            split_dir / f"{image_path.stem}_mask.png",
-            split_dir / f"{image_path.stem}.png",
-        ]
-        mask_path = next(
-            (candidate for candidate in candidates if candidate != image_path and candidate.is_file()),
-            None,
-        )
-        if mask_path is not None:
-            pairs.append((image_path, mask_path))
-
-    # Roboflow's reference loader pairs sorted JPG images and PNG masks by position.
-    if not pairs:
-        source_images = sorted(path for path in images if path.suffix.lower() != ".png")
-        sorted_masks = sorted(masks)
-        if source_images and len(source_images) == len(sorted_masks):
-            pairs = list(zip(source_images, sorted_masks))
-    return pairs
-
-
-def _roboflow_semantic_classes(dataset_dir: Path) -> list[str]:
-    for split in ("train", "training", "valid", "val", "validation", "test"):
-        classes_path = dataset_dir / split / "_classes.csv"
-        if not classes_path.is_file():
-            continue
-        try:
-            rows = csv.reader(_iter_text_lines_limited(classes_path, label="semantic class mapping"))
-            classes: list[tuple[int, str]] = []
-            for row in rows:
-                if len(row) < 2:
-                    continue
-                try:
-                    class_id = int(row[0].strip())
-                except ValueError:
-                    continue
-                name = row[1].strip()
-                if class_id > 0 and name and name.lower() != "background":
-                    classes.append((class_id, name))
-            if classes:
-                return [name for _class_id, name in sorted(classes)]
-        except (OSError, ValueError):
-            continue
-    return []
-
-
 def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> dict[str, Any]:
     stats: dict[str, Any] = {
         "train_images": 0,
@@ -488,7 +430,6 @@ def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> 
         "missing_masks": [],
         "splits": [],
         "errors": [],
-        "roboflow_png_masks": False,
         "classes": [],
     }
     for split in ("train", "val", "test"):
@@ -499,17 +440,7 @@ def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> 
             mask_files = [path for path in masks_dir.rglob("*") if path.suffix.lower() in MASK_EXTENSIONS]
             pairs = [(image_path, _matching_mask_path(masks_dir, image_path)) for image_path in images]
         else:
-            split_dir = next(
-                (dataset_dir / name for name in _split_candidates(split) if (dataset_dir / name).is_dir()),
-                None,
-            )
-            roboflow_pairs = _roboflow_semantic_pairs(split_dir) if split_dir is not None else []
-            if not roboflow_pairs:
-                continue
-            stats["roboflow_png_masks"] = True
-            pairs = [(image_path, mask_path) for image_path, mask_path in roboflow_pairs]
-            images = [image_path for image_path, _mask_path in roboflow_pairs]
-            mask_files = [mask_path for _image_path, mask_path in roboflow_pairs]
+            continue
         if images:
             stats["splits"].append(split)
         if split == "train":
@@ -541,8 +472,6 @@ def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> 
                         )
             except Exception as exc:
                 stats["errors"].append(f"Could not inspect semantic pair {image_path.name}: {exc}")
-    if stats["roboflow_png_masks"]:
-        stats["classes"] = _roboflow_semantic_classes(dataset_dir)
     return stats
 
 
@@ -975,12 +904,6 @@ def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> di
         and yolo_stats["box_rows"] > 0
         and yolo_stats["box_rows"] >= yolo_stats["polygon_rows"]
     )
-    has_yolo_segmentation = (
-        has_yolo_yaml
-        and has_yolo_labels
-        and yolo_stats["polygon_rows"] > 0
-        and yolo_stats["polygon_rows"] > yolo_stats["box_rows"]
-    )
     imagefolder_classes = [] if has_yolo_yaml and has_yolo_labels else _imagefolder_classes(dataset_dir)
     if imagefolder_classes:
         classes = imagefolder_classes
@@ -1003,9 +926,8 @@ def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> di
     if has_yolo_detection:
         formats.append("yolo_detection")
         tasks.append("object_detection")
-    if has_yolo_segmentation:
-        formats.append("yolo_segmentation")
-        tasks.append("segmentation")
+    if has_yolo_yaml and yolo_stats["polygon_rows"] > yolo_stats["box_rows"]:
+        errors.append("YOLO polygon segmentation is not an upload format supported by the current model catalog.")
     errors.extend(yolo_stats.get("errors", []))
     errors.extend(coco_stats.get("errors", []))
     warnings.extend(coco_stats.get("warnings", []))
@@ -1056,7 +978,7 @@ def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> di
 
     image_count = count_images(dataset_dir)
     if has_semantic_masks and not any(
-        format_name in formats for format_name in ("imagefolder", "yolo_detection", "yolo_segmentation", "coco_instances")
+        format_name in formats for format_name in ("imagefolder", "yolo_detection", "coco_instances")
     ):
         image_count = semantic_stats["image_files"]
 
@@ -1154,11 +1076,68 @@ def normalize_dataset_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         tasks.append("image_classification")
     if "yolo_detection" in formats or (coco.get("box_annotations", 0) > 0 and not _has_complete_coco_masks(coco)):
         tasks.append("object_detection")
-    if {"semantic_masks", "yolo_segmentation"}.intersection(formats) or _has_complete_coco_masks(coco):
+    if "semantic_masks" in formats or _has_complete_coco_masks(coco):
         tasks.append("segmentation")
     normalized["tasks"] = tasks
     normalized["metadata_version"] = DATASET_METADATA_VERSION
     return normalized
+
+
+def enrich_ailab_label_metadata(dataset_dir: Path, metadata: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(metadata.get("label_schema"), dict):
+        return metadata
+    manifest_path = dataset_dir / ".ailab_dataset.json"
+    try:
+        if manifest_path.stat().st_size > 1024 * 1024:
+            return metadata
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return metadata
+    if not isinstance(manifest, dict) or not manifest.get("source_annotation_project_id"):
+        return metadata
+    stored_schema = manifest.get("label_schema")
+    if isinstance(stored_schema, dict):
+        enriched = dict(metadata)
+        enriched["label_schema"] = stored_schema
+        return enriched
+    if "semantic_masks" not in set(metadata.get("formats", [])):
+        return metadata
+    classes = list(metadata.get("classes") or [])
+    if not classes:
+        return metadata
+    enriched = dict(metadata)
+    enriched["label_schema"] = {
+        "origin": "ailab_label",
+        "task": "semantic_segmentation",
+        "format": "semantic_masks",
+        "background_id": 0,
+        "classes": [
+            {"id": f"class-{index + 1}", "name": name, "train_id": index + 1}
+            for index, name in enumerate(classes)
+        ],
+    }
+    return enriched
+
+
+def model_args_for_dataset(
+    metadata: dict[str, Any],
+    model_type: str,
+    extra_args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply dataset-owned values that users must not be able to mismatch."""
+    args = dict(extra_args or {})
+    schema = metadata.get("label_schema")
+    if model_type == "deeplabv3plus" and isinstance(schema, dict) and schema.get("task") == "semantic_segmentation":
+        class_rows = schema.get("classes")
+        train_ids = [
+            int(item["train_id"])
+            for item in class_rows or []
+            if isinstance(item, dict) and isinstance(item.get("train_id"), int)
+        ]
+        if not train_ids:
+            raise ValueError("AILAB semantic dataset has no class mapping")
+        args["num_classes"] = max(train_ids) + 1
+    return args
 
 
 def _canonical_task_from_metadata(metadata: dict[str, Any]) -> str:
@@ -1210,7 +1189,8 @@ def _has_bounding_boxes(metadata: dict[str, Any]) -> bool:
     return "yolo_detection" in formats or metadata.get("coco", {}).get("box_annotations", 0) > 0
 
 
-def _model_compatibility_reason(model_id: str, metadata: dict[str, Any], task_id: str) -> tuple[bool, str]:
+def _model_compatibility_reason(model: dict[str, Any], metadata: dict[str, Any], task_id: str) -> tuple[bool, str]:
+    model_id = str(model.get("id", ""))
     formats = set(metadata.get("formats", []))
     tasks = set(metadata.get("tasks", []))
 
@@ -1232,9 +1212,12 @@ def _model_compatibility_reason(model_id: str, metadata: dict[str, Any], task_id
         return ok, "Requires semantic masks; COCO polygon masks are converted to class-ID masks at train time."
     if model_id in {"resnet", "efficientnet"}:
         return "imagefolder" in formats, "Requires image classification class folders."
+    required_formats = set(model.get("dataset_formats", []))
+    if required_formats.intersection(formats):
+        return True, "Dataset matches a format declared by this model."
     if task_id not in tasks:
         return False, f"Dataset does not contain {task_id} annotations."
-    return False, "No compatibility rule is defined for this model."
+    return False, "Dataset does not match a format declared by this model."
 
 
 def compatible_models_for_metadata(metadata: dict[str, Any], catalog: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1242,7 +1225,7 @@ def compatible_models_for_metadata(metadata: dict[str, Any], catalog: dict[str, 
     for task in catalog.get("tasks", []):
         task_id = str(task.get("id", ""))
         for model in task.get("models", []):
-            ready, reason = _model_compatibility_reason(str(model.get("id", "")), metadata, task_id)
+            ready, reason = _model_compatibility_reason(model, metadata, task_id)
             compatible.append(
                 {
                     "id": model.get("id"),
@@ -1629,33 +1612,6 @@ def _write_coco_semantic_export(dataset_dir: Path, output_root: Path, metadata: 
     return warnings
 
 
-def _write_roboflow_semantic_export(dataset_dir: Path, output_root: Path) -> list[str]:
-    wrote_train = False
-    for split in ("train", "val", "test"):
-        split_dir = next(
-            (dataset_dir / name for name in _split_candidates(split) if (dataset_dir / name).is_dir()),
-            None,
-        )
-        if split_dir is None:
-            continue
-        pairs = _roboflow_semantic_pairs(split_dir)
-        if not pairs:
-            continue
-        images_dir = output_root / split / "images"
-        masks_dir = output_root / split / "masks"
-        images_dir.mkdir(parents=True, exist_ok=True)
-        masks_dir.mkdir(parents=True, exist_ok=True)
-        for source_image, source_mask in pairs:
-            target_image = _unique_child(images_dir, source_image.name)
-            shutil.copy2(source_image, target_image)
-            shutil.copy2(source_mask, masks_dir / f"{target_image.stem}{source_mask.suffix.lower()}")
-        wrote_train = wrote_train or split == "train"
-    if not wrote_train:
-        raise ValueError(f"Dataset '{dataset_dir.name}' has no Roboflow semantic training pairs.")
-    return []
-
-
-
 def _prepared_response(
     dataset_dir: Path,
     model_type: str,
@@ -1711,9 +1667,14 @@ def _cached_generated_export(
         return export_root, False, fingerprint, warnings
 
 
-def prepare_dataset_for_model(dataset_dir: Path, model_type: str, extra_args: dict[str, Any] | None = None) -> dict[str, Any]:
+def prepare_dataset_for_model(
+    dataset_dir: Path,
+    model_type: str,
+    extra_args: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     extra_args = extra_args or {}
-    metadata = inspect_dataset(dataset_dir)
+    metadata = metadata or inspect_dataset(dataset_dir)
     formats = set(metadata.get("formats", []))
 
     if model_type in {"resnet", "efficientnet"}:
@@ -1723,26 +1684,6 @@ def prepare_dataset_for_model(dataset_dir: Path, model_type: str, extra_args: di
 
     if model_type == "deeplabv3plus":
         if "semantic_masks" in formats:
-            if metadata.get("semantic_masks", {}).get("roboflow_png_masks"):
-                export_root, cache_hit, fingerprint, warnings = _cached_generated_export(
-                    dataset_dir,
-                    model_type,
-                    extra_args,
-                    "semantic_masks",
-                    ["train/images", "train/masks"],
-                    lambda output_root: _write_roboflow_semantic_export(dataset_dir, output_root),
-                )
-                return _prepared_response(
-                    dataset_dir,
-                    model_type,
-                    metadata,
-                    export_root,
-                    "semantic_masks",
-                    export_path=export_root,
-                    cache_hit=cache_hit,
-                    fingerprint=fingerprint,
-                    warnings=warnings,
-                )
             return _prepared_response(dataset_dir, model_type, metadata, dataset_dir, "semantic_masks")
         if _has_coco_semantic_masks(metadata):
             export_root, cache_hit, fingerprint, warnings = _cached_generated_export(

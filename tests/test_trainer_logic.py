@@ -56,7 +56,7 @@ if "rq.command" not in sys.modules:
 if "rq.job" not in sys.modules:
     sys.modules["rq.job"] = types.SimpleNamespace(Job=types.SimpleNamespace, JobStatus=types.SimpleNamespace)
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, inspect_dataset_for_upload, prepare_dataset_for_model, validate_dataset_for_upload
+from dataset_utils import compatible_models_for_metadata, enrich_ailab_label_metadata, inspect_dataset, inspect_dataset_for_upload, model_args_for_dataset, prepare_dataset_for_model, validate_dataset_for_upload
 from worker.trainers.classification_common import _batch_size_for
 from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
@@ -181,7 +181,7 @@ class TrainerLogicTests(unittest.TestCase):
             (root / "data.yaml").write_text("train: train/images", encoding="utf-8")
             (labels / "image.txt").write_text("0 0 0 1 0 1 1 0 1", encoding="utf-8")
             formats = inspect_dataset(root)["formats"]
-            self.assertIn("yolo_segmentation", formats)
+            self.assertNotIn("yolo_segmentation", formats)
             self.assertNotIn("yolo_detection", formats)
 
     def test_nested_yolo_detection_layout_is_detected(self):
@@ -253,9 +253,34 @@ class TrainerLogicTests(unittest.TestCase):
             (root / "data.yaml").write_text("train: train/images\nnames: ['item']", encoding="utf-8")
             (images / "image.jpg").write_bytes(b"not-an-image")
             (labels / "image.txt").write_text("0 0 0 1 0 1 1 0 1", encoding="utf-8")
-            self.assertIn("yolo_segmentation", inspect_dataset(root)["formats"])
+            self.assertNotIn("yolo_segmentation", inspect_dataset(root)["formats"])
             with self.assertRaises(ValueError):
                 validate_dataset_for_upload(root)
+
+    def test_ailab_semantic_schema_controls_model_class_count(self):
+        metadata = {
+            "label_schema": {
+                "origin": "ailab_label",
+                "task": "semantic_segmentation",
+                "classes": [
+                    {"name": "road", "train_id": 1},
+                    {"name": "car", "train_id": 2},
+                ],
+            }
+        }
+        args = model_args_for_dataset(metadata, "deeplabv3plus", {"num_classes": 2})
+        self.assertEqual(args["num_classes"], 3)
+
+    def test_legacy_ailab_semantic_metadata_is_enriched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / ".ailab_dataset.json").write_text(
+                json.dumps({"source_annotation_project_id": "project-1"}), encoding="utf-8"
+            )
+            metadata = enrich_ailab_label_metadata(
+                root, {"formats": ["semantic_masks"], "classes": ["road", "car"]}
+            )
+            self.assertEqual(model_args_for_dataset(metadata, "deeplabv3plus")["num_classes"], 3)
 
     def test_coco_box_only_advertises_detection_not_segmentation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -611,6 +636,13 @@ class _FakeQueue:
 
 
 class TrainingServiceOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.repository_patch = patch("services.training_service.resource_repository.database_url", "")
+        self.repository_patch.start()
+
+    def tearDown(self):
+        self.repository_patch.stop()
+
     def _service(self, root: Path) -> TrainingService:
         service = TrainingService.__new__(TrainingService)
         service.dataset_dir = root

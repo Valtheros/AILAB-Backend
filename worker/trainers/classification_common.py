@@ -92,6 +92,7 @@ def _evaluate_test_split(
     family: str,
     logger,
     log_path: Path | None,
+    display_classes: list[str],
 ) -> dict | None:
     """One-shot held-out test evaluation, run once after training completes.
 
@@ -181,7 +182,7 @@ def _evaluate_test_split(
         "test_loss": test_loss / test_total,
         "test_images": test_total,
         "num_classes": len(train_dataset.classes),
-        "classes": list(train_dataset.classes),
+        "classes": display_classes,
     }
     (results_dir / "test_evaluation.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     logger(log_path, f"[{family}] Held-out test accuracy: {result['test_accuracy']:.4f} on {test_total} images (from {checkpoint_name})")
@@ -258,6 +259,14 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     num_classes = len(train_dataset.classes)
     if num_classes < 2:
         raise ValueError("Image classification requires at least two class folders.")
+    schema = config.get("dataset_metadata", {}).get("label_schema") or {}
+    declared_rows = schema.get("classes") if isinstance(schema, dict) else []
+    declared_rows = sorted(
+        (item for item in declared_rows or [] if isinstance(item, dict)),
+        key=lambda item: int(item.get("train_id", 0)),
+    )
+    declared_classes = [str(item.get("name", "")) for item in declared_rows]
+    display_classes = declared_classes if len(declared_classes) == num_classes else list(train_dataset.classes)
 
     architecture = str(args.get("architecture") or config.get("model_name"))
     pretrained = bool(args.get("pretrained", True))
@@ -363,8 +372,8 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
 
         if monitored_accuracy >= best_score:
             best_score = monitored_accuracy
-            torch.save({"model": model.state_dict(), "classes": train_dataset.classes, "config": config}, results_dir / "best.pt")
-        torch.save({"model": model.state_dict(), "classes": train_dataset.classes, "config": config}, results_dir / "last.pt")
+            torch.save({"model": model.state_dict(), "classes": display_classes, "config": config}, results_dir / "best.pt")
+        torch.save({"model": model.state_dict(), "classes": display_classes, "config": config}, results_dir / "last.pt")
 
     # Optional one-shot held-out test evaluation. Runs after the training loop
     # has finished and both checkpoints are written, so it cannot affect
@@ -374,7 +383,7 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     try:
         test_result = _evaluate_test_split(
             dataset_path, val_transform, model, device, criterion, train_dataset,
-            batch_size, workers, results_dir, family, logger, log_path,
+            batch_size, workers, results_dir, family, logger, log_path, display_classes,
         )
     except Exception as exc:  # pragma: no cover - defensive, never fail a done run
         logger(log_path, f"[{family}] Test evaluation was skipped after an error: {exc}")

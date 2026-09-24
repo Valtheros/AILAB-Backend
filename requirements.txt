@@ -2,6 +2,7 @@ fastapi
 uvicorn[standard]
 pyyaml
 Pillow
+pycocotools
 pydantic
 python-multipart
 redis

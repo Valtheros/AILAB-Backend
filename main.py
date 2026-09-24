@@ -14,9 +14,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from annotation_operations import annotation_operations
+from annotation_service import annotation_service
+
 from dataset_utils import (
     DATASET_METADATA_VERSION,
     dataset_workflow_metadata,
+    enrich_ailab_label_metadata,
     export_cache_metadata,
     find_dataset_yaml,
     format_bytes,
@@ -26,7 +30,7 @@ from dataset_utils import (
     safe_dataset_name,
     validate_dataset_for_upload,
 )
-from dataset_storage import dataset_lock_name, owner_dataset_path, registered_storage_path
+from dataset_storage import dataset_lock_name, owner_dataset_path, owner_storage_key, registered_storage_path
 from inference_service import (
     MAX_INFERENCE_IMAGE_BYTES,
     InferenceError,
@@ -145,6 +149,42 @@ class StagedImportRequest(BaseModel):
 
 class TransferResourcesRequest(BaseModel):
     targetUserId: str = Field(min_length=1, max_length=255)
+
+
+class AnnotationImageSaveRequest(BaseModel):
+    revision: int = Field(ge=0)
+    annotations: list[dict[str, Any]] = Field(default_factory=list)
+    markedEmpty: bool = False
+    excluded: bool = False
+    force: bool = False
+
+    class Config:
+        extra = "forbid"
+
+
+class AnnotationProjectUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    classes: list[dict[str, Any]]
+    trainRatio: int = Field(ge=1, le=100)
+    valRatio: int = Field(ge=0, le=99)
+    testRatio: int = Field(ge=0, le=99)
+
+    class Config:
+        extra = "forbid"
+
+
+class AnnotationSplitRequest(BaseModel):
+    split: str = Field(pattern="^(train|val|test)$")
+
+
+class AnnotationBulkRequest(BaseModel):
+    imageIds: list[str] = Field(min_length=1, max_length=500)
+    split: str | None = Field(default=None, pattern="^(train|val|test)$")
+    excluded: bool | None = None
+    automatic: bool = False
+
+    class Config:
+        extra = "forbid"
 
 
 def _request_user_id(request: Request) -> str | None:
@@ -350,6 +390,21 @@ def _dataset_metadata_is_current(metadata: Any) -> bool:
         and metadata.get("metadata_version") in {1, DATASET_METADATA_VERSION}
         and required.issubset(metadata)
     )
+
+
+def _registered_dataset_metadata(target_dir: Path, record: dict[str, Any] | None) -> dict[str, Any]:
+    stored_metadata = record.get("metadata") if record else None
+    if isinstance(stored_metadata, str):
+        try:
+            stored_metadata = json.loads(stored_metadata)
+        except json.JSONDecodeError:
+            stored_metadata = None
+    metadata = (
+        normalize_dataset_metadata(stored_metadata)
+        if _dataset_metadata_is_current(stored_metadata)
+        else inspect_dataset(target_dir)
+    )
+    return enrich_ailab_label_metadata(target_dir, metadata)
 
 
 def _dataset_response(dataset_name: str, metadata: dict[str, Any]) -> dict[str, Any]:
@@ -716,6 +771,367 @@ async def job_events(job_id: str, request: Request):
     )
 
 
+@app.get("/api/annotation-projects")
+def list_annotation_projects(request: Request):
+    owner_id = _require_request_user_id(request)
+    return {
+        "projects": annotation_service.list_projects(owner_id),
+        "operations": annotation_operations.list_active(owner_id),
+    }
+
+
+@app.post("/api/annotation-projects", status_code=202)
+async def create_annotation_project(
+    request: Request,
+    file: UploadFile = File(...),
+    name: str = Form(...),
+    taskType: str = Form(...),
+    classes: str = Form(...),
+    trainRatio: int = Form(80),
+    valRatio: int = Form(10),
+    testRatio: int = Form(10),
+):
+    owner_id = _require_request_user_id(request)
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Choose a ZIP file containing images")
+    upload_path: Path | None = None
+    project: dict[str, Any] | None = None
+    try:
+        parsed_classes = json.loads(classes)
+        annotation_service.validate_project_input(
+            name, taskType, parsed_classes, (trainRatio, valRatio, testRatio)
+        )
+        upload_root = contained_path(
+            DATASET_DIR, ".annotation-uploads", owner_storage_key(owner_id)
+        )
+        upload_path = await save_upload_to_temp(file, upload_root)
+        project = annotation_service.create_project_record(
+            owner_id, name, taskType, parsed_classes, (trainRatio, valRatio, testRatio)
+        )
+        operation = annotation_operations.create(
+            owner_id, project["id"], "import", upload_path
+        )
+        return {"project": project, "operation": operation}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Classes must be valid JSON") from exc
+    except (ValueError, FileExistsError) as exc:
+        if upload_path:
+            upload_path.unlink(missing_ok=True)
+        if project:
+            try:
+                annotation_service.delete_project(owner_id, project["id"])
+            except Exception:
+                pass
+        raise HTTPException(status_code=409 if isinstance(exc, FileExistsError) else 400, detail=str(exc)) from exc
+    except Exception:
+        if upload_path:
+            upload_path.unlink(missing_ok=True)
+        raise
+
+
+@app.post("/api/annotation-projects/{project_id}/imports", status_code=202)
+async def import_annotation_images(project_id: str, request: Request, file: UploadFile = File(...)):
+    owner_id = _require_request_user_id(request)
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Choose a ZIP file containing images")
+    upload_path: Path | None = None
+    try:
+        if not annotation_service.get_project(owner_id, project_id):
+            raise FileNotFoundError("Annotation project was not found")
+        upload_root = contained_path(
+            DATASET_DIR, ".annotation-uploads", owner_storage_key(owner_id)
+        )
+        upload_path = await save_upload_to_temp(file, upload_root)
+        operation = annotation_operations.create(
+            owner_id, project_id, "import", upload_path
+        )
+        return {"operation": operation}
+    except FileNotFoundError as exc:
+        if upload_path:
+            upload_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        if upload_path:
+            upload_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        if upload_path:
+            upload_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-operations/{operation_id}")
+def get_annotation_operation(operation_id: str, request: Request):
+    operation = annotation_operations.get(_require_request_user_id(request), operation_id)
+    if not operation:
+        raise HTTPException(status_code=404, detail="Annotation operation was not found")
+    return {"operation": operation}
+
+
+@app.post("/api/annotation-operations/{operation_id}/retry")
+def retry_annotation_operation(operation_id: str, request: Request):
+    try:
+        return {"operation": annotation_operations.retry(_require_request_user_id(request), operation_id)}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/annotation-operations/{operation_id}/cancel")
+def cancel_annotation_operation(operation_id: str, request: Request):
+    try:
+        return {"operation": annotation_operations.cancel(_require_request_user_id(request), operation_id)}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-projects/{project_id}")
+def get_annotation_project(project_id: str, request: Request):
+    project = annotation_service.get_project(_require_request_user_id(request), project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Annotation project was not found")
+    return {"project": project}
+
+
+@app.patch("/api/annotation-projects/{project_id}")
+def update_annotation_project(
+    project_id: str, payload: AnnotationProjectUpdateRequest, request: Request
+):
+    try:
+        project = annotation_service.update_project(
+            _require_request_user_id(request), project_id, payload.name, payload.classes,
+            (payload.trainRatio, payload.valRatio, payload.testRatio),
+        )
+        return {"project": project}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/annotation-projects/{project_id}/rebalance")
+def rebalance_annotation_project(project_id: str, request: Request):
+    try:
+        return {
+            "updated": annotation_service.rebalance(
+                _require_request_user_id(request), project_id
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-projects/{project_id}/images")
+def list_annotation_images(
+    project_id: str,
+    request: Request,
+    status: str = "all",
+    split: str = "all",
+    search: str = "",
+    sort: str = "original",
+    offset: int = 0,
+    limit: int = 48,
+):
+    try:
+        owner_id = _require_request_user_id(request)
+        result = annotation_service.list_images(
+            owner_id, project_id, status, split,
+            search, sort, offset, limit,
+        )
+        result["operation"] = next(
+            (
+                item for item in annotation_operations.list_active(
+                    owner_id
+                )
+                if item["project_id"] == project_id
+            ),
+            None,
+        )
+        return result
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/annotation-projects/{project_id}/images/bulk")
+def bulk_update_annotation_images(
+    project_id: str, payload: AnnotationBulkRequest, request: Request
+):
+    try:
+        updated = annotation_service.bulk_update(
+            _require_request_user_id(request), project_id, payload.imageIds,
+            payload.split, payload.excluded, payload.automatic,
+        )
+        return {"updated": updated}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-projects/{project_id}/images/{image_id}/content")
+def annotation_image_content(project_id: str, image_id: str, request: Request):
+    try:
+        return FileResponse(
+            annotation_service.image_path(
+                _require_request_user_id(request), project_id, image_id
+            )
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-projects/{project_id}/images/{image_id}/thumbnail")
+def annotation_image_thumbnail(project_id: str, image_id: str, request: Request):
+    try:
+        return FileResponse(
+            annotation_service.thumbnail_path(
+                _require_request_user_id(request), project_id, image_id
+            ),
+            media_type="image/webp",
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-projects/{project_id}/images/{image_id}")
+def get_annotation_image(
+    project_id: str,
+    image_id: str,
+    request: Request,
+    split: str = "all",
+    status: str = "all",
+    search: str = "",
+    sort: str = "original",
+):
+    owner_id = _require_request_user_id(request)
+    project = annotation_service.get_project(owner_id, project_id)
+    image = annotation_service.get_image(owner_id, project_id, image_id)
+    if not project or not image:
+        raise HTTPException(status_code=404, detail="Annotation image was not found")
+    try:
+        navigation = annotation_service.neighbor_ids(
+            owner_id, project_id, image_id, split, status, search, sort
+        )
+    except ValueError:
+        navigation = {"previousId": None, "nextId": None}
+    return {"project": project, "image": image, **navigation}
+
+
+@app.put("/api/annotation-projects/{project_id}/images/{image_id}")
+def save_annotation_image(
+    project_id: str,
+    image_id: str,
+    payload: AnnotationImageSaveRequest,
+    request: Request,
+):
+    try:
+        image = annotation_service.save_image(
+            _require_request_user_id(request), project_id, image_id,
+            payload.revision, payload.annotations, payload.markedEmpty,
+            payload.excluded, payload.force,
+        )
+        return {"image": image}
+    except FileExistsError as exc:
+        latest = annotation_service.get_image(
+            _require_request_user_id(request), project_id, image_id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={"message": str(exc), "latestRevision": latest["revision"] if latest else None},
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/annotation-projects/{project_id}/images/{image_id}/split")
+def set_annotation_image_split(
+    project_id: str,
+    image_id: str,
+    payload: AnnotationSplitRequest,
+    request: Request,
+):
+    try:
+        return {
+            "image": annotation_service.set_split(
+                _require_request_user_id(request), project_id, image_id, payload.split
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/annotation-projects/{project_id}/images/{image_id}/revisions")
+def list_annotation_image_revisions(project_id: str, image_id: str, request: Request):
+    try:
+        return {
+            "revisions": annotation_service.list_revisions(
+                _require_request_user_id(request), project_id, image_id
+            )
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/annotation-projects/{project_id}/images/{image_id}/revisions/{revision_id}/restore")
+def restore_annotation_image_revision(
+    project_id: str, image_id: str, revision_id: str, request: Request
+):
+    try:
+        return {
+            "image": annotation_service.restore_revision(
+                _require_request_user_id(request), project_id, image_id, revision_id
+            )
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/annotation-projects/{project_id}/publish", status_code=202)
+def publish_annotation_project(project_id: str, request: Request):
+    try:
+        operation = annotation_operations.create(
+            _require_request_user_id(request), project_id, "publish"
+        )
+        return {"operation": operation}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/annotation-projects/{project_id}")
+def delete_annotation_project(project_id: str, request: Request):
+    try:
+        annotation_service.delete_project(
+            _require_request_user_id(request), project_id
+        )
+        return {"status": "success"}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/datasets")
 def list_datasets(request: Request):
     request_owner = _require_request_user_id(request)
@@ -735,13 +1151,7 @@ def list_datasets(request: Request):
             continue
 
         stored_metadata = record.get("metadata") if record else None
-        if isinstance(stored_metadata, str):
-            try:
-                stored_metadata = json.loads(stored_metadata)
-            except json.JSONDecodeError:
-                stored_metadata = None
-        metadata_is_usable = _dataset_metadata_is_current(stored_metadata)
-        metadata = normalize_dataset_metadata(stored_metadata) if metadata_is_usable else inspect_dataset(item)
+        metadata = _registered_dataset_metadata(item, record)
         if record and metadata != stored_metadata:
             resource_repository.update_dataset_metadata(record["id"], metadata)
         metadata["export_cache"] = export_cache_metadata(item)
@@ -771,6 +1181,7 @@ def list_datasets(request: Request):
                 "compatibleModels": profile["compatible_models"],
                 "readyModels": profile["ready_models"],
                 "exportCache": profile["export_cache"],
+                "labelSchema": metadata.get("label_schema"),
                 "createdBy": owner_id,
             }
         )
@@ -1307,7 +1718,7 @@ def dataset_metadata(dataset_name: str, request: Request):
             raise HTTPException(status_code=404, detail="Dataset not found")
     else:
         _assert_owned_resource_visible(_dataset_owner(target_dir), request)
-    metadata = inspect_dataset(target_dir)
+    metadata = _registered_dataset_metadata(target_dir, record)
     metadata["export_cache"] = export_cache_metadata(target_dir)
     metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
     metadata.update(_dataset_profile(metadata))
@@ -1330,6 +1741,6 @@ def dataset_compatibility(dataset_name: str, request: Request):
             raise HTTPException(status_code=404, detail="Dataset not found")
     else:
         _assert_owned_resource_visible(_dataset_owner(target_dir), request)
-    metadata = inspect_dataset(target_dir)
+    metadata = _registered_dataset_metadata(target_dir, record)
     metadata["export_cache"] = export_cache_metadata(target_dir)
     return {"dataset_name": dataset_name, **_dataset_profile(metadata)}

@@ -399,7 +399,7 @@ DATASET_INTERFACES = {
     "yolo": {
         "dataset_task": "object_detection",
         "required_annotations": ["bounding boxes"],
-        "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "accepted_source_formats": ["yolo", "coco"],
         "accepted_canonical_formats": ["object_detection_boxes"],
         "canonical_format": "object_detection_boxes",
         "conversion_targets": ["yolo_detection"],
@@ -408,7 +408,7 @@ DATASET_INTERFACES = {
     "faster_rcnn": {
         "dataset_task": "object_detection",
         "required_annotations": ["bounding boxes"],
-        "accepted_source_formats": ["yolo", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "accepted_source_formats": ["yolo", "coco"],
         "accepted_canonical_formats": ["object_detection_boxes"],
         "canonical_format": "object_detection_boxes",
         "conversion_targets": ["coco_instances", "yolo_detection"],
@@ -417,7 +417,7 @@ DATASET_INTERFACES = {
     "deeplabv3plus": {
         "dataset_task": "semantic_segmentation",
         "required_annotations": ["one class ID per pixel mask"],
-        "accepted_source_formats": ["semantic_masks", "coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "accepted_source_formats": ["semantic_masks", "coco"],
         "accepted_canonical_formats": ["semantic_masks", "coco_segmentation"],
         "canonical_format": "semantic_masks",
         "conversion_targets": ["semantic_masks"],
@@ -426,7 +426,7 @@ DATASET_INTERFACES = {
     "mask_rcnn": {
         "dataset_task": "instance_segmentation",
         "required_annotations": ["instance masks", "bounding boxes"],
-        "accepted_source_formats": ["coco", "cvat_coco", "label_studio_coco", "roboflow_coco"],
+        "accepted_source_formats": ["coco"],
         "accepted_canonical_formats": ["coco_segmentation"],
         "canonical_format": "coco_instance_masks",
         "conversion_targets": ["coco_instances"],
