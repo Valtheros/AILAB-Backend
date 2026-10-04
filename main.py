@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import shutil
 import time
 import uuid
@@ -11,6 +13,8 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -61,9 +65,43 @@ from resource_repository import resource_repository
 from staged_uploads import StagedUploadStore
 from settings import BACKEND_INTERNAL_TOKEN, CORS_ORIGINS, DATASET_DIR, RUNS_DIR, ensure_runtime_dirs
 from sse_utils import TERMINAL_STATUSES, heartbeat, sse_event
+import compute_repository as compute
+from compute_api import router as compute_router, ExecutionSelection
+from api_errors import PublicError, error_info
 
 
 app = FastAPI(title="No-Code Computer Vision Training Backend")
+
+from label_studio_api import router as label_studio_router, internal_router as label_studio_internal_router
+app.include_router(label_studio_router)
+app.include_router(label_studio_internal_router)
+app.include_router(compute_router)
+
+
+@app.exception_handler(PublicError)
+async def public_error(request: Request, exc: PublicError):
+    return JSONResponse({'detail': str(exc), **error_info(exc), 'requestId': request.state.request_id}, status_code=exc.status)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request: Request, exc: StarletteHTTPException):
+    code = {401: 'UNAUTHORIZED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 409: 'CONFLICT',
+            429: 'RATE_LIMITED', 503: 'SERVICE_UNAVAILABLE'}.get(exc.status_code, 'VALIDATION_ERROR')
+    detail = exc.detail
+    if exc.status_code >= 500:
+        logging.getLogger(__name__).error('API HTTP failure %s: %s', request.state.request_id, detail)
+        code = 'SERVICE_UNAVAILABLE' if exc.status_code == 503 else 'OPERATION_FAILED'
+        detail = 'The service could not complete this request. Please retry.'
+    return JSONResponse({'detail': detail, 'code': code, 'details': {},
+                         'requestId': request.state.request_id}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(RequestValidationError)
+async def invalid_fields(request: Request, exc: RequestValidationError):
+    fields = [{'field': list(e['loc']), 'message': e['msg']} for e in exc.errors()]
+    return JSONResponse({'detail': 'Some fields are invalid. Check the supplied values.',
+                         'code': 'VALIDATION_ERROR', 'details': {'fields': fields},
+                         'requestId': request.state.request_id}, status_code=422)
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,11 +120,24 @@ async def require_internal_token(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api") and path not in PUBLIC_API_PATHS:
         if not BACKEND_INTERNAL_TOKEN:
-            return JSONResponse({"detail": "BACKEND_INTERNAL_TOKEN must be set for protected backend API routes"}, status_code=503)
+            return JSONResponse({'detail': 'The service is not configured. Contact an administrator.', 'code': 'SERVICE_UNAVAILABLE', 'details': {}, 'requestId': request.state.request_id}, status_code=503)
         provided = request.headers.get("x-internal-token")
         if provided != BACKEND_INTERNAL_TOKEN:
-            return JSONResponse({"detail": "Unauthorized backend request"}, status_code=401)
+            return JSONResponse({'detail': 'Unauthorized backend request', 'code': 'UNAUTHORIZED', 'details': {}, 'requestId': request.state.request_id}, status_code=401)
     return await call_next(request)
+
+
+@app.middleware('http')
+async def request_id(request: Request, call_next):
+    request.state.request_id = uuid.uuid4().hex
+    try:
+        response = await call_next(request)
+    except Exception:
+        logging.getLogger(__name__).exception('API request failed: %s', request.state.request_id)
+        response = JSONResponse({'detail': 'The service could not complete this request. Please retry.',
+                                 'code': 'OPERATION_FAILED', 'details': {}, 'requestId': request.state.request_id}, status_code=500)
+    response.headers['X-Request-ID'] = request.state.request_id
+    return response
 
 ensure_runtime_dirs()
 training_service = TrainingService()
@@ -95,6 +146,7 @@ staged_uploads.cleanup()
 
 
 class TrainRequest(BaseModel):
+    execution: ExecutionSelection | None = None
     task_type: str | None = None
     model_type: str = "yolo"
     model_name: str | None = None
@@ -116,6 +168,7 @@ class TaskCreateRequest(BaseModel):
 
 
 class TaskDraftRequest(BaseModel):
+    execution: ExecutionSelection | None = None
     display_name: str = Field(min_length=1, max_length=100)
     task_type: str
     model_type: str
@@ -131,6 +184,7 @@ class TaskDraftRequest(BaseModel):
 
 
 class ResourcePlanPreviewRequest(BaseModel):
+    execution: ExecutionSelection | None = None
     model_type: str
     params: dict[str, Any] = Field(default_factory=dict)
     batch_size: int = Field(default=16, ge=1, le=256)
@@ -260,6 +314,9 @@ def _model_name_from_request(request: TrainRequest, model_entry: dict[str, Any] 
 
 def _extra_args_from_request(request: TrainRequest) -> dict[str, Any]:
     extra_args = dict(request.params or {})
+    if compute.enabled():
+        # Device assignment is not a trainer parameter; API containers need no GPU runtime.
+        extra_args.pop('device', None)
     if request.model_type == "yolo" and "model_size" not in extra_args:
         extra_args["model_size"] = request.model_size or "n"
     return validate_model_params(request.model_type, extra_args)
@@ -282,6 +339,8 @@ def _task_response(row: dict[str, Any], run: dict[str, Any] | None = None) -> di
         "amp": bool(params.get("amp", True)),
         "seed": int(params.get("seed", 0)),
         "deviceSelection": str(params.get("_device_selection", "auto")),
+        "execution": row.get('execution') or params.get('_execution') or {'mode': 'auto', 'gpuUuid': None},
+        "computeJob": compute.get_job(row['owner_user_id'], row['compute_job_id']) if row.get('compute_job_id') else None,
         "params": {key: value for key, value in params.items() if not key.startswith("_")},
         "runSlug": row.get("run_slug"),
         "jobId": row.get("rq_job_id"),
@@ -504,7 +563,7 @@ def _resource_plan_summary(plan: dict[str, Any]) -> dict[str, Any]:
     """
     estimated = int(plan.get("estimated_vram_mb", 0) or 0)
     safe_limit = int(plan.get("safe_vram_mb", 0) or 0)
-    is_cpu = str(plan.get("device", "")).startswith("cpu")
+    is_cpu = str(plan.get("device", "")).lower().startswith("cpu")
     return {
         "estimatedVramMb": estimated,
         "safeLimitMb": safe_limit,
@@ -528,7 +587,8 @@ def preview_resource_plan(payload: ResourcePlanPreviewRequest, request: Request)
     _require_request_user_id(request)
     if get_model(payload.model_type) is None:
         raise HTTPException(status_code=400, detail=f"Unsupported model_type: {payload.model_type}")
-    plan = validate_resource_plan(
+    plan = compute.resource_plan(payload.model_type, dict(payload.params or {}), payload.batch_size,
+           payload.execution.model_dump() if payload.execution else None) if compute.enabled() else validate_resource_plan(
         payload.model_type,
         params=dict(payload.params or {}),
         batch_size=payload.batch_size,
@@ -542,6 +602,13 @@ def start_train(train_request: TrainRequest, request: Request):
 
 
 def _start_train_request(train_request: TrainRequest, request: Request, task_id: str | None = None):
+    if compute.enabled():
+        train_request.execution = ExecutionSelection(**compute.execution_selection(
+            train_request.execution.model_dump() if train_request.execution else None, train_request.params))
+    elif train_request.execution:
+        if train_request.execution.mode != 'cpu':
+            compute.require_enabled()
+        train_request.params = {**train_request.params, 'device': 'cpu'}
     model_entry = get_model(train_request.model_type)
     if model_entry is None:
         raise HTTPException(status_code=400, detail=f"Unsupported model_type: {train_request.model_type}")
@@ -568,11 +635,14 @@ def _start_train_request(train_request: TrainRequest, request: Request, task_id:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        resource_plan = enforce_resource_plan(
+        resource_plan = compute.resource_plan(train_request.model_type, extra_args, train_request.batch_size,
+           train_request.execution.model_dump() if train_request.execution else None) if compute.enabled() else enforce_resource_plan(
             train_request.model_type,
             params=extra_args,
             batch_size=train_request.batch_size,
         )
+        if not resource_plan['ok']:
+            raise ResourcePlanError(resource_plan['errors'], resource_plan['suggestions'])
         extra_args = resource_plan["normalized_params"]
     except ResourcePlanError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -591,6 +661,7 @@ def _start_train_request(train_request: TrainRequest, request: Request, task_id:
             owner_id=_require_request_user_id(request),
             owner_email=_request_user_email(request),
             task_id=task_id,
+            execution=train_request.execution.model_dump() if train_request.execution else None,
         )
         return {
             "status": "success",
@@ -598,6 +669,8 @@ def _start_train_request(train_request: TrainRequest, request: Request, task_id:
             "container_id": job_id,
             "resourcePlan": _resource_plan_summary(resource_plan),
         }
+    except PublicError:
+        raise
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail=str(exc))
     except FileNotFoundError as exc:
@@ -924,10 +997,21 @@ def update_task(task_id: str, payload: TaskDraftRequest, request: Request):
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     params = dict(payload.params)
+    legacy = {**params, '_device_selection': payload.device_selection}
+    if payload.execution:
+        execution = compute.execution_selection(payload.execution.model_dump())
+    elif compute.enabled():
+        execution = compute.execution_selection(params=legacy)
+    else:
+        device = str(params.get('device', 'auto'))
+        execution = ({'mode': 'auto', 'gpuUuid': None} if payload.device_selection == 'auto' or device == 'auto'
+                     else {'mode': 'cpu', 'gpuUuid': None} if device == 'cpu'
+                     else {'mode': 'gpu', 'gpuUuid': None, 'needsSelection': True})
     params.update({
         "epochs": payload.epochs,
         "batch_size": payload.batch_size,
         "_device_selection": payload.device_selection,
+        "_execution": execution,
     })
     row = resource_repository.update_task_draft(owner_id, task_id, {
         "display_name": payload.display_name.strip() or "cv_run",
@@ -953,15 +1037,35 @@ def start_task(task_id: str, request: Request):
     if not row.get("dataset_slug"):
         raise HTTPException(status_code=400, detail="Select a compatible dataset before training")
     params = dict(row.get("params") or {})
+    stored_execution = row.get('execution') or params.get('_execution')
+    if stored_execution:
+        stored_execution = compute.execution_selection(stored_execution)
+    elif compute.enabled():
+        stored_execution = compute.execution_selection(params=params)
     run_slug = f"{safe_dataset_name(str(row.get('display_name') or 'cv_run'))}_{str(row['id']).replace('-', '')[:8]}"
     train_request = TrainRequest(
         task_type=row["task_type"], model_type=row["model_type"], model_name=row.get("model_name"),
         dataset_name=row["dataset_slug"], project_name=run_slug,
         epochs=int(params.get("epochs", 50)), batch_size=int(params.get("batch_size", 16)),
         params={key: value for key, value in params.items() if not key.startswith("_")},
+        execution=stored_execution,
     )
     result = _start_train_request(train_request, request, task_id=task_id)
     return {**result, "task_id": task_id}
+
+
+@app.post('/api/tasks/{task_id}/clone', status_code=201)
+def clone_task(task_id: str, request: Request):
+    owner_id = _require_request_user_id(request)
+    row = resource_repository.get_task(owner_id, task_id)
+    if not row:
+        raise PublicError('NOT_FOUND', 'Training task not found.', status=404)
+    if row['status'] in {'queued','running','started','stopping','recovery_pending'}:
+        raise PublicError('RUN_IN_USE', 'Stop this run before creating another draft.', status=409)
+    draft = resource_repository.create_task(owner_id, _request_user_email(request), row['display_name'])
+    values = {**row, 'params': {**row.get('params', {}), '_execution': row.get('execution') or {'mode': 'auto', 'gpuUuid': None}}}
+    copied = resource_repository.update_task_draft(owner_id, draft['id'], values)
+    return _task_response(copied)
 
 
 @app.post("/api/tasks/{task_id}/stop")
@@ -969,7 +1073,7 @@ def stop_task(task_id: str, request: Request):
     row = resource_repository.get_task(_require_request_user_id(request), task_id)
     if not row:
         raise HTTPException(status_code=404, detail="Training task not found")
-    if not row.get("rq_job_id") or row["status"] not in {"queued", "running", "started", "stopping"}:
+    if not row.get("rq_job_id") or row["status"] not in {"queued", "running", "started", "stopping", "recovery_pending"}:
         raise HTTPException(status_code=409, detail="Training task is not active")
     try:
         return {"status": training_service.stop_training_container(row["rq_job_id"])}
@@ -1008,17 +1112,25 @@ def delete_task(task_id: str, request: Request):
         raise HTTPException(status_code=409, detail="Stop the active training task before deleting it")
     removal: ReversibleDirectoryRemoval | None = None
     try:
-        if row.get("storage_path"):
-            path = registered_storage_path(RUNS_DIR, row["storage_path"])
-            if path.is_dir():
-                removal = ReversibleDirectoryRemoval(path).apply()
-        deleted = resource_repository.delete_task(owner_id, task_id)
+        if compute.enabled():
+            with compute.run_guard(owner_id, task_id) as c:
+                if row.get('storage_path'):
+                    path = registered_storage_path(RUNS_DIR, row['storage_path'])
+                    if path.is_dir():
+                        removal = ReversibleDirectoryRemoval(path).apply()
+                deleted = c.execute('delete from training_tasks where id=%s returning id', (task_id,)).fetchone()
+        else:
+            if row.get("storage_path"):
+                path = registered_storage_path(RUNS_DIR, row["storage_path"])
+                if path.is_dir():
+                    removal = ReversibleDirectoryRemoval(path).apply()
+            deleted = resource_repository.delete_task(owner_id, task_id)
         if not deleted:
             raise HTTPException(status_code=409, detail="Training task could not be deleted")
         if removal:
             removal.commit()
         return {"status": "success"}
-    except HTTPException:
+    except (HTTPException, PublicError):
         if removal:
             removal.rollback()
         raise
@@ -1049,10 +1161,19 @@ def delete_run(project_name: str, request: Request):
         raise HTTPException(status_code=404, detail="Run not found")
     removal: ReversibleDirectoryRemoval | None = None
     try:
-        removal = ReversibleDirectoryRemoval(project_dir).apply()
-        resource_repository.delete_run_by_slug(owner_id, project_name)
+        if compute.enabled() and record:
+            with compute.run_guard(owner_id, record['id']) as c:
+                removal = ReversibleDirectoryRemoval(project_dir).apply()
+                c.execute('delete from training_tasks where id=%s', (record['id'],))
+        else:
+            removal = ReversibleDirectoryRemoval(project_dir).apply()
+            resource_repository.delete_run_by_slug(owner_id, project_name)
         removal.commit()
         return {"status": "success"}
+    except PublicError:
+        if removal is not None:
+            removal.rollback()
+        raise
     except Exception as exc:
         if removal is not None:
             removal.rollback()
@@ -1077,6 +1198,7 @@ async def predict_run(
     request: Request,
     file: UploadFile = File(...),
     threshold: float | None = Form(None),
+    execution: str | None = Form(None),
 ):
     """Run one uploaded image through a completed run's trained model.
 
@@ -1084,6 +1206,8 @@ async def predict_run(
     boxes), and segmentation (semantic or instance mask overlay).
     """
     owner_id = _require_request_user_id(request)
+    if threshold is not None and (not math.isfinite(threshold) or not 0 <= threshold <= 1):
+        raise PublicError('INVALID_THRESHOLD', 'Confidence threshold must be a finite number between 0 and 1.')
     try:
         record = _run_record_for_predict(project_name, request)
     except ValueError as exc:
@@ -1119,6 +1243,45 @@ async def predict_run(
     run_dir = contained_path(RUNS_DIR, project_name)
     if not run_dir.is_dir():
         raise HTTPException(status_code=404, detail="Run not found")
+
+    if compute.enabled():
+        import hashlib
+        from inference_service import _open_verified_image
+        from resource_guard import estimate_training_memory
+        try:
+            _open_verified_image(payload)
+        except InferenceError as exc:
+            raise PublicError('INVALID_IMAGE', str(exc)) from exc
+        try:
+            selection = compute.execution_selection(json.loads(execution) if execution else {'mode': 'auto'})
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise PublicError('INVALID_EXECUTION', 'Choose Auto GPU, a GPU, or CPU.') from exc
+        key = request.headers.get('idempotency-key')
+        if not key or len(key) > 128:
+            raise PublicError('IDEMPOTENCY_REQUIRED', 'A valid request key is required.')
+        job_id = uuid.uuid4()
+        directory = compute.job_directory(job_id)
+        directory.mkdir(parents=True, exist_ok=False)
+        try:
+            (directory / 'input').write_bytes(payload)
+            row = await asyncio.to_thread(compute.create_job, owner_id, record['id'], 'predict',
+                   {'project_name': project_name, 'model_type': model_type, 'task_type': task_type, 'threshold': threshold,
+                    'input_sha256': hashlib.sha256(payload).hexdigest(), 'input_name': Path(file.filename or 'image').name[:255], 'input_bytes': len(payload)},
+                   selection, idempotency_key=key, job_id=job_id,
+                   estimated_vram_mb=estimate_training_memory(model_type, config.get('extra_args', {}), 1))
+            if str(row['id']) != str(job_id):
+                shutil.rmtree(directory)
+            return JSONResponse(json.loads(json.dumps(compute.public_job(row), default=str)), status_code=202)
+        except Exception:
+            # A lost commit acknowledgement must not delete input for a durably queued job.
+            try:
+                with resource_repository._connect() as c:
+                    persisted = c.execute('select id from compute_jobs where id=%s', (job_id,)).fetchone()
+                if not persisted:
+                    shutil.rmtree(directory, ignore_errors=True)
+            except Exception:
+                pass
+            raise
 
     try:
         # Runs off the event loop: loading a checkpoint and the forward pass are
@@ -1180,6 +1343,10 @@ def admin_transfer_user_resources(user_id: str, payload: TransferResourcesReques
 @app.delete("/api/admin/users/{user_id}/resources")
 def admin_delete_user_resources(user_id: str, request: Request):
     _require_admin(request)
+    if compute.enabled():
+        with resource_repository._connect() as c:
+            if c.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (user_id, ['queued', *compute.ACTIVE])).fetchone():
+                raise PublicError('RUN_IN_USE', 'Cancel active Train and Test jobs before deleting this user.', status=409)
     datasets, runs = resource_repository.delete_user_resource_records(user_id)
     errors: list[str] = []
     for run in runs:

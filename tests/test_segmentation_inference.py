@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import segmentation_inference as si
-from inference_service import InferenceError
+from inference_service import InferenceError, _checkpoint_path
 
 try:
     import torch  # noqa: F401
@@ -46,6 +46,7 @@ class HelperTests(unittest.TestCase):
                 si.load_segmenter(Path(d), "unet")
 
     def test_missing_checkpoint_raises(self):
+        self.assertIs(si._checkpoint_path, _checkpoint_path)
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(InferenceError):
                 si._checkpoint_path(Path(d))

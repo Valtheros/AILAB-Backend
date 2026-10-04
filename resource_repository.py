@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -32,7 +33,7 @@ class ResourceRepository:
     def _connect(self):
         if not self.enabled:
             raise RuntimeError("DATABASE_URL and psycopg are required for the resource registry")
-        return psycopg.connect(self.database_url, row_factory=dict_row)
+        return psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=3)
 
     @staticmethod
     def _lock_key(value: str) -> int:
@@ -229,13 +230,13 @@ class ResourceRepository:
                 """
                 update training_tasks set
                   display_name = %s, task_type = %s, model_type = %s, model_name = %s,
-                  dataset_slug = nullif(%s, ''), params = %s::jsonb, updated_at = now()
+                  dataset_slug = nullif(%s, ''), params = %s::jsonb, execution=%s::jsonb, updated_at = now()
                 where owner_user_id = %s and id = %s and status = 'draft'
                 returning *
                 """,
                 (
                     values["display_name"], values["task_type"], values["model_type"], values["model_name"],
-                    values.get("dataset_slug", ""), json.dumps(values["params"]), owner_id, task_id,
+                    values.get("dataset_slug", ""), json.dumps(values["params"]), json.dumps(values['params'].get('_execution')), owner_id, task_id,
                 ),
             ).fetchone()
             return dict(row) if row else None
@@ -408,6 +409,11 @@ class ResourceRepository:
         }
 
     def transfer_user_resources(self, source_user_id: str, target_user_id: str) -> dict[str, int]:
+        from compute_repository import enabled, ACTIVE
+        if enabled():
+            with self._connect() as c:
+                if c.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (source_user_id, ['queued', *ACTIVE])).fetchone():
+                    raise ValueError('Cancel active Train and Test jobs before transferring resources.')
         if source_user_id == target_user_id:
             raise ValueError("Source and target users must be different")
         moves: list[tuple[Path, Path]] = []
@@ -415,6 +421,8 @@ class ResourceRepository:
             with self._connect() as connection:
                 for user_id in sorted((source_user_id, target_user_id)):
                     connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
+                if enabled() and connection.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (source_user_id, ['queued', *ACTIVE])).fetchone():
+                    raise ValueError('Cancel active Train and Test jobs before transferring resources.')
                 target = connection.execute('select id, email from "user" where id = %s', (target_user_id,)).fetchone()
                 if not target:
                     raise FileNotFoundError("Transfer target user was not found")
@@ -453,6 +461,8 @@ class ResourceRepository:
                     "update training_tasks set owner_user_id = %s, created_by = %s, updated_at = now() where owner_user_id = %s returning storage_path",
                     (target_user_id, target["email"], source_user_id),
                 ).fetchall()
+                if enabled():
+                    connection.execute('update compute_jobs set owner_user_id=%s,idempotency_key=null where owner_user_id=%s', (target_user_id, source_user_id))
                 projects = connection.execute(
                     "update projects set created_by = %s, updated_at = now() where created_by in (%s, (select email from \"user\" where id = %s)) returning id",
                     (target_user_id, source_user_id, source_user_id),
@@ -502,6 +512,11 @@ class ResourceRepository:
     def delete_user_resource_records(self, user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with self._connect() as connection:
             connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
+            if os.getenv('COMPUTE_ENABLED', 'false').lower() == 'true':
+                from api_errors import PublicError
+                if connection.execute("select 1 from compute_jobs where owner_user_id=%s and status in ('queued','dispatching','running','stopping','recovery_pending')", (user_id,)).fetchone():
+                    raise PublicError('RUN_IN_USE', 'Cancel active Train and Test jobs before deleting this user.', status=409)
+                connection.execute('insert into compute_user_quotas(owner_user_id,accepting_jobs) values(%s,false) on conflict(owner_user_id) do update set accepting_jobs=false', (user_id,))
             datasets = [dict(row) for row in connection.execute(
                 "select * from datasets where owner_user_id = %s for update", (user_id,)
             ).fetchall()]

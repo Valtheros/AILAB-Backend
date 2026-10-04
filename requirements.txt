@@ -7,6 +7,7 @@ python-multipart
 redis
 rq
 psycopg[binary]
+pycocotools==2.0.11
 
 # torch / torchvision are installed separately in the Dockerfile from the
 # CPU-only wheel index (see the comment there). Do not add them here or pip

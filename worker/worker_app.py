@@ -29,7 +29,7 @@ def _persist_status(
                 connection.execute(
                     "update training_tasks set status = %s, error_detail = %s, updated_at = now(), "
                     "finished_at = case when %s in ('completed','failed','stopped','cancelled') then now() else finished_at end "
-                    "where (%s::uuid is not null and id = %s::uuid) or (%s::text is not null and rq_job_id = %s)",
+                    "where compute_job_id is null and ((%s::uuid is not null and id = %s::uuid) or (%s::text is not null and rq_job_id = %s))",
                     (status, error_detail, status, run_id, run_id, job_id, job_id),
                 )
             return
@@ -77,7 +77,10 @@ def run_training(config: dict) -> dict:
         if job:
             job.meta["log_path"] = str(log_path)
             job.meta["project_name"] = project_name
-            job.save_meta()
+            try:
+                job.save_meta()
+            except Exception:
+                pass  # Redis is transport; the on-disk log remains authoritative.
 
     model_type = config.get("model_type", "yolo").lower()
     task_type = config.get("task_type", "object_detection")

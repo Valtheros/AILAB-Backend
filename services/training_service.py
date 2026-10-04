@@ -20,13 +20,14 @@ except ImportError:  # Lightweight unit-test stubs do not expose rq.exceptions.
     class NoSuchJobError(Exception):
         pass
 
-from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model
+from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model, read_yaml_limited
 from dataset_storage import registered_storage_path
 from model_catalog import get_model
 from security_utils import contained_path, validate_slug
 from settings import DATASET_DIR, REDIS_URL, RUNS_DIR, ensure_runtime_dirs
 from resource_repository import resource_repository
 from worker.error_utils import concise_error
+import compute_repository as compute
 
 
 MAX_LOG_RESPONSE_BYTES = 1024 * 1024
@@ -50,6 +51,8 @@ class TrainingService:
         if not self.redis or not resource_repository.enabled:
             return
         for run in resource_repository.list_queued_runs():
+            if compute.training_record(str(run.get('rq_job_id') or '')):
+                continue
             job_id = str(run.get("rq_job_id") or "")
             if not job_id:
                 resource_repository.update_run_status_by_id(
@@ -223,8 +226,10 @@ class TrainingService:
         owner_id: str | None = None,
         owner_email: str | None = None,
         task_id: str | None = None,
+        execution: dict | None = None,
     ) -> str:
-        self._ensure_redis()
+        if not compute.enabled():
+            self._ensure_redis()
         if not owner_id:
             raise PermissionError("Authenticated user identity is required to start training.")
         validate_slug(project_name, "project name")
@@ -248,11 +253,20 @@ class TrainingService:
                 if resource_repository.enabled and not dataset_record:
                     raise FileNotFoundError(f"Dataset '{selected_name}' is not registered. Run the resource backfill first.")
                 dataset_record = dataset_record or {"id": selected_name, "slug": selected_name}
+                # Published semantic masks reserve zero for background.
+                label_schema = dataset_record.get("metadata", {}).get("label_schema", {})
+                if model_type == "deeplabv3plus" and label_schema.get("origin") == "label_studio":
+                    extra_args = {**(extra_args or {}), "num_classes": int(label_schema["num_classes"]), "ignore_index": 255}
                 self._assert_dataset_matches_model(dataset_path, model_type, task_type, extra_args=extra_args or {})
                 prepared_dataset = prepare_dataset_for_model(dataset_path, model_type, extra_args=extra_args or {})
                 dataset_metadata = prepared_dataset["metadata"]
+                if label_schema.get("origin") == "label_studio":
+                    dataset_metadata["label_schema"] = label_schema
                 worker_dataset_path = Path(prepared_dataset["dataset_path"])
                 data_yaml_path = prepared_dataset.get("data_yaml_path")
+                if model_type == 'yolo' and label_schema.get('origin') == 'label_studio':
+                    if not read_yaml_limited(Path(data_yaml_path)).get('val'):
+                        raise ValueError('YOLO requires Validation images. Move some labeled images to Validation in Label Studio, then publish a new dataset version.')
                 job_config = {
                     "job_id": planned_job_id,
                     "task_type": task_type, "model_type": model_type, "model_name": model_name,
@@ -266,28 +280,45 @@ class TrainingService:
                 if model_type == "yolo":
                     job_config["task"] = "detect"
                 queue_name = "cv_training"
-                queue = self.queues[queue_name]
+                queue = self.queues.get(queue_name)
+                stored_params = {**(extra_args or {}), 'epochs': epochs, 'batch_size': batch_size}
                 if task_id:
                     run_record = resource_repository.activate_task(
                         owner_id=owner_id, task_id=task_id, dataset=dataset_record, run_slug=project_name,
-                        task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
+                        task_type=task_type, model_type=model_type, model_name=model_name, params=stored_params,
                         storage_path=project_dir, job_id=planned_job_id, connection=connection,
                     )
                 else:
                     run_record = resource_repository.create_run(
                         owner_id=owner_id, owner_email=owner_email, dataset=dataset_record, project_name=project_name,
-                        task_type=task_type, model_type=model_type, model_name=model_name, params=extra_args or {},
+                        task_type=task_type, model_type=model_type, model_name=model_name, params=stored_params,
                         storage_path=project_dir, job_id=planned_job_id, connection=connection,
                     )
                 project_dir.mkdir(parents=False, exist_ok=False)
                 reserved_project_dir = True
                 job_config["run_id"] = str(run_record.get("id"))
                 job_config["dataset_id"] = str(dataset_record.get("id"))
+                if compute.enabled():
+                    job_config['compute_job_id'] = planned_job_id
+                    job_config['execution'] = compute.execution_selection(execution, extra_args)
+                    compute.create_job(owner_id, run_record['id'], 'train', job_config,
+                                       job_config['execution'], job_id=planned_job_id, connection=connection,
+                                       estimated_vram_mb=int((resource_plan or {}).get('estimated_vram_mb', 0)))
                 (project_dir / "job_config.json").write_text(json.dumps(job_config, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception:
-            if reserved_project_dir:
+            committed = False
+            if compute.enabled() and reserved_project_dir:
+                try:
+                    with resource_repository._connect() as c:
+                        committed = bool(c.execute('select id from compute_jobs where id=%s', (planned_job_id,)).fetchone())
+                except Exception:
+                    committed = True  # Keep media until the transaction outcome can be confirmed.
+            if reserved_project_dir and not committed:
                 shutil.rmtree(project_dir, ignore_errors=True)
             raise
+
+        if compute.enabled():
+            return planned_job_id
 
         job_meta = {
             "project_name": project_name,
@@ -332,6 +363,9 @@ class TrainingService:
         return str(owner) if owner else None
 
     def get_container_status(self, job_id: str) -> str:
+        record = compute.training_record(job_id)
+        if record:
+            return 'exited' if record['status'] == 'completed' else record['status']
         if not self._connect_redis():
             return "redis_connection_error"
         try:
@@ -362,6 +396,14 @@ class TrainingService:
             return "redis_connection_error"
 
     def get_container_logs(self, job_id: str) -> str:
+        record = compute.training_record(job_id)
+        if record:
+            path = self._job_log_path(job_id)
+            if not path:
+                return 'Waiting for a compute worker.'
+            with path.open('rb') as file:
+                file.seek(max(0, path.stat().st_size - MAX_LOG_RESPONSE_BYTES))
+                return file.read(MAX_LOG_RESPONSE_BYTES).decode('utf-8', errors='replace')
         if not self.redis:
             return "Redis connection error: Is Redis running?"
         try:
@@ -397,6 +439,10 @@ class TrainingService:
             return None
 
     def _job_log_path(self, job_id: str) -> Path | None:
+        record = compute.training_record(job_id)
+        if record:
+            path = contained_path(self.runs_dir, record['run_slug'], 'train.log')
+            return path if path.is_file() else None
         if not self.redis:
             return None
         job = Job.fetch(job_id, connection=self.redis)
@@ -407,7 +453,7 @@ class TrainingService:
         return log_path if log_path.is_file() else None
 
     def read_job_log_chunk(self, job_id: str, offset: int = 0, max_bytes: int = 256 * 1024) -> tuple[str, int, bool]:
-        if not self.redis:
+        if not self.redis and not compute.enabled():
             return "", offset, False
         try:
             log_path = self._job_log_path(job_id)
@@ -445,7 +491,10 @@ class TrainingService:
         if status == "not_found":
             return {"job_id": job_id, "status": status, "project_name": None, "logs": "", "metrics": []}
         project_name = None
-        if self.redis:
+        record = compute.training_record(job_id)
+        if record:
+            project_name = record['run_slug']
+        elif self.redis:
             try:
                 job = Job.fetch(job_id, connection=self.redis)
                 project_name = job.meta.get("project_name")
@@ -467,6 +516,9 @@ class TrainingService:
         }
 
     def stop_training_container(self, job_id: str) -> str:
+        record = compute.training_record(job_id)
+        if record:
+            return compute.cancel_job(record['owner_user_id'], job_id)['status']
         self._ensure_redis()
         try:
             job = Job.fetch(job_id, connection=self.redis)

@@ -154,7 +154,7 @@ def _checkpoint_path(run_dir: Path) -> Path:
     )
 
 
-def load_classifier(run_dir: Path) -> dict[str, Any]:
+def load_classifier(run_dir: Path, device: str | None = None) -> dict[str, Any]:
     """Load (or reuse) the trained classifier for one run directory.
 
     The cache key includes the checkpoint size and modification time so that
@@ -163,7 +163,7 @@ def load_classifier(run_dir: Path) -> dict[str, Any]:
     torch = _require_torch()
     path = _checkpoint_path(run_dir)
     stat = path.stat()
-    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    key = (str(path), stat.st_mtime_ns, stat.st_size, device)
 
     with _cache_lock:
         cached = _model_cache.get(key)
@@ -203,7 +203,7 @@ def load_classifier(run_dir: Path) -> dict[str, Any]:
     # Use the GPU when the image provides one; the CPU path is the norm because
     # the API image ships CPU-only wheels to avoid competing for VRAM with an
     # active training job.
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
     model.to(device)
     model.eval()
 
@@ -257,7 +257,7 @@ def _open_verified_image(payload: bytes):
         raise InferenceError("The uploaded image could not be decoded.") from exc
 
 
-def predict_image(run_dir: Path, payload: bytes, top_k: int = 3) -> dict[str, Any]:
+def predict_image(run_dir: Path, payload: bytes, top_k: int = 3, *, device: str | None = None) -> dict[str, Any]:
     """Return the top-k softmax predictions for one image."""
     torch = _require_torch()
     import torchvision.transforms as transforms
@@ -266,7 +266,7 @@ def predict_image(run_dir: Path, payload: bytes, top_k: int = 3) -> dict[str, An
     image = _open_verified_image(payload)
     original_size = list(image.size)
 
-    entry = load_classifier(run_dir)
+    entry = load_classifier(run_dir, device=device) if device else load_classifier(run_dir)
     model_ready = time.perf_counter()
 
     # Mirrors the validation transform in classification_common.py exactly.

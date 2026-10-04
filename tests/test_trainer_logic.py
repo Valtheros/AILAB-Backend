@@ -414,6 +414,10 @@ class TrainerLogicTests(unittest.TestCase):
             self.assertIn(".ailab_exports", export_path.parts)
             self.assertTrue((export_path / "data.yaml").is_file())
             self.assertTrue((export_path / "labels" / "train").is_dir())
+            import yaml
+            config = yaml.safe_load((export_path / 'data.yaml').read_text())
+            self.assertEqual(Path(config['path']), export_path)
+            self.assertTrue((Path(config['path']) / config['train']).is_dir())
             self.assertFalse(first["export"]["cache_hit"])
             self.assertTrue(second["export"]["cache_hit"])
             self.assertEqual(first["export"]["fingerprint"], second["export"]["fingerprint"])
