@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
 
 
@@ -18,6 +18,14 @@ class BridgeError(Exception):
 class NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def public_url():
+    value = os.environ.get('LABEL_STUDIO_PUBLIC_URL', '').rstrip('/')
+    parsed = urlsplit(value)
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise BridgeError('Label Studio public URL is not configured correctly.')
+    return value
 
 
 def bridge(owner_id: str, action: str, payload: dict | None = None, *, content: Path | None = None):

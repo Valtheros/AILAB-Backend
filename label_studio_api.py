@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
-from label_studio_client import BridgeError, bridge
+from label_studio_client import BridgeError, bridge, public_url
 import label_studio_jobs as jobs
 from resource_repository import resource_repository as registry
 from security_utils import MAX_UPLOAD_BYTES, contained_path
@@ -143,7 +143,7 @@ def account(request: Request):
         row = c.execute('select * from label_studio_accounts where owner_user_id=%s', (user['id'],)).fetchone()
     if not row:
         return {'connected': False, 'activated': False}
-    return {'connected': True, **bridge(user['id'], 'account', {'email': user['email']}), 'url': os.environ.get('LABEL_STUDIO_PUBLIC_URL', 'http://172.25.2.135:8080') + '/projects/'}
+    return {'connected': True, **bridge(user['id'], 'account', {'email': user['email']}), 'url': public_url() + '/projects/'}
 
 
 @router.post('/account')

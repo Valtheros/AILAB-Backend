@@ -15,13 +15,17 @@ if __name__ == '__main__':
         if line and not line.startswith('#') and '=' in line:
             key, value = line.split('=', 1)
             values[key.strip()] = value.strip().strip('"').strip("'")
+    public_app = values.get('AILAB_PUBLIC_URL') or values.get('NEXT_PUBLIC_APP_URL')
+    if not public_app:
+        raise ValueError('Set NEXT_PUBLIC_APP_URL or AILAB_PUBLIC_URL before configuring Label Studio.')
+    public_app = public_app.rstrip('/')
     defaults = {
         'LABEL_STUDIO_DB': 'ailab_label_studio',
         'LABEL_STUDIO_DB_USER': 'ailab_label_studio',
         'LABEL_STUDIO_DB_PASSWORD': secrets.token_urlsafe(48),
         'LABEL_STUDIO_BRIDGE_SECRET': secrets.token_urlsafe(48),
-        'LABEL_STUDIO_PUBLIC_URL': 'http://172.25.2.135:8080',
-        'AILAB_PUBLIC_URL': values.get('NEXT_PUBLIC_APP_URL', 'http://172.25.2.135'),
+        'LABEL_STUDIO_PUBLIC_URL': public_app + '/label-studio',
+        'AILAB_PUBLIC_URL': public_app,
     }
     missing = {key: value for key, value in defaults.items() if key not in values}
     values.update(missing)
