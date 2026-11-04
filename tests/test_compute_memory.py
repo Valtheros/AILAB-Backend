@@ -1,13 +1,37 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import compute_memory as memory
+import compute_repository as compute
 
 
 class MemoryTests(unittest.TestCase):
+    def test_cpu_is_not_ready_when_coordinator_heartbeat_is_stale(self):
+        now = datetime.now(timezone.utc)
+        node = {'heartbeat_at': now - timedelta(seconds=31), 'cpu_worker_heartbeat': now, 'cpu_health_error': None}
+        context = MagicMock()
+        context.__enter__.return_value.execute.return_value.fetchall.side_effect = [[node], [], []]
+        with patch.dict('os.environ', {'COMPUTE_ENABLED': 'true'}), patch.object(compute.registry, '_connect', return_value=context):
+            result = compute.list_devices()
+        self.assertFalse(result['coordinatorAvailable'])
+        self.assertFalse(result['cpuAvailable'])
+
+    def test_cpu_resource_plan_does_not_claim_gpu_memory_warning(self):
+        context = MagicMock()
+        context.__enter__.return_value.execute.return_value.fetchall.return_value = []
+        profile = {'safe_limits': {'gpu_vram_mb': 0}}
+        plan = {'warnings': []}
+        with patch.object(compute.registry, '_connect', return_value=context), \
+             patch('resource_guard.get_resource_profile', return_value=profile), \
+             patch('resource_guard.validate_resource_plan', return_value=plan):
+            result = compute.resource_plan('resnet', {}, 2, {'mode': 'cpu'})
+        self.assertEqual(result['device'], 'CPU')
+        self.assertEqual(result['warnings'], [])
     def test_only_anonymous_ram_is_credited(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

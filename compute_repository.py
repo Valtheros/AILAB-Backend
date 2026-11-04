@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -44,7 +45,8 @@ def resource_plan(model, params, batch_size, selection):
     plan = validate_resource_plan(model, {**params, 'device': 'cpu' if chosen['mode'] == 'cpu' else '0'}, batch_size, profile)
     plan['execution'] = chosen
     plan['device'] = 'CPU' if chosen['mode'] == 'cpu' else 'Auto GPU' if chosen['mode'] == 'auto' else chosen['gpuUuid']
-    plan['warnings'].append('VRAM is an estimate, not a guarantee against out-of-memory errors.')
+    if chosen['mode'] != 'cpu':
+        plan['warnings'].append('VRAM is an estimate, not a guarantee against out-of-memory errors.')
     return plan
 
 
@@ -95,7 +97,8 @@ def list_devices(admin=False):
              'status': device_state(d, d['uuid'] in active), 'error': d['health_error'],
              'nodeId': d['node_id'], 'observedAt': d['observed_at'], 'draining': d['draining'],
              'enabled': d['enabled']} for d in devices],
-            'cpuAvailable': any(recent(n['cpu_worker_heartbeat']) and not n['cpu_health_error'] for n in nodes),
+            'coordinatorAvailable': any(recent(n.get('heartbeat_at')) for n in nodes),
+            'cpuAvailable': any(recent(n.get('heartbeat_at')) and recent(n['cpu_worker_heartbeat']) and not n['cpu_health_error'] for n in nodes),
             **({'nodes': nodes, 'quotas': quotas} if admin else {})}
 
 
@@ -111,8 +114,13 @@ def validate_target(selection, estimated_vram_mb, c):
 
 
 def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=0,
-               idempotency_key=None, job_id=None, connection=None):
+               idempotency_key=None, job_id=None, dataset_version_id=None, connection=None,
+               model_endpoint_id=None, model_api_key_id=None):
     require_enabled()
+    if kind not in {'train', 'predict', 'evaluate', 'batch_predict'}:
+        raise PublicError('INVALID_JOB_KIND', 'The requested job type is not supported.')
+    if kind == 'evaluate' and not dataset_version_id:
+        raise PublicError('DATASET_REQUIRED', 'Select a dataset version for evaluation.')
     selection = execution_selection(selection)
     own = connection is None
     c = connection or registry._connect()
@@ -121,11 +129,23 @@ def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=
         quota = c.execute('select accepting_jobs from compute_user_quotas where owner_user_id=%s', (owner_id,)).fetchone()
         if quota and not quota['accepting_jobs']:
             raise PublicError('USER_RESOURCES_DELETING', 'This account is undergoing resource cleanup. Contact an administrator.', status=409)
+        if bool(model_endpoint_id) != bool(model_api_key_id):
+            raise PublicError('UNAUTHORIZED', 'Invalid API credentials.', status=401)
+        if model_endpoint_id:
+            authorized = c.execute('''select e.checkpoint_sha256 from model_endpoints e join model_api_keys k on k.endpoint_id=e.id
+                join "user" u on u.id=e.owner_user_id where e.id=%s and k.id=%s and e.owner_user_id=%s and e.run_id=%s
+                and e.enabled and k.revoked_at is null and k.expires_at>now() and u."emailVerified" and not coalesce(u.banned,false)
+                for share of e,k,u''', (model_endpoint_id, model_api_key_id, owner_id, run_id)).fetchone()
+            if not authorized or authorized['checkpoint_sha256'] != payload.get('checkpoint_sha256'):
+                raise PublicError('MODEL_API_UNAVAILABLE', 'The API key or model endpoint is no longer active.', status=403)
         if idempotency_key:
             previous = c.execute('select * from compute_jobs where owner_user_id=%s and idempotency_key=%s',
                                  (owner_id, idempotency_key)).fetchone()
             if previous:
                 if (str(previous['run_id']) != str(run_id) or previous['kind'] != kind
+                        or str(previous.get('dataset_version_id') or '') != str(dataset_version_id or '')
+                        or str(previous.get('model_api_key_id') or '') != str(model_api_key_id or '')
+                        or str(previous.get('model_endpoint_id') or '') != str(model_endpoint_id or '')
                         or previous['payload'] != payload or previous['mode'] != selection['mode']
                         or previous['requested_gpu_uuid'] != selection['gpuUuid']):
                     raise PublicError('IDEMPOTENCY_CONFLICT', 'This request key belongs to a different job.', status=409)
@@ -133,18 +153,23 @@ def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=
         run = c.execute('select id,status from training_tasks where id=%s and owner_user_id=%s for update', (run_id, owner_id)).fetchone()
         if not run:
             raise PublicError('NOT_FOUND', 'Run not found.', status=404)
-        if kind == 'predict' and run['status'] != 'completed':
+        if kind != 'train' and run['status'] != 'completed':
             raise PublicError('RUN_NOT_COMPLETED', 'Only completed runs can be tested.', status=409)
-        count = c.execute("select count(*) as n from compute_jobs where owner_user_id=%s and kind=%s and status=any(%s)",
-                          (owner_id, kind, ['queued', *ACTIVE])).fetchone()['n']
-        if count >= (10 if kind == 'train' else 3):
+        if dataset_version_id and not c.execute("select 1 from datasets where id=%s and owner_user_id=%s and status='active'",
+                                                 (dataset_version_id, owner_id)).fetchone():
+            raise PublicError('NOT_FOUND', 'Dataset version not found.', status=404)
+        group = ['train', 'evaluate'] if kind in {'train', 'evaluate'} else ['predict', 'batch_predict']
+        count = c.execute("select count(*) as n from compute_jobs where owner_user_id=%s and kind=any(%s) and status=any(%s)",
+                          (owner_id, group, ['queued', *ACTIVE])).fetchone()['n']
+        if count >= (10 if kind in {'train', 'evaluate'} else 3):
             raise PublicError('QUEUE_LIMIT', 'You have too many pending jobs. Cancel one or wait for it to finish.', status=429)
         validate_target(selection, estimated_vram_mb, c)
         c.execute('insert into compute_user_quotas(owner_user_id) values(%s) on conflict do nothing', (owner_id,))
         row = c.execute('''insert into compute_jobs(id,owner_user_id,run_id,kind,mode,requested_gpu_uuid,
-                 payload,estimated_vram_mb,idempotency_key) values(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s) returning *''',
+                 payload,estimated_vram_mb,idempotency_key,dataset_version_id,model_endpoint_id,model_api_key_id)
+                 values(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s) returning *''',
                 (job_id or uuid.uuid4(), owner_id, run_id, kind, selection['mode'], selection['gpuUuid'],
-                 json.dumps(payload), estimated_vram_mb, idempotency_key)).fetchone()
+                 json.dumps(payload), estimated_vram_mb, idempotency_key, dataset_version_id, model_endpoint_id, model_api_key_id)).fetchone()
         if kind == 'train':
             c.execute('update training_tasks set compute_job_id=%s,execution=%s::jsonb where id=%s',
                       (row['id'], json.dumps(selection), run_id))
@@ -162,8 +187,10 @@ def public_job(row):
             'requestedExecution': {'mode': row['mode'], 'gpuUuid': row['requested_gpu_uuid']},
             'assignedGpu': {'uuid': row['assigned_gpu_uuid'], 'name': gpu} if row['assigned_gpu_uuid'] else None,
             'queueReason': row['queue_reason'], 'errorCode': row['error_code'], 'error': row['error_message'],
+            'progress': {'current': row.get('progress_current', 0), 'total': row.get('progress_total', 0)},
             'inputName': row['payload'].get('input_name'), 'inputBytes': row['payload'].get('input_bytes'),
-            'createdAt': row['created_at'], 'startedAt': row['started_at'], 'finishedAt': row['finished_at']}
+            'createdAt': row['created_at'], 'startedAt': row['started_at'], 'finishedAt': row['finished_at'],
+            'expiresAt': row['finished_at'] + timedelta(hours=24) if row.get('finished_at') and row['kind'] in {'predict', 'batch_predict'} else None}
 
 
 def get_job(owner_id, job_id, *, public=True):
@@ -179,6 +206,10 @@ def assert_run_idle(run_id, c):
     if enabled() and c.execute('select 1 from compute_jobs where run_id=%s and status=any(%s) limit 1',
                               (run_id, ['queued', *ACTIVE])).fetchone():
         raise PublicError('RUN_IN_USE', 'Cancel active compute jobs before deleting this run.', status=409)
+    if c.execute("select 1 from evaluations where run_id=%s and status='awaiting_queue' limit 1", (run_id,)).fetchone():
+        raise PublicError('RUN_IN_USE', 'Cancel the pending evaluation before deleting this run.', status=409)
+    if c.execute('select 1 from model_endpoints where run_id=%s and enabled limit 1', (run_id,)).fetchone():
+        raise PublicError('MODEL_API_ENABLED', 'Disable this model API before deleting the run.', status=409)
 
 
 @contextmanager
@@ -201,10 +232,14 @@ def cancel_job(owner_id, job_id):
             c.execute("update compute_jobs set status='cancelled',cancel_requested=true,finished_at=now() where id=%s", (job_id,))
             if row['kind'] == 'train':
                 c.execute("update training_tasks set status='cancelled',finished_at=now() where id=%s", (row['run_id'],))
+            elif row['kind'] == 'evaluate':
+                c.execute("update evaluations set status='cancelled',finished_at=now(),updated_at=now() where compute_job_id=%s", (job_id,))
         elif row['status'] in ACTIVE:
             c.execute("update compute_jobs set status='stopping',cancel_requested=true where id=%s", (job_id,))
             if row['kind'] == 'train':
                 c.execute("update training_tasks set status='stopping' where id=%s", (row['run_id'],))
+            elif row['kind'] == 'evaluate':
+                c.execute("update evaluations set status='stopping',updated_at=now() where compute_job_id=%s", (job_id,))
     return get_job(owner_id, job_id)
 
 
@@ -247,10 +282,12 @@ def claim_job(job_id, token, worker_id, gpu_uuid, c, *, memory_cgroup=None):
           and status='dispatching' and not cancel_requested returning *''', (memory_cgroup, job_id, token, worker_id, gpu_uuid)).fetchone()
     if row and row['kind'] == 'train':
         c.execute("update training_tasks set status='running',updated_at=now() where id=%s", (row['run_id'],))
+    elif row and row['kind'] == 'evaluate':
+        c.execute("update evaluations set status='running',updated_at=now() where compute_job_id=%s", (job_id,))
     return dict(row) if row else None
 
 
-def finish_job(job_id, token, status, *, error_code=None, error_message=None, result_path=None):
+def finish_job(job_id, token, status, *, error_code=None, error_message=None, result_path=None, result_state=None, dataset_verified=False):
     with registry._connect() as c:
         row = c.execute('''select * from compute_jobs where id=%s and dispatch_token=%s and status=any(%s) for update''',
                          (job_id, token, list(ACTIVE))).fetchone()
@@ -262,12 +299,40 @@ def finish_job(job_id, token, status, *, error_code=None, error_message=None, re
                      finished_at=now(),heartbeat_at=now() where id=%s''', (status, error_code, error_message, result_path, job_id))
         if row['kind'] == 'train':
             projection = 'stopped' if status == 'cancelled' and row['started_at'] else status
-            c.execute('update training_tasks set status=%s,error_detail=%s,finished_at=now(),updated_at=now() where id=%s',
-                      (projection, error_message, row['run_id']))
+            digest = row['payload'].get('dataset_content_sha256')
+            c.execute('''update training_tasks set status=%s,error_detail=%s,
+                      dataset_provenance=case when %s and dataset_content_sha256=%s then 'verified' else 'unverified' end,
+                      finished_at=now(),updated_at=now() where id=%s''',
+                      (projection, error_message, bool(status == 'completed' and dataset_verified and digest), digest, row['run_id']))
+            if status == 'completed':
+                execution = {'mode': row['mode'], 'gpuUuid': row['requested_gpu_uuid']}
+                c.execute('''insert into evaluations(owner_user_id,run_id,dataset_version_id,origin,execution,dataset_content_sha256)
+                    select t.owner_user_id,t.id,t.dataset_id,'automatic',%s::jsonb,t.dataset_content_sha256
+                    from training_tasks t join datasets d on d.id=t.dataset_id and d.status='active'
+                    where t.id=%s on conflict(run_id) where origin='automatic' do nothing''',
+                    (json.dumps(execution), row['run_id']))
+        elif row['kind'] == 'evaluate':
+            evaluation_status = (result_state if status == 'completed' and result_state in {'completed', 'partial', 'no_test'}
+                                 else 'completed' if status == 'completed' else status)
+            c.execute('''update evaluations set status=%s,result_path=%s,error_message=%s,finished_at=now(),updated_at=now()
+                         where compute_job_id=%s''', (evaluation_status, result_path, error_message, job_id))
+        if status in {'completed', 'failed'}:
+            from notification_service import emit
+            notice_status = evaluation_status if row['kind'] == 'evaluate' and status == 'completed' else status
+            emit(c, row['owner_user_id'], f"compute:{job_id}:{status}", row['kind'], notice_status,
+                 f"/tasks/{row['run_id']}")
+
+
+def require_unexpired_result(row):
+    finished = row.get('finished_at')
+    if row['kind'] in {'predict', 'batch_predict'} and (
+            row.get('cleaned_at') or (finished and finished + timedelta(hours=24) <= datetime.now(timezone.utc))):
+        raise PublicError('RESULT_EXPIRED', 'This result expired. Upload the images again.', status=410)
 
 
 def read_result(owner_id, job_id):
     row = get_job(owner_id, job_id, public=False)
+    require_unexpired_result(row)
     if row['status'] != 'completed' or row['kind'] != 'predict':
         raise PublicError('RESULT_NOT_READY', 'Prediction is not ready.', status=409)
     path = job_directory(job_id) / 'result.json'

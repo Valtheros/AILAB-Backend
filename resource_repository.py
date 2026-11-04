@@ -70,10 +70,84 @@ class ResourceRepository:
             return []
         with self._connect() as connection:
             rows = connection.execute(
-                "select * from datasets where owner_user_id = %s and status = 'active' order by created_at desc",
+                """select d.*, c.name as collection_name from datasets d
+                   left join dataset_collections c on c.id = d.collection_id and c.owner_user_id=d.owner_user_id
+                   where d.owner_user_id = %s and d.status = 'active' order by d.created_at desc""",
                 (owner_id,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def reserve_dataset_version(self, owner_id: str, name: str, collection_id: Any | None, connection) -> dict[str, Any]:
+        if collection_id:
+            collection = connection.execute(
+                'select * from dataset_collections where id=%s and owner_user_id=%s for update',
+                (collection_id, owner_id),
+            ).fetchone()
+            if not collection:
+                raise FileNotFoundError('Dataset collection was not found.')
+        else:
+            collection = connection.execute(
+                'insert into dataset_collections(owner_user_id,name) values(%s,%s) returning *',
+                (owner_id, name),
+            ).fetchone()
+        if collection.get('label_studio_project_id'):
+            version = connection.execute(
+                '''update label_studio_projects set reserved_version=greatest(reserved_version,%s)+1
+                   where id=%s and owner_user_id=%s returning reserved_version''',
+                (collection['reserved_version'], collection['label_studio_project_id'], owner_id),
+            ).fetchone()
+            if not version:
+                raise FileNotFoundError('Label Studio project was not found.')
+            return dict(connection.execute(
+                'update dataset_collections set reserved_version=%s where id=%s returning *',
+                (version['reserved_version'], collection['id']),
+            ).fetchone())
+        return dict(connection.execute(
+            'update dataset_collections set reserved_version=reserved_version+1 where id=%s returning *',
+            (collection['id'],),
+        ).fetchone())
+
+    def attach_label_studio_version(self, owner_id: str, project_id: Any, name: str, version: int,
+                                    dataset_id: Any, path: Path, content_sha256: str, connection) -> dict[str, Any]:
+        project = connection.execute(
+            'select reserved_version from label_studio_projects where id=%s and owner_user_id=%s',
+            (project_id, owner_id),
+        ).fetchone()
+        if not project:
+            raise FileNotFoundError('Label Studio project was not found.')
+        collection = connection.execute(
+            '''insert into dataset_collections(owner_user_id,name,label_studio_project_id,reserved_version)
+               values(%s,%s,%s,%s) on conflict(label_studio_project_id) where label_studio_project_id is not null
+               do update set reserved_version=greatest(dataset_collections.reserved_version,excluded.reserved_version)
+               where dataset_collections.owner_user_id=excluded.owner_user_id returning *''',
+            (owner_id, name, project_id, max(version, project['reserved_version'])),
+        ).fetchone()
+        if not collection:
+            raise FileNotFoundError('Dataset collection was not found.')
+        row = connection.execute(
+            '''update datasets set collection_id=%s,version=%s,content_sha256=%s,source_manifest_path=%s
+               where id=%s and owner_user_id=%s and (collection_id is null or (collection_id=%s and version=%s))
+               returning *''',
+             (collection['id'], version, content_sha256, str(path / '.ailab_source_manifest.json') if content_sha256 else None,
+             dataset_id, owner_id, collection['id'], version),
+        ).fetchone()
+        if not row:
+            raise ValueError('Dataset version is already associated with another collection.')
+        return dict(row)
+
+    def insert_dataset_version(self, owner_id: str, owner_email: str | None, slug: str, path: Path,
+                               metadata: dict[str, Any], collection: dict[str, Any], content_sha256: str,
+                               connection) -> dict[str, Any]:
+        row = connection.execute(
+            '''insert into datasets(name,slug,storage_path,formats,tasks,classes,created_by,owner_user_id,
+                 status,metadata,collection_id,version,content_sha256,source_manifest_path)
+               values(%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,'active',%s::jsonb,%s,%s,%s,%s)
+               returning *''',
+            (slug, slug, str(path), json.dumps(metadata.get('formats', [])), json.dumps(metadata.get('tasks', [])),
+             json.dumps(metadata.get('classes', [])), owner_email or owner_id, owner_id, json.dumps(metadata),
+             collection['id'], collection['reserved_version'], content_sha256, str(path / '.ailab_source_manifest.json')),
+        ).fetchone()
+        return dict(row)
 
     def active_runs_for_dataset(self, dataset_id: Any, connection=None) -> list[dict[str, Any]]:
         if not self.enabled or dataset_id is None:
@@ -82,13 +156,33 @@ class ResourceRepository:
         connection = connection or self._connect()
         try:
             rows = connection.execute(
-                "select id, run_slug, rq_job_id, status from training_tasks where dataset_id = %s and status = any(%s)",
-                (dataset_id, list(ACTIVE_RUN_STATUSES)),
+                """select id,run_slug,rq_job_id,status from training_tasks where dataset_id=%s and status=any(%s)
+                   union all
+                   select t.id,t.run_slug,j.rq_job_id,j.status from compute_jobs j
+                   join training_tasks t on t.id=j.run_id where j.dataset_version_id=%s and j.status=any(%s)
+                   union all
+                   select t.id,t.run_slug,null as rq_job_id,e.status from evaluations e
+                   join training_tasks t on t.id=e.run_id where e.dataset_version_id=%s and e.status='awaiting_queue'
+                   union all
+                   select i.dataset_version_id as id,'dataset-index' as run_slug,i.rq_job_id,i.status from dataset_indexes i
+                   where i.dataset_version_id=%s and i.status in ('queued','running')""",
+                (dataset_id, list(ACTIVE_RUN_STATUSES), dataset_id,
+                 ['queued', 'dispatching', 'running', 'stopping', 'recovery_pending'], dataset_id, dataset_id),
             ).fetchall()
             return [dict(row) for row in rows]
         finally:
             if owned:
                 connection.close()
+
+    def dataset_usage(self, owner_id: str, dataset_id: Any, slug: str) -> dict[str, Any]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                '''select status,count(*) as count from training_tasks where owner_user_id=%s
+                   and (dataset_id=%s or (dataset_id is null and dataset_slug=%s)) group by status''',
+                (owner_id, dataset_id, slug),
+            ).fetchall()
+        return {'runCount': sum(row['count'] for row in rows),
+                'activeCount': len(self.active_runs_for_dataset(dataset_id))}
 
     def upsert_dataset(self, owner_id: str, owner_email: str | None, slug: str, path: Path, metadata: dict[str, Any], connection=None) -> dict[str, Any]:
         if not self.enabled:
@@ -158,12 +252,13 @@ class ResourceRepository:
             row = connection.execute(
                 """
                 insert into training_tasks
-                  (dataset_id, dataset_slug, rq_job_id, run_slug, display_name, task_type, model_type, model_name, params, status,
+                  (dataset_id, dataset_slug, dataset_content_sha256, dataset_provenance, rq_job_id, run_slug, display_name, task_type, model_type, model_name, params, status,
                    storage_path, created_by, owner_user_id)
-                values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'queued', %s, %s, %s)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, 'queued', %s, %s, %s)
                 returning *
                 """,
-                (dataset.get("id"), dataset.get("slug"), job_id, project_name, project_name, task_type, model_type, model_name,
+                (dataset.get("id"), dataset.get("slug"), dataset.get("content_sha256"),
+                 'unverified', job_id, project_name, project_name, task_type, model_type, model_name,
                  json.dumps(params), str(storage_path), owner_email or owner_id, owner_id),
             ).fetchone()
             if owned:
@@ -201,7 +296,10 @@ class ResourceRepository:
             return []
         with self._connect() as connection:
             rows = connection.execute(
-                "select * from training_tasks where owner_user_id = %s order by updated_at desc",
+                """select t.*,d.version as dataset_version,d.status as dataset_status,c.name as dataset_collection_name
+                   from training_tasks t left join datasets d on d.id=t.dataset_id and d.owner_user_id=t.owner_user_id
+                   left join dataset_collections c on c.id=d.collection_id and c.owner_user_id=t.owner_user_id
+                   where t.owner_user_id=%s order by t.updated_at desc""",
                 (owner_id,),
             ).fetchall()
             return [dict(row) for row in rows]
@@ -212,9 +310,12 @@ class ResourceRepository:
         owned = connection is None
         connection = connection or self._connect()
         try:
-            suffix = " for update" if for_update else ""
+            suffix = " for update of t" if for_update else ""
             row = connection.execute(
-                f"select * from training_tasks where owner_user_id = %s and id = %s{suffix}",
+                f"""select t.*,d.version as dataset_version,d.status as dataset_status,c.name as dataset_collection_name
+                    from training_tasks t left join datasets d on d.id=t.dataset_id and d.owner_user_id=t.owner_user_id
+                    left join dataset_collections c on c.id=d.collection_id and c.owner_user_id=t.owner_user_id
+                    where t.owner_user_id=%s and t.id=%s{suffix}""",
                 (owner_id, task_id),
             ).fetchone()
             return dict(row) if row else None
@@ -230,13 +331,16 @@ class ResourceRepository:
                 """
                 update training_tasks set
                   display_name = %s, task_type = %s, model_type = %s, model_name = %s,
-                  dataset_slug = nullif(%s, ''), params = %s::jsonb, execution=%s::jsonb, updated_at = now()
+                  dataset_slug = nullif(%s, ''),
+                  dataset_id = (select id from datasets where owner_user_id=%s and slug=nullif(%s,'') and status='active'),
+                  params = %s::jsonb, execution=%s::jsonb, updated_at = now()
                 where owner_user_id = %s and id = %s and status = 'draft'
                 returning *
                 """,
                 (
                     values["display_name"], values["task_type"], values["model_type"], values["model_name"],
-                    values.get("dataset_slug", ""), json.dumps(values["params"]), json.dumps(values['params'].get('_execution')), owner_id, task_id,
+                    values.get("dataset_slug", ""), owner_id, values.get("dataset_slug", ""),
+                    json.dumps(values["params"]), json.dumps(values['params'].get('_execution')), owner_id, task_id,
                 ),
             ).fetchone()
             return dict(row) if row else None
@@ -251,12 +355,14 @@ class ResourceRepository:
             raise FileExistsError("Training task has already been started")
         row = connection.execute(
             """
-            update training_tasks set dataset_id = %s, dataset_slug = %s, rq_job_id = %s,
+            update training_tasks set dataset_id = %s, dataset_slug = %s, dataset_content_sha256 = %s,
+              dataset_provenance = %s, rq_job_id = %s,
               run_slug = %s, task_type = %s, model_type = %s, model_name = %s, params = %s::jsonb,
               status = 'queued', storage_path = %s, error_detail = null, updated_at = now()
             where id = %s returning *
             """,
-            (dataset.get("id"), dataset.get("slug"), job_id, run_slug, task_type, model_type, model_name,
+            (dataset.get("id"), dataset.get("slug"), dataset.get("content_sha256"),
+             'unverified', job_id, run_slug, task_type, model_type, model_name,
              json.dumps(params), str(storage_path), task_id),
         ).fetchone()
         return dict(row)
@@ -408,6 +514,21 @@ class ResourceRepository:
             "totalBytes": total_bytes,
         }
 
+    @staticmethod
+    def assert_no_pending_imports(connection, user_id: str) -> None:
+        if connection.execute(
+            "select 1 from dataset_import_intents where owner_user_id=%s and status='pending' limit 1", (user_id,)
+        ).fetchone():
+            raise ValueError('A dataset import is unfinished. Restore the account and retry that import before transferring or deleting its data.')
+
+    @staticmethod
+    def assert_no_storage_account(connection, user_id: str) -> None:
+        table = connection.execute("select to_regclass('storage_accounts') as name").fetchone()
+        if table['name'] and connection.execute(
+            'select 1 from storage_accounts where owner_user_id=%s', (user_id,)
+        ).fetchone():
+            raise ValueError('Storage quota cleanup or transfer is not available for this account yet.')
+
     def transfer_user_resources(self, source_user_id: str, target_user_id: str) -> dict[str, int]:
         from compute_repository import enabled, ACTIVE
         if enabled():
@@ -423,6 +544,13 @@ class ResourceRepository:
                     connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
                 if enabled() and connection.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (source_user_id, ['queued', *ACTIVE])).fetchone():
                     raise ValueError('Cancel active Train and Test jobs before transferring resources.')
+                if connection.execute("select 1 from evaluations where owner_user_id=%s and status='awaiting_queue'", (source_user_id,)).fetchone():
+                    raise ValueError('Cancel pending evaluations before transferring resources.')
+                if connection.execute("select 1 from dataset_indexes where owner_user_id=%s and status in ('queued','running')", (source_user_id,)).fetchone():
+                    raise ValueError('Wait for dataset indexing to finish before transferring resources.')
+                self.assert_no_pending_imports(connection, source_user_id)
+                self.assert_no_storage_account(connection, source_user_id)
+                self.assert_no_storage_account(connection, target_user_id)
                 target = connection.execute('select id, email from "user" where id = %s', (target_user_id,)).fetchone()
                 if not target:
                     raise FileNotFoundError("Transfer target user was not found")
@@ -454,15 +582,28 @@ class ResourceRepository:
                         source.replace(destination)
                         moves.append((source, destination))
                     connection.execute(
-                        "update datasets set owner_user_id = %s, created_by = %s, storage_path = %s, updated_at = now() where id = %s",
-                        (target_user_id, target["email"], str(destination), row["id"]),
+                        """update datasets set owner_user_id=%s, created_by=%s, storage_path=%s,
+                           source_manifest_path=case when source_manifest_path is null then null else %s end,
+                           updated_at=now() where id=%s""",
+                        (target_user_id, target["email"], str(destination), str(destination / '.ailab_source_manifest.json'), row["id"]),
                     )
+                connection.execute('update dataset_import_intents set owner_user_id=%s where owner_user_id=%s', (target_user_id, source_user_id))
+                connection.execute(
+                    "update dataset_collections set owner_user_id=%s, label_studio_project_id=null where owner_user_id=%s",
+                    (target_user_id, source_user_id),
+                )
                 runs = connection.execute(
                     "update training_tasks set owner_user_id = %s, created_by = %s, updated_at = now() where owner_user_id = %s returning storage_path",
                     (target_user_id, target["email"], source_user_id),
                 ).fetchall()
                 if enabled():
                     connection.execute('update compute_jobs set owner_user_id=%s,idempotency_key=null where owner_user_id=%s', (target_user_id, source_user_id))
+                connection.execute('update evaluations set owner_user_id=%s,idempotency_key=null where owner_user_id=%s', (target_user_id, source_user_id))
+                connection.execute('update dataset_indexes set owner_user_id=%s where owner_user_id=%s', (target_user_id, source_user_id))
+                connection.execute('''update model_api_keys set revoked_at=coalesce(revoked_at,now())
+                    where endpoint_id in (select id from model_endpoints where owner_user_id=%s)''', (source_user_id,))
+                connection.execute('update model_endpoints set owner_user_id=%s,enabled=false,updated_at=now() where owner_user_id=%s',
+                                   (target_user_id, source_user_id))
                 projects = connection.execute(
                     "update projects set created_by = %s, updated_at = now() where created_by in (%s, (select email from \"user\" where id = %s)) returning id",
                     (target_user_id, source_user_id, source_user_id),
@@ -517,6 +658,15 @@ class ResourceRepository:
                 if connection.execute("select 1 from compute_jobs where owner_user_id=%s and status in ('queued','dispatching','running','stopping','recovery_pending')", (user_id,)).fetchone():
                     raise PublicError('RUN_IN_USE', 'Cancel active Train and Test jobs before deleting this user.', status=409)
                 connection.execute('insert into compute_user_quotas(owner_user_id,accepting_jobs) values(%s,false) on conflict(owner_user_id) do update set accepting_jobs=false', (user_id,))
+            if connection.execute("select 1 from evaluations where owner_user_id=%s and status='awaiting_queue'", (user_id,)).fetchone():
+                raise ValueError('Cancel pending evaluations before deleting this user.')
+            if connection.execute("select 1 from dataset_indexes where owner_user_id=%s and status in ('queued','running')", (user_id,)).fetchone():
+                raise ValueError('Wait for dataset indexing to finish before deleting this user.')
+            self.assert_no_pending_imports(connection, user_id)
+            self.assert_no_storage_account(connection, user_id)
+            connection.execute('''update model_api_keys set revoked_at=coalesce(revoked_at,now())
+                where endpoint_id in (select id from model_endpoints where owner_user_id=%s)''', (user_id,))
+            connection.execute('update model_endpoints set enabled=false,updated_at=now() where owner_user_id=%s', (user_id,))
             datasets = [dict(row) for row in connection.execute(
                 "select * from datasets where owner_user_id = %s for update", (user_id,)
             ).fetchall()]
@@ -531,8 +681,12 @@ class ResourceRepository:
 
     def finalize_user_resource_delete(self, user_id: str) -> None:
         with self._connect() as connection:
+            connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
+            self.assert_no_storage_account(connection, user_id)
             connection.execute("delete from training_tasks where owner_user_id = %s", (user_id,))
+            connection.execute("delete from dataset_import_intents where owner_user_id = %s", (user_id,))
             connection.execute("delete from datasets where owner_user_id = %s", (user_id,))
+            connection.execute("delete from dataset_collections where owner_user_id = %s", (user_id,))
             connection.execute("delete from projects where created_by in (%s, (select email from \"user\" where id = %s))", (user_id, user_id))
             connection.execute("delete from workspace_members where user_id = %s", (user_id,))
 

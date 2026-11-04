@@ -87,6 +87,11 @@ class MetricResolutionTests(unittest.TestCase):
 
 
 class SeriesTests(unittest.TestCase):
+    def test_comparison_preserves_creation_time_for_duplicate_names(self):
+        created = "2026-10-31T12:00:00Z"
+        result = build_run_comparison(task_row=_task(created_at=created), metric_rows=[], config={})
+        self.assertEqual(result["createdAt"], created)
+
     def test_classification_series_and_best_point(self):
         result = build_run_comparison(
             task_row=_task(),

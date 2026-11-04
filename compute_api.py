@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import uuid
+import re
+import json
 from typing import Literal
 
 from fastapi import APIRouter, Request, Query
@@ -44,12 +46,12 @@ def job(job_id: uuid.UUID, request: Request):
 
 
 @router.get('/jobs')
-def latest(request: Request, runSlug: str = Query(max_length=128)):
+def latest(request: Request, runSlug: str = Query(max_length=128), kind: Literal['predict', 'batch_predict'] = 'predict'):
     with compute.registry._connect() as c:
         row = c.execute('''select j.*,g.name as gpu_name from compute_jobs j join training_tasks t on j.run_id=t.id
           left join gpu_devices g on g.uuid=j.assigned_gpu_uuid
-          where j.owner_user_id=%s and t.run_slug=%s and j.kind='predict' and j.cleaned_at is null
-          order by j.created_at desc limit 1''', (owner(request)['id'], runSlug)).fetchone()
+          where j.owner_user_id=%s and t.run_slug=%s and j.kind=%s and j.cleaned_at is null
+          order by j.created_at desc limit 1''', (owner(request)['id'], runSlug, kind)).fetchone()
     return {'job': compute.public_job(row) if row else None}
 
 
@@ -57,6 +59,7 @@ def latest(request: Request, runSlug: str = Query(max_length=128)):
 def input_image(job_id: uuid.UUID, request: Request):
     from PIL import Image
     row = compute.get_job(owner(request)['id'], job_id, public=False)
+    compute.require_unexpired_result(row)
     path = compute.job_directory(job_id) / 'input'
     if row['kind'] != 'predict' or not path.is_file():
         raise PublicError('RESULT_EXPIRED', 'The input image is no longer available.', status=410)
@@ -73,10 +76,43 @@ def result(job_id: uuid.UUID, request: Request):
 @router.get('/jobs/{job_id}/overlay')
 def overlay(job_id: uuid.UUID, request: Request):
     row = compute.get_job(owner(request)['id'], job_id, public=False)
+    compute.require_unexpired_result(row)
     path = compute.job_directory(job_id) / 'overlay.png'
     if row['status'] != 'completed' or not path.is_file():
         raise PublicError('RESULT_EXPIRED', 'The overlay is not available.', status=410)
     return FileResponse(path, media_type='image/png', headers={'Cache-Control': 'private, no-store'})
+
+
+def batch_result_file(job_id, owner_id, file_path):
+    row = compute.get_job(owner_id, job_id, public=False)
+    if row['kind'] != 'batch_predict':
+        raise PublicError('NOT_FOUND', 'File not found.', status=404)
+    compute.require_unexpired_result(row)
+    if row['status'] not in {'completed', 'failed'}:
+        raise PublicError('RESULT_NOT_READY', 'The batch result is not ready.', status=409)
+    if not (file_path in {'result.json', 'results.csv', 'results.zip'}
+            or re.fullmatch(r'overlays/\d{3}\.png', file_path)
+            or re.fullmatch(r'masks/\d{3}-(?:semantic|\d+)\.png', file_path)):
+        raise PublicError('NOT_FOUND', 'File not found.', status=404)
+    path = compute.job_directory(job_id) / file_path
+    if row.get('error_code') == 'CHECKPOINT_CHANGED':
+        raise PublicError('CHECKPOINT_CHANGED', 'The model changed while this job was running.', status=409)
+    if not path.is_file():
+        raise PublicError('RESULT_UNAVAILABLE', 'This job has no result file. Check the job error.', status=409)
+    return path
+
+
+@router.get('/jobs/{job_id}/batch-result')
+def batch_result(job_id: uuid.UUID, request: Request):
+    path = batch_result_file(job_id, owner(request)['id'], 'result.json')
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+@router.get('/jobs/{job_id}/files/{file_path:path}')
+def batch_file(job_id: uuid.UUID, file_path: str, request: Request):
+    path = batch_result_file(job_id, owner(request)['id'], file_path)
+    return FileResponse(path, filename=path.name, content_disposition_type='inline' if path.suffix == '.png' else 'attachment',
+                        headers={'Cache-Control': 'private, no-store'})
 
 
 @router.post('/jobs/{job_id}/cancel')

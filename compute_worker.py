@@ -13,9 +13,11 @@ import threading
 
 from redis import Redis
 from rq import SimpleWorker
+from psycopg.errors import QueryCanceled
 
 from compute_memory import worker_cgroup
 from compute_repository import claim_job, finish_job, job_directory, queue_name, registry
+from compute_policy import JOB_TIMEOUTS
 from settings import REDIS_URL
 
 log = logging.getLogger(__name__)
@@ -48,6 +50,15 @@ def heartbeat(job_id=None, token=None, health_error=None):
         if job_id:
             return c.execute('''update compute_jobs set heartbeat_at=now() where id=%s and dispatch_token=%s
                    returning cancel_requested,status''', (job_id, token)).fetchone()
+
+
+def idle_heartbeat(health_error=None):
+    try:
+        heartbeat(health_error=health_error)
+    except QueryCanceled:
+        log.warning('Worker heartbeat timed out; retrying')
+        return False
+    return True
 
 
 def terminate_child():
@@ -121,7 +132,7 @@ def execute(job_id, token):
         env = {**os.environ, 'COMPUTE_EXEC_DEVICE': 'cuda:0' if GPU else 'cpu',
                'OMP_NUM_THREADS': str(row['worker_cpus']), 'MKL_NUM_THREADS': str(row['worker_cpus'])}
         CHILD = subprocess.Popen([sys.executable, '-m', 'compute_executor', job_id, token], env=env, cwd=directory, start_new_session=True)
-        deadline = time.monotonic() + (86400 if row['kind'] == 'train' else 600)
+        deadline = time.monotonic() + JOB_TIMEOUTS[row['kind']]
         while CHILD.poll() is None:
             try:
                 current = heartbeat(job_id, token)
@@ -220,19 +231,22 @@ def main():
     LEASE.execute('set statement_timeout=3000')
     if not LEASE.execute('select pg_try_advisory_lock(%s) as ok', (registry._lock_key(f'compute-worker:{NODE}:{GPU or "cpu"}'),)).fetchone()['ok']:
         raise RuntimeError('Another worker owns this device')
+    while not idle_heartbeat(health_error='Worker starting'):
+        time.sleep(2)
     try:
         preflight()
         recover_stopped_jobs()
     except Exception as exc:
         reason = str(exc)
-        heartbeat(health_error=reason)
         log.exception('Worker failed preflight; not accepting jobs')
         while True:
-            heartbeat(health_error=reason)
+            idle_heartbeat(health_error=reason)
             time.sleep(5)
     redis = Redis.from_url(REDIS_URL, socket_connect_timeout=2, socket_timeout=3)
     while True:
-        heartbeat()
+        if not idle_heartbeat():
+            time.sleep(2)
+            continue
         with registry._connect() as c:
             unfinished = c.execute("select id,dispatch_token from compute_jobs where worker_id=%s and status in ('running','stopping','recovery_pending')", (WORKER_ID,)).fetchall()
         for row in unfinished:

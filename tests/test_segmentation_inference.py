@@ -40,6 +40,12 @@ class HelperTests(unittest.TestCase):
         # Pads when fewer names than classes.
         self.assertEqual(si._semantic_class_names({}, 3), ["background", "class 1", "class 2"])
 
+    def test_semantic_class_schema_must_be_complete_for_evaluation(self):
+        self.assertTrue(si._semantic_classes_verified({'dataset_metadata': {'classes': ['road']}}, 2))
+        self.assertFalse(si._semantic_classes_verified({}, 2))
+        self.assertFalse(si._semantic_classes_verified({'dataset_metadata': {'classes': ['road', 'road']}}, 3))
+        self.assertFalse(si._semantic_classes_verified({'dataset_metadata': {'classes': ['background']}}, 2))
+
     def test_unknown_model_type_raises(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(InferenceError):
@@ -77,6 +83,13 @@ class SemanticParseTests(unittest.TestCase):
         legend = out["segmentation"]["legend"]
         self.assertEqual([e["name"] for e in legend], ["road"])  # background excluded
         self.assertAlmostEqual(legend[0]["percent"], 50.0, delta=2.0)
+        masks = {}
+        def save_mask(name, image):
+            masks[name] = image
+            return name
+        with_mask = si._predict_semantic(entry, _tiny_image(), 0.5, mask_sink=save_mask)
+        self.assertEqual(with_mask['segmentation']['maskFile'], 'semantic')
+        self.assertEqual((masks['semantic'].getpixel((0, 0)), masks['semantic'].getpixel((0, 29))), (1, 0))
 
 
 @unittest.skipUnless(HAS_STACK, "torch/PIL/numpy not installed")
@@ -105,6 +118,13 @@ class InstanceParseTests(unittest.TestCase):
         self.assertEqual(seg["kind"], "instance")
         self.assertEqual(seg["instances"][0]["className"], "fire")  # label 1 -> classes[0]
         self.assertTrue(seg["overlay"].startswith("data:image/png;base64,"))
+        masks = {}
+        def save_mask(name, image):
+            masks[name] = image
+            return name
+        with_mask = si._predict_instance(entry, _tiny_image(), 0.5, mask_sink=save_mask)
+        self.assertEqual(with_mask['segmentation']['instances'][0]['maskFile'], '0')
+        self.assertEqual((masks['0'].getpixel((0, 0)), masks['0'].getpixel((20, 20))), (255, 0))
 
 
 if __name__ == "__main__":

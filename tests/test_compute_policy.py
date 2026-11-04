@@ -105,6 +105,14 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(fair_candidates([alice, bob, train], quota, 0)[0]['id'], 'bob')
         self.assertEqual(fair_candidates([alice, bob, train], quota, 3)[0]['id'], 'train')
 
+    def test_evaluation_and_batch_are_heavy_jobs_for_fairness(self):
+        prediction = dict(self.job, id='prediction', kind='predict')
+        evaluation = dict(self.job, id='evaluation', kind='evaluate')
+        batch = dict(self.job, id='batch', kind='batch_predict')
+        jobs = [prediction, evaluation, batch]
+        self.assertEqual(fair_candidates(jobs, {}, 0)[0]['id'], 'prediction')
+        self.assertIn(fair_candidates(jobs, {}, 3)[0]['id'], {'evaluation', 'batch'})
+
 
 if __name__ == '__main__':
     unittest.main()

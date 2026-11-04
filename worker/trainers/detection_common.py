@@ -397,18 +397,19 @@ def train_detection_model(config: dict, model_kind: str, log_path: Path | None, 
     # training loop. torchvision detectors only expose losses (not mAP) without a
     # heavy COCO-eval dependency, so test loss is the held-out metric here,
     # mirroring the val-loss the loop already tracks. Skips when no test split.
-    try:
-        if model_kind == "mask_rcnn":
-            test_dataset = CocoInstanceDataset(dataset_path, "test", include_masks=True,
-                category_to_label=train_dataset.category_to_label, classes=train_dataset.classes)
-        elif use_coco_boxes:
-            test_dataset = CocoInstanceDataset(dataset_path, "test", include_masks=False,
-                category_to_label=train_dataset.category_to_label, classes=train_dataset.classes)
-        else:
-            test_dataset = YoloBoxDataset(dataset_path, data_yaml_path, "test")
-    except Exception as exc:
-        test_dataset = None
-        logger(log_path, f"[{model_kind}] No test split found; skipping held-out test evaluation. ({exc})")
+    test_dataset = None
+    if not config.get('compute_job_id'):
+        try:
+            if model_kind == "mask_rcnn":
+                test_dataset = CocoInstanceDataset(dataset_path, "test", include_masks=True,
+                    category_to_label=train_dataset.category_to_label, classes=train_dataset.classes)
+            elif use_coco_boxes:
+                test_dataset = CocoInstanceDataset(dataset_path, "test", include_masks=False,
+                    category_to_label=train_dataset.category_to_label, classes=train_dataset.classes)
+            else:
+                test_dataset = YoloBoxDataset(dataset_path, data_yaml_path, "test")
+        except Exception as exc:
+            logger(log_path, f"[{model_kind}] No test split found; skipping held-out test evaluation. ({exc})")
 
     if test_dataset is not None and len(test_dataset) > 0:
         try:

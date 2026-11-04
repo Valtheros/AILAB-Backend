@@ -4,12 +4,46 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
+from psycopg.errors import QueryCanceled
 
 import compute_executor
 import compute_worker
 
 
 class WorkerFailureTests(unittest.TestCase):
+    def test_startup_heartbeat_retries_statement_timeout_before_preflight(self):
+        lease = MagicMock()
+        lease.execute.return_value.fetchone.return_value = {'ok': True}
+        with patch.object(compute_worker.registry, '_connect', return_value=lease), \
+             patch.object(compute_worker, 'preflight', side_effect=SystemExit) as preflight, \
+             patch.object(compute_worker, 'heartbeat', side_effect=[QueryCanceled(), None]) as heartbeat, \
+             patch.object(compute_worker.time, 'sleep') as sleep, \
+             patch.object(compute_worker, 'log'):
+            with self.assertRaises(SystemExit):
+                compute_worker.main()
+        self.assertEqual(heartbeat.call_count, 2)
+        sleep.assert_called_once_with(2)
+        preflight.assert_called_once()
+
+    def test_idle_heartbeat_retries_statement_timeout_before_accepting_jobs(self):
+        lease = MagicMock()
+        lease.execute.return_value.fetchone.return_value = {'ok': True}
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.execute.return_value.fetchall.return_value = []
+        with patch.object(compute_worker.registry, '_connect', side_effect=[lease, connection]), \
+             patch.object(compute_worker, 'preflight'), \
+             patch.object(compute_worker, 'recover_stopped_jobs'), \
+             patch.object(compute_worker, 'heartbeat', side_effect=[None, QueryCanceled(), None]) as heartbeat, \
+             patch.object(compute_worker, 'SimpleWorker') as worker, \
+             patch.object(compute_worker.time, 'sleep', side_effect=[None, SystemExit]), \
+             patch.object(compute_worker, 'log'):
+            with self.assertRaises(SystemExit):
+                compute_worker.main()
+        self.assertEqual(heartbeat.call_count, 3)
+        self.assertEqual(heartbeat.call_args_list[0].kwargs, {'health_error': 'Worker starting'})
+        worker.return_value.work.assert_called_once()
+
     def supervisor(self, *, code=None, cancel=False, timeout=False, kill_code=-15, child_result=None):
         process = Mock(returncode=code)
         process.poll.side_effect = lambda: process.returncode

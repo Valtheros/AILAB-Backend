@@ -273,6 +273,8 @@ class TrainingService:
                     "epochs": epochs, "batch_size": batch_size, "project_name": project_name,
                     "dataset_name": dataset_path.name, "dataset_path": str(worker_dataset_path),
                     "source_dataset_path": str(dataset_path), "data_yaml_path": data_yaml_path,
+                    "dataset_version_id": str(dataset_record['id']),
+                    "dataset_content_sha256": dataset_record.get('content_sha256'),
                     "dataset_metadata": dataset_metadata, "dataset_export": prepared_dataset.get("export"),
                     "extra_args": extra_args or {}, "resource_plan": resource_plan or {},
                     "created_by": owner_id, "created_by_email": owner_email,

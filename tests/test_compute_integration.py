@@ -2,20 +2,23 @@
 import os
 import unittest
 import uuid
+import tempfile
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 from types import SimpleNamespace
 
 import compute_repository as compute
 from api_errors import PublicError
+from tests.isolation import require_test_database, require_test_storage
 
 
 @unittest.skipUnless(os.getenv('COMPUTE_TESTS') == '1', 'Requires isolated PostgreSQL test stack')
 class ComputeIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        if 'ailab_compute_test_pg' not in compute.registry.database_url:
-            raise RuntimeError('Refusing to run destructive fixtures against a non-test database')
+        require_test_database(compute.registry.database_url)
+        require_test_storage('RUNS_DIR', 'DATASET_DIR', 'STORAGE_DIR', 'TMPDIR')
         from scripts.apply_schema import apply
         with compute.registry._connect() as c:
             c.execute('''create table if not exists "user"(id text primary key,email text unique,name text,
@@ -125,6 +128,119 @@ class ComputeIntegrationTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 c.execute('delete from training_tasks where id=%s', (self.runs['alice'],))
 
+    def test_batch_and_single_prediction_share_pending_limit(self):
+        self.create(kind='predict')
+        self.create(kind='batch_predict')
+        self.create(kind='batch_predict')
+        with self.assertRaises(PublicError) as error:
+            self.create(kind='predict')
+        self.assertEqual(error.exception.code, 'QUEUE_LIMIT')
+
+    def test_evaluation_cannot_access_other_owners_dataset_and_prevents_deletion(self):
+        dataset = compute.registry.upsert_dataset('bob', 'bob@test.invalid', 'bob-data',
+                                                  os.path.join(os.getenv('TMPDIR', '.'), 'test-dataset'),
+                                                  {'formats': [], 'tasks': [], 'classes': []})
+        with self.assertRaises(PublicError) as error:
+            compute.create_job('alice', self.runs['alice'], 'evaluate', {}, {'mode': 'auto'}, dataset_version_id=dataset['id'])
+        self.assertEqual(error.exception.status, 404)
+        job = compute.create_job('bob', self.runs['bob'], 'evaluate', {}, {'mode': 'auto'}, dataset_version_id=dataset['id'])
+        self.assertEqual(len(compute.registry.active_runs_for_dataset(dataset['id'])), 1)
+        compute.cancel_job('bob', job['id'])
+        self.assertEqual(compute.registry.active_runs_for_dataset(dataset['id']), [])
+
+    def test_completed_train_creates_one_durable_automatic_evaluation(self):
+        from evaluation_repository import cancel, enqueue_pending
+        dataset = compute.registry.upsert_dataset('alice', 'alice@test.invalid', 'train-data',
+            os.path.join(os.getenv('TMPDIR', '.'), 'train-dataset'), {'formats': [], 'tasks': [], 'classes': []})
+        with compute.registry._connect() as c:
+            c.execute('update training_tasks set dataset_id=%s where id=%s', (dataset['id'], self.runs['alice']))
+        job = self.create(kind='train')
+        reserved = compute.reserve_one()
+        with compute.registry._connect() as c:
+            compute.claim_job(job['id'], reserved['dispatch_token'], reserved['worker_id'], reserved['assigned_gpu_uuid'], c)
+        compute.finish_job(job['id'], reserved['dispatch_token'], 'completed')
+        compute.finish_job(job['id'], reserved['dispatch_token'], 'completed')
+        with compute.registry._connect() as c:
+            rows = c.execute('select * from evaluations where run_id=%s', (self.runs['alice'],)).fetchall()
+            self.assertEqual(c.execute('select status from training_tasks where id=%s', (self.runs['alice'],)).fetchone()['status'], 'completed')
+            notices = c.execute('select * from notifications where owner_user_id=%s and kind=%s', ('alice', 'train')).fetchall()
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]['status'], 'completed')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['status'], 'awaiting_queue')
+        self.assertEqual(len(compute.registry.active_runs_for_dataset(dataset['id'])), 1)
+        enqueue_pending()
+        enqueue_pending()
+        with compute.registry._connect() as c:
+            evaluation = c.execute('select * from evaluations where id=%s', (rows[0]['id'],)).fetchone()
+            self.assertEqual(c.execute("select count(*) as count from compute_jobs where kind='evaluate'").fetchone()['count'], 1)
+        self.assertEqual(evaluation['status'], 'queued')
+        self.assertEqual(cancel('alice', evaluation['id'])['status'], 'cancelled')
+
+    def test_verified_training_provenance_requires_successful_worker_proof(self):
+        with compute.registry._connect() as connection:
+            connection.execute('update training_tasks set dataset_content_sha256=%s where id=%s', ('digest', self.runs['alice']))
+        job = compute.create_job('alice', self.runs['alice'], 'train', {'dataset_content_sha256': 'digest'},
+                                 {'mode': 'auto'}, estimated_vram_mb=2000)
+        reserved = compute.reserve_one()
+        with compute.registry._connect() as connection:
+            compute.claim_job(job['id'], reserved['dispatch_token'], reserved['worker_id'], reserved['assigned_gpu_uuid'], connection)
+        compute.finish_job(job['id'], reserved['dispatch_token'], 'completed', dataset_verified=True)
+        with compute.registry._connect() as connection:
+            run = connection.execute('select status,dataset_provenance from training_tasks where id=%s', (self.runs['alice'],)).fetchone()
+        self.assertEqual((run['status'], run['dataset_provenance']), ('completed', 'verified'))
+
+    def test_notifications_are_scoped_and_marking_is_idempotent(self):
+        import notification_api
+        from notification_service import emit
+        with compute.registry._connect() as c:
+            emit(c, 'alice', 'test:event', 'train', 'completed', f"/tasks/{self.runs['alice']}")
+            emit(c, 'alice', 'test:event', 'train', 'completed', f"/tasks/{self.runs['alice']}")
+        with patch.object(notification_api, 'owner', return_value={'id': 'alice'}):
+            result = notification_api.list_notifications(None)
+            self.assertEqual(result['unreadCount'], 1)
+            notification_id = uuid.UUID(result['notifications'][0]['id'])
+        with patch.object(notification_api, 'owner', return_value={'id': 'bob'}):
+            self.assertEqual(notification_api.list_notifications(None)['unreadCount'], 0)
+            with self.assertRaises(PublicError) as error:
+                notification_api.mark_read(notification_id, None)
+            self.assertEqual(error.exception.status, 404)
+        with patch.object(notification_api, 'owner', return_value={'id': 'alice'}):
+            notification_api.mark_read(notification_id, None)
+            notification_api.mark_read(notification_id, None)
+            self.assertEqual(notification_api.list_notifications(None)['unreadCount'], 0)
+
+    def test_delete_evaluation_is_owner_scoped_and_preserves_run(self):
+        import evaluation_api
+        dataset = compute.registry.upsert_dataset('alice', 'alice@test.invalid', 'sample',
+            os.path.join(os.getenv('TMPDIR', '.'), 'evaluation-test-dataset'), {'formats': [], 'tasks': [], 'classes': []})
+        evaluation_id = uuid.uuid4()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result_dir = root / 'run' / 'evaluations' / str(evaluation_id)
+            result_dir.mkdir(parents=True)
+            (result_dir / 'report.json').write_text('{}')
+            with compute.registry._connect() as c:
+                c.execute("update training_tasks set run_slug='run' where id=%s", (self.runs['alice'],))
+                c.execute('''insert into evaluations(id,owner_user_id,run_id,dataset_version_id,origin,status)
+                    values(%s,'alice',%s,%s,'manual','queued')''', (evaluation_id, self.runs['alice'], dataset['id']))
+            with patch.object(evaluation_api, 'RUNS_DIR', root), patch.object(evaluation_api, 'owner', return_value={'id': 'bob'}):
+                with self.assertRaises(PublicError) as error:
+                    evaluation_api.delete_evaluation(evaluation_id, None)
+                self.assertEqual(error.exception.status, 404)
+            with patch.object(evaluation_api, 'RUNS_DIR', root), patch.object(evaluation_api, 'owner', return_value={'id': 'alice'}):
+                with self.assertRaises(PublicError) as error:
+                    evaluation_api.delete_evaluation(evaluation_id, None)
+                self.assertEqual(error.exception.status, 409)
+                self.assertTrue(result_dir.is_dir())
+                with compute.registry._connect() as c:
+                    c.execute("update evaluations set status='completed' where id=%s", (evaluation_id,))
+                self.assertEqual(evaluation_api.delete_evaluation(evaluation_id, None), {'deleted': True})
+            self.assertFalse(result_dir.exists())
+            with compute.registry._connect() as c:
+                self.assertIsNone(c.execute('select id from evaluations where id=%s', (evaluation_id,)).fetchone())
+                self.assertIsNotNone(c.execute('select id from training_tasks where id=%s', (self.runs['alice'],)).fetchone())
+
     def test_idempotency_rejects_different_input_or_device(self):
         one = self.create(idempotency_key='input-key')
         with self.assertRaises(PublicError) as exc:
@@ -155,6 +271,31 @@ class ComputeIntegrationTests(unittest.TestCase):
             self.assertIsNone(compute.claim_job(job['id'], first['dispatch_token'], first['worker_id'], first['assigned_gpu_uuid'], c))
             self.assertIsNotNone(compute.claim_job(job['id'], second['dispatch_token'], second['worker_id'], second['assigned_gpu_uuid'], c))
 
+    def test_new_worker_recovers_fresh_dispatch_without_waiting_for_timeout(self):
+        from compute_coordinator import recover_dispatches
+        job = self.create()
+        reserved = compute.reserve_one()
+        recover_dispatches()
+        self.assertEqual(compute.get_job('alice', job['id'])['status'], 'dispatching')
+        with compute.registry._connect() as c:
+            c.execute("update gpu_devices set worker_id='replacement',worker_heartbeat=now(),health_error='Worker starting' where uuid=%s", (reserved['assigned_gpu_uuid'],))
+        recover_dispatches()
+        self.assertEqual(compute.get_job('alice', job['id'])['status'], 'queued')
+        with compute.registry._connect() as c:
+            self.assertIsNone(compute.claim_job(job['id'], reserved['dispatch_token'], reserved['worker_id'], reserved['assigned_gpu_uuid'], c))
+
+    def test_new_cpu_worker_recovers_fresh_dispatch(self):
+        from compute_coordinator import recover_dispatches
+        with compute.registry._connect() as c:
+            c.execute("update compute_nodes set cpu_worker_id='old-cpu',cpu_worker_heartbeat=now() where id='local'")
+        job = compute.create_job('alice', self.runs['alice'], 'predict', {}, {'mode': 'cpu'})
+        reserved = compute.reserve_one()
+        self.assertIsNotNone(reserved)
+        with compute.registry._connect() as c:
+            c.execute("update compute_nodes set cpu_worker_id='new-cpu',cpu_worker_heartbeat=now() where id='local'")
+        recover_dispatches()
+        self.assertEqual(compute.get_job('alice', job['id'])['status'], 'queued')
+
     def test_prediction_files_expire_but_running_files_remain(self):
         from compute_coordinator import cleanup_results
         job = self.create()
@@ -168,6 +309,73 @@ class ComputeIntegrationTests(unittest.TestCase):
         self.assertFalse(directory.exists())
         self.assertIsNotNone(compute.get_job('alice', job['id'], public=False)['cleaned_at'])
 
+    def test_failed_batch_without_output_is_unavailable_not_expired(self):
+        from compute_api import batch_result_file
+
+        job = self.create(kind='batch_predict')
+        reserved = compute.reserve_one()
+        with compute.registry._connect() as connection:
+            compute.claim_job(job['id'], reserved['dispatch_token'], reserved['worker_id'], reserved['assigned_gpu_uuid'], connection)
+        compute.finish_job(job['id'], reserved['dispatch_token'], 'failed', error_code='COMPUTE_FAILED', error_message='Model failed.')
+        with self.assertRaises(PublicError) as error:
+            batch_result_file(job['id'], 'alice', 'result.json')
+        self.assertEqual((error.exception.code, error.exception.status), ('RESULT_UNAVAILABLE', 409))
+        with compute.registry._connect() as connection:
+            connection.execute("update compute_jobs set finished_at=now()-interval '25 hours' where id=%s", (job['id'],))
+        with self.assertRaises(PublicError) as error:
+            batch_result_file(job['id'], 'alice', 'result.json')
+        self.assertEqual((error.exception.code, error.exception.status), ('RESULT_EXPIRED', 410))
+
+    def test_single_image_files_expire_without_waiting_for_cleanup(self):
+        from compute_api import input_image, overlay
+
+        job = self.create()
+        directory = compute.job_directory(job['id'])
+        directory.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(__import__('shutil').rmtree, directory, ignore_errors=True)
+        (directory / 'input').write_bytes(b'original')
+        (directory / 'overlay.png').write_bytes(b'overlay')
+        (directory / 'result.json').write_text('{}')
+        with compute.registry._connect() as connection:
+            connection.execute("update compute_jobs set status='completed',finished_at=now()-interval '25 hours' where id=%s",
+                               (job['id'],))
+        with patch('compute_api.owner', return_value={'id': 'alice'}):
+            for fn in (lambda: compute.read_result('alice', job['id']),
+                       lambda: input_image(job['id'], None), lambda: overlay(job['id'], None)):
+                with self.subTest(fn=fn), self.assertRaises(PublicError) as error:
+                    fn()
+                self.assertEqual((error.exception.code, error.exception.status), ('RESULT_EXPIRED', 410))
+        self.assertTrue(directory.exists())
+
+    def test_cleanup_only_removes_temporary_prediction_results(self):
+        import shutil
+        from compute_coordinator import cleanup_results
+
+        jobs = {}
+        for kind in ('predict', 'batch_predict', 'train', 'evaluate'):
+            job_id = uuid.uuid4()
+            directory = compute.job_directory(job_id)
+            directory.mkdir(parents=True, exist_ok=True)
+            self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+            (directory / 'record').write_text(kind)
+            with compute.registry._connect() as connection:
+                connection.execute("""insert into compute_jobs(id,owner_user_id,run_id,kind,mode,status,finished_at,result_path,payload)
+                    values(%s,'alice',%s,%s,'cpu','completed',now()-interval '25 hours','retained.json','{}'::jsonb)""",
+                    (job_id, self.runs['alice'], kind))
+            jobs[kind] = (job_id, directory)
+
+        cleanup_results()
+        for kind, (job_id, directory) in jobs.items():
+            row = compute.get_job('alice', job_id, public=False)
+            if kind in {'predict', 'batch_predict'}:
+                self.assertFalse(directory.exists())
+                self.assertIsNotNone(row['cleaned_at'])
+                self.assertIsNone(row['result_path'])
+            else:
+                self.assertTrue((directory / 'record').is_file())
+                self.assertIsNone(row['cleaned_at'])
+                self.assertEqual(row['result_path'], 'retained.json')
+
     def test_version_reservations_never_reuse_cancelled_number(self):
         import label_studio_jobs as jobs
         project = uuid.uuid4()
@@ -179,6 +387,31 @@ class ComputeIntegrationTests(unittest.TestCase):
             jobs.cancel('alice', one['id'])
             two = jobs.create('alice', project, 'publish', preview_only=True)
         self.assertGreater(two['version'], one['version'])
+
+    def test_label_account_cleanup_blocks_active_work_and_preserves_other_owner(self):
+        import label_studio_jobs as jobs
+        project_a, project_b = uuid.uuid4(), uuid.uuid4()
+        with compute.registry._connect() as c:
+            c.execute("insert into label_studio_accounts(owner_user_id,ls_user_id) values('alice',1),('bob',2)")
+            c.execute("insert into label_studio_projects(id,owner_user_id,ls_project_id,name,kind) values(%s,'alice',1,'A','object_detection'),(%s,'bob',2,'B','object_detection')", (project_a, project_b))
+        with patch.object(jobs, 'enqueue'), patch.object(jobs, 'bridge') as bridge:
+            op = jobs.create('alice', project_a, 'publish', preview_only=True)
+            with compute.registry._connect() as c:
+                c.execute('update "user" set banned=true where id=%s', ('alice',))
+            with self.assertRaisesRegex(ValueError, 'active Label Studio'):
+                jobs.delete_account_data('alice')
+            bridge.assert_not_called()
+            with self.assertRaisesRegex(ValueError, 'disabled'):
+                jobs.create('alice', project_a, 'publish')
+            jobs.cancel('alice', op['id'])
+            jobs.delete_account_data('alice')
+            jobs.delete_account_data('alice')
+            bridge.assert_called_once_with('alice', 'delete-account')
+        with compute.registry._connect() as c:
+            self.assertIsNone(c.execute("select 1 from label_studio_accounts where owner_user_id='alice'").fetchone())
+            self.assertIsNotNone(c.execute("select 1 from label_studio_projects where owner_user_id='bob'").fetchone())
+            c.execute("delete from training_tasks where owner_user_id='alice'")
+            c.execute('delete from "user" where id=%s', ('alice',))
 
 
 if __name__ == '__main__': unittest.main()

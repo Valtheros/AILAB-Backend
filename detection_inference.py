@@ -201,11 +201,8 @@ def load_detector(run_dir: Path, model_type: str, device: str | None = None) -> 
 
 
 def _predict_yolo(entry: dict[str, Any], image, threshold: float) -> list[dict[str, Any]]:
-    import numpy as np
-
-    # Ultralytics accepts an RGB ndarray and returns boxes in the input image's
-    # own pixel space, which is exactly the original size we pass here.
-    results = entry["model"].predict(source=np.asarray(image), conf=threshold, verbose=False, device=entry.get('device', 'cpu'))
+    # PIL lets Ultralytics perform its own RGB-to-BGR conversion before preprocessing.
+    results = entry["model"].predict(source=image, conf=threshold, verbose=False, device=entry.get('device', 'cpu'))
     if not results:
         return []
     boxes = results[0].boxes

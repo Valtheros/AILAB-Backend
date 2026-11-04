@@ -20,7 +20,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MASK_EXTENSIONS = {".png", ".bmp", ".tif", ".tiff"}
 DATASET_METADATA_VERSION = 2
 EXPORTS_DIR_NAME = ".ailab_exports"
-SOURCE_FINGERPRINT_SKIP_FILES = {".ailab_dataset.json"}
+SOURCE_FINGERPRINT_SKIP_FILES = {".ailab_dataset.json", ".ailab_source_manifest.json"}
 TRAINABLE_FORMATS = {
     "imagefolder",
     "yolo_detection",

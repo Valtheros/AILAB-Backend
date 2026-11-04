@@ -61,7 +61,7 @@ from worker.trainers.classification_common import _batch_size_for
 from worker.trainers import detection_datasets as detection_datasets_module
 from worker.trainers.detection_datasets import CocoInstanceDataset
 from worker.trainers.detection_common import _evaluate_detection_metrics
-from worker.trainers.deeplabv3plus_trainer import _segmentation_scores
+from worker.trainers.deeplabv3plus_trainer import _batch_norm_for_single_image, _segmentation_scores
 from worker.trainers.trainer_utils import format_epoch_metrics, require_positive_batch_size, split_image_dir
 from worker.trainers.yolo_trainer import _format_epoch_log
 from worker.error_utils import concise_error
@@ -70,6 +70,28 @@ from services.training_service import TrainingService
 
 
 class TrainerLogicTests(unittest.TestCase):
+    def test_deeplab_single_image_batch_norm_restores_training_and_gradients(self):
+        import torch
+        import torch.nn as nn
+
+        model = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.BatchNorm2d(3), nn.Conv2d(3, 2, 1))
+        model.train()
+        batch_norm = model[1]
+        before = batch_norm.running_mean.clone()
+        with _batch_norm_for_single_image(model, 1):
+            self.assertFalse(batch_norm.training)
+            model(torch.randn(1, 3, 4, 4)).sum().backward()
+        self.assertTrue(batch_norm.training)
+        self.assertTrue(torch.equal(before, batch_norm.running_mean))
+        self.assertIsNotNone(batch_norm.weight.grad)
+        with _batch_norm_for_single_image(model, 2):
+            self.assertTrue(batch_norm.training)
+            model(torch.randn(2, 3, 4, 4)).sum().backward()
+        with self.assertRaises(RuntimeError):
+            with _batch_norm_for_single_image(model, 1):
+                raise RuntimeError('test')
+        self.assertTrue(batch_norm.training)
+
     def test_epoch_log_uses_the_results_row(self):
         row = {
             "epoch": 2,

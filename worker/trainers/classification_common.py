@@ -377,13 +377,14 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     # training, metrics, or best-checkpoint selection. Any failure here is
     # logged and swallowed — the run is already complete.
     test_result = None
-    try:
-        test_result = _evaluate_test_split(
-            dataset_path, val_transform, model, device, criterion, train_dataset,
-            batch_size, workers, results_dir, family, logger, log_path,
-        )
-    except Exception as exc:  # pragma: no cover - defensive, never fail a done run
-        logger(log_path, f"[{family}] Test evaluation was skipped after an error: {exc}")
+    if not config.get('compute_job_id'):
+        try:
+            test_result = _evaluate_test_split(
+                dataset_path, val_transform, model, device, criterion, train_dataset,
+                batch_size, workers, results_dir, family, logger, log_path,
+            )
+        except Exception as exc:  # pragma: no cover - defensive, never fail a done run
+            logger(log_path, f"[{family}] Test evaluation was skipped after an error: {exc}")
 
     return {
         "status": "completed",

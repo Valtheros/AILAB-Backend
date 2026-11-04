@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import os
+import re
 import shutil
 import time
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +34,8 @@ from dataset_utils import (
     safe_dataset_name,
     validate_dataset_for_upload,
 )
-from dataset_storage import dataset_lock_name, owner_dataset_path, registered_storage_path
+from dataset_storage import dataset_lock_name, owner_dataset_path, owner_dataset_root, registered_storage_path
+from dataset_versioning import MANIFEST_NAME, encode_manifest, source_manifest, write_manifest
 from inference_service import (
     MAX_INFERENCE_IMAGE_BYTES,
     InferenceError,
@@ -43,7 +48,6 @@ from detection_inference import DETECTION_TASK_TYPE, predict_detection
 from segmentation_inference import SEGMENTATION_TASK_TYPE, predict_segmentation
 from model_catalog import get_catalog, get_model, validate_model_params
 from run_comparison import build_run_comparison, summarise_comparison
-from run_insights import analyse_run, compare_insights
 from resource_guard import (
     ResourcePlanError,
     enforce_resource_plan,
@@ -54,7 +58,6 @@ from security_utils import (
     contained_path,
     named_file_lock,
     ReversibleDirectoryRemoval,
-    ReversibleDirectoryReplace,
     safe_extract_zip,
     save_upload_to_temp,
     staging_directory,
@@ -67,6 +70,12 @@ from settings import BACKEND_INTERNAL_TOKEN, CORS_ORIGINS, DATASET_DIR, RUNS_DIR
 from sse_utils import TERMINAL_STATUSES, heartbeat, sse_event
 import compute_repository as compute
 from compute_api import router as compute_router, ExecutionSelection
+from evaluation_api import router as evaluation_router
+from notification_api import router as notification_router
+from model_endpoint_api import router as model_endpoint_router
+from model_public_api import router as model_public_router
+from dataset_version_api import router as dataset_version_router
+import model_api_service
 from api_errors import PublicError, error_info
 
 
@@ -76,6 +85,11 @@ from label_studio_api import router as label_studio_router, internal_router as l
 app.include_router(label_studio_router)
 app.include_router(label_studio_internal_router)
 app.include_router(compute_router)
+app.include_router(evaluation_router)
+app.include_router(notification_router)
+app.include_router(model_endpoint_router)
+app.include_router(model_public_router)
+app.include_router(dataset_version_router)
 
 
 @app.exception_handler(PublicError)
@@ -118,6 +132,19 @@ PUBLIC_API_PATHS = {"/api/model-catalog", "/api/resource-profile"}
 @app.middleware("http")
 async def require_internal_token(request: Request, call_next):
     path = request.url.path
+    if path.startswith('/api/v1/'):
+        try:
+            principal = await asyncio.to_thread(model_api_service.authenticate, request.headers.get('authorization'))
+            submitting = request.method == 'POST' and re.fullmatch(r'/api/v1/models/[0-9a-fA-F-]+/predict(?:-batch)?', path) is not None
+            await asyncio.to_thread(model_api_service.enforce_rate_limit, principal, submitting)
+            request.state.model_api_principal = principal
+        except PublicError as exc:
+            headers = {'Retry-After': str(exc.details['retryAfter'])} if exc.status == 429 else {}
+            return JSONResponse({'detail': str(exc), **error_info(exc), 'requestId': request.state.request_id},
+                                status_code=exc.status, headers=headers)
+        response = await call_next(request)
+        response.headers['Cache-Control'] = 'private, no-store'
+        return response
     if path.startswith("/api") and path not in PUBLIC_API_PATHS:
         if not BACKEND_INTERNAL_TOKEN:
             return JSONResponse({'detail': 'The service is not configured. Contact an administrator.', 'code': 'SERVICE_UNAVAILABLE', 'details': {}, 'requestId': request.state.request_id}, status_code=503)
@@ -195,6 +222,7 @@ class ResourcePlanPreviewRequest(BaseModel):
 
 class StagedImportRequest(BaseModel):
     uploadToken: str = Field(min_length=20, max_length=128)
+    collectionId: uuid.UUID | None = None
 
 
 class TransferResourcesRequest(BaseModel):
@@ -332,6 +360,12 @@ def _task_response(row: dict[str, Any], run: dict[str, Any] | None = None) -> di
         "modelType": row.get("model_type") or "yolo",
         "modelName": row.get("model_name") or "yolo11n",
         "datasetName": row.get("dataset_slug") or "",
+        "datasetId": str(row["dataset_id"]) if row.get("dataset_id") else None,
+        "datasetCollectionName": row.get("dataset_collection_name"),
+        "datasetVersion": row.get("dataset_version"),
+        "datasetStatus": row.get("dataset_status"),
+        "datasetContentSha256": row.get("dataset_content_sha256"),
+        "datasetProvenance": row.get("dataset_provenance") or "unverified",
         "epochs": int(params.get("epochs", 50)),
         "batchSize": int(params.get("batch_size", 16)),
         "device": str(params.get("device", "cpu")),
@@ -380,10 +414,13 @@ def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
     metadata = normalize_dataset_metadata(metadata)
     workflow = dataset_workflow_metadata(metadata, get_catalog())
     ready_models = [model for model in workflow.get("compatible_models", []) if model.get("ready")]
+    schema = metadata.get("label_schema") or {}
+    labels = schema.get("classes") if isinstance(schema, dict) and schema.get("origin") == "label_studio" and schema.get("task") == "image_classification" else None
+    display_classes = labels if isinstance(labels, list) and len(labels) == len(metadata["classes"]) and all(isinstance(label, str) and label for label in labels) else metadata["classes"]
     return {
         "tasks": metadata["tasks"],
         "formats": metadata["formats"],
-        "classes": metadata["classes"],
+        "classes": display_classes,
         "image_count": metadata["image_count"],
         "size_bytes": metadata["size_bytes"],
         "warnings": metadata.get("warnings", []),
@@ -440,15 +477,17 @@ async def _inspect_uploaded_zip(request: Request, file: UploadFile) -> dict[str,
         raise HTTPException(status_code=400, detail="Only .zip files are supported")
 
     dataset_name = safe_dataset_name(file.filename)
-    staging_dir = staging_directory(DATASET_DIR)
+    owner_id = _require_request_user_id(request)
+    owner_root = owner_dataset_root(DATASET_DIR, owner_id)
+    staging_dir = staging_directory(owner_root)
     temp_zip_path: Path | None = None
     try:
-        temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
+        temp_zip_path = await save_upload_to_temp(file, owner_root)
         extract_dir, metadata = await asyncio.to_thread(_extract_and_validate_upload, temp_zip_path, staging_dir)
         profile = _dataset_profile(metadata)
         staged = await asyncio.to_thread(
             staged_uploads.create,
-            _require_request_user_id(request),
+            owner_id,
             dataset_name,
             extract_dir,
             profile,
@@ -470,69 +509,8 @@ async def _inspect_uploaded_zip(request: Request, file: UploadFile) -> dict[str,
 
 
 async def _import_uploaded_zip(request: Request, file: UploadFile) -> dict[str, Any]:
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No filename provided")
-    if not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are supported")
-
-    dataset_name = safe_dataset_name(file.filename)
-    try:
-        validate_slug(dataset_name, "dataset name")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    request_owner = _require_request_user_id(request)
-    target_dir = owner_dataset_path(DATASET_DIR, request_owner, dataset_name)
-    staging_dir = staging_directory(DATASET_DIR)
-    temp_zip_path: Path | None = None
-    replacement: ReversibleDirectoryReplace | None = None
-
-    try:
-        temp_zip_path = await save_upload_to_temp(file, DATASET_DIR)
-        extract_dir, metadata = await asyncio.to_thread(_extract_and_validate_upload, temp_zip_path, staging_dir)
-        with named_file_lock(DATASET_DIR, dataset_lock_name(request_owner, dataset_name), "dataset name"):
-            with resource_repository.dataset_guard(request_owner, dataset_name) as connection:
-                existing = resource_repository.get_dataset(request_owner, dataset_name, connection)
-                if existing:
-                    target_dir = registered_storage_path(DATASET_DIR, existing["storage_path"])
-                active = resource_repository.active_runs_for_dataset(existing.get("id") if existing else None, connection)
-                if active:
-                    names = ", ".join(str(run["run_slug"]) for run in active)
-                    raise HTTPException(status_code=409, detail=f"Dataset is in use by active training run(s): {names}")
-                target_owner = _dataset_owner(target_dir) if target_dir.exists() else None
-                if target_dir.exists() and target_owner not in {None, request_owner}:
-                    raise HTTPException(status_code=409, detail="Dataset storage ownership is inconsistent. Contact an administrator.")
-                target_dir.parent.mkdir(parents=True, exist_ok=True)
-                replacement = ReversibleDirectoryReplace(extract_dir, target_dir).apply()
-                metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
-                workflow = dataset_workflow_metadata(metadata, get_catalog())
-                _write_dataset_metadata(target_dir, request, workflow)
-                record = resource_repository.upsert_dataset(request_owner, _request_user_email(request), dataset_name, target_dir, metadata, connection)
-            replacement.commit()
-            return {**_dataset_response(dataset_name, metadata), "id": str(record.get("id", dataset_name))}
-    except HTTPException:
-        if replacement is not None:
-            replacement.rollback()
-        raise
-    except zipfile.BadZipFile:
-        if replacement is not None:
-            replacement.rollback()
-        raise HTTPException(status_code=400, detail="Invalid ZIP file")
-    except FileExistsError as exc:
-        if replacement is not None:
-            replacement.rollback()
-        raise HTTPException(status_code=409, detail=str(exc))
-    except ValueError as exc:
-        if replacement is not None:
-            replacement.rollback()
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception as exc:
-        if replacement is not None:
-            replacement.rollback()
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if temp_zip_path and temp_zip_path.exists():
-            temp_zip_path.unlink()
+    inspected = await _inspect_uploaded_zip(request, file)
+    return await asyncio.to_thread(import_dataset, StagedImportRequest(uploadToken=inspected['uploadToken']), request)
 
 
 @app.get("/")
@@ -585,6 +563,8 @@ def preview_resource_plan(payload: ResourcePlanPreviewRequest, request: Request)
     enforce_resource_plan unchanged.
     """
     _require_request_user_id(request)
+    if os.getenv('COMPUTE_REQUIRED', 'false').lower() == 'true':
+        compute.require_enabled()
     if get_model(payload.model_type) is None:
         raise HTTPException(status_code=400, detail=f"Unsupported model_type: {payload.model_type}")
     plan = compute.resource_plan(payload.model_type, dict(payload.params or {}), payload.batch_size,
@@ -602,6 +582,8 @@ def start_train(train_request: TrainRequest, request: Request):
 
 
 def _start_train_request(train_request: TrainRequest, request: Request, task_id: str | None = None):
+    if os.getenv('COMPUTE_REQUIRED', 'false').lower() == 'true':
+        compute.require_enabled()
     if compute.enabled():
         train_request.execution = ExecutionSelection(**compute.execution_selection(
             train_request.execution.model_dump() if train_request.execution else None, train_request.params))
@@ -710,16 +692,7 @@ def get_metrics(project_name: str, request: Request):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not metrics:
         return {"status": "no_data", "metrics": []}
-    # Plain-language, rule-based insights over the numbers already in the CSV
-    # (and the test evaluation, if the run wrote one). Read-only; never fails
-    # the metrics response.
-    config = _read_json_file(contained_path(RUNS_DIR, project_name, "job_config.json"))
-    test_eval = _read_json_file(contained_path(RUNS_DIR, project_name, "test_evaluation.json"))
-    try:
-        analysis = analyse_run(metrics, str(config.get("task_type") or ""), test_eval or None)
-    except Exception:
-        analysis = {"metric": None, "insights": []}
-    return {"status": "success", "metrics": metrics, "insights": analysis["insights"]}
+    return {"status": "success", "metrics": metrics, "insights": []}
 
 
 @app.post("/api/stop/{job_id}")
@@ -819,13 +792,20 @@ def list_datasets(request: Request):
             resource_repository.update_dataset_metadata(record["id"], metadata)
         metadata["export_cache"] = export_cache_metadata(item)
         profile = _dataset_profile(metadata)
+        label_schema = metadata.get("label_schema") or {}
+        label_schema = label_schema if isinstance(label_schema, dict) and label_schema.get("origin") == "label_studio" else None
         created = time.strftime("%Y-%m-%d", time.localtime(item.stat().st_ctime))
         datasets.append(
             {
                 "id": str(record.get("id")) if record else item.name,
                 "name": item.name,
+                "collectionId": str(record["collection_id"]) if record and record.get("collection_id") else None,
+                "collectionName": record.get("collection_name") if record else None,
+                "version": record.get("version") if record else None,
+                "contentSha256": record.get("content_sha256") if record else None,
                 "images": metadata["image_count"],
-                "classes": metadata["classes"],
+                "classes": profile["classes"],
+                "labelSchema": {"origin": "label_studio", "numClasses": label_schema.get("num_classes")} if label_schema else None,
                 "createdAt": created,
                 "size": format_bytes(metadata["size_bytes"]),
                 "tasks": metadata["tasks"],
@@ -861,52 +841,106 @@ async def inspect_dataset_upload(request: Request, file: UploadFile = File(...))
 @app.post("/api/datasets/import")
 def import_dataset(payload: StagedImportRequest, request: Request):
     owner_id = _require_request_user_id(request)
-    replacement: ReversibleDirectoryReplace | None = None
+    token = payload.uploadToken
+    if not token or any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for character in token):
+        raise HTTPException(status_code=400, detail='Invalid upload token')
+    if not resource_repository.enabled:
+        raise HTTPException(status_code=503, detail='Dataset registry is unavailable')
+    token_hash = hashlib.sha256(token.encode('ascii')).hexdigest()
     try:
-        manifest, extracted_dir, _pending_stage_dir = staged_uploads.peek(payload.uploadToken, owner_id)
-        dataset_name = str(manifest["dataset_name"])
-        validate_slug(dataset_name, "dataset name")
-        metadata = inspect_dataset_for_upload(extracted_dir)
-        validate_dataset_for_upload(extracted_dir, metadata)
-        with resource_repository.dataset_guard(owner_id, dataset_name) as connection:
-            existing = resource_repository.get_dataset(owner_id, dataset_name, connection)
-            target_dir = (
-                registered_storage_path(DATASET_DIR, existing["storage_path"])
-                if existing
-                else owner_dataset_path(DATASET_DIR, owner_id, dataset_name)
-            )
-            active = resource_repository.active_runs_for_dataset(existing.get("id") if existing else None, connection)
-            if active:
-                names = ", ".join(str(run["run_slug"]) for run in active)
-                raise HTTPException(status_code=409, detail=f"Dataset is in use by active training run(s): {names}")
-            if target_dir.exists() and existing is None:
-                raise HTTPException(status_code=409, detail="Dataset storage exists without a registry record. Contact an administrator.")
-            _manifest, extracted_dir, stage_dir = staged_uploads.consume(payload.uploadToken, owner_id)
-            target_dir.parent.mkdir(parents=True, exist_ok=True)
-            replacement = ReversibleDirectoryReplace(extracted_dir, target_dir).apply()
-            metadata["yaml_path"] = str(find_dataset_yaml(target_dir) or "")
-            workflow = dataset_workflow_metadata(metadata, get_catalog())
-            _write_dataset_metadata(target_dir, request, workflow)
-            record = resource_repository.upsert_dataset(owner_id, _request_user_email(request), dataset_name, target_dir, metadata, connection)
-        replacement.commit()
-        shutil.rmtree(stage_dir, ignore_errors=True)
-        return {**_dataset_response(dataset_name, metadata), "id": str(record.get("id", dataset_name))}
-    except HTTPException:
-        if replacement is not None:
-            replacement.rollback()
-        raise
+        with named_file_lock(DATASET_DIR, dataset_lock_name(owner_id, token_hash), 'dataset import'):
+            with resource_repository._connect() as connection:
+                intent = connection.execute(
+                    'select * from dataset_import_intents where owner_user_id=%s and token_sha256=%s',
+                    (owner_id, token_hash),
+                ).fetchone()
+            if not intent:
+                staged, extracted_dir, stage_dir = staged_uploads.peek(token, owner_id)
+                original_name = validate_slug(str(staged['dataset_name']), 'dataset name')
+                metadata = inspect_dataset_for_upload(extracted_dir)
+                validate_dataset_for_upload(extracted_dir, metadata)
+                content_hash = write_manifest(stage_dir, source_manifest(extracted_dir, metadata))
+                with resource_repository.dataset_guard(owner_id, original_name) as connection:
+                    if not connection.execute('select 1 from "user" where id=%s and not coalesce(banned,false) for share', (owner_id,)).fetchone():
+                        raise HTTPException(status_code=403, detail='This account is disabled.')
+                    intent = connection.execute(
+                        'select * from dataset_import_intents where owner_user_id=%s and token_sha256=%s',
+                        (owner_id, token_hash),
+                    ).fetchone()
+                    if not intent:
+                        collection = resource_repository.reserve_dataset_version(owner_id, original_name, payload.collectionId, connection)
+                        suffix = f"-{str(collection['id'])[:8]}-v{collection['reserved_version']}"
+                        slug = original_name[:128 - len(suffix)].rstrip('.') + suffix
+                        intent = connection.execute(
+                            '''insert into dataset_import_intents(owner_user_id,token_sha256,collection_id,version,slug,metadata,content_sha256)
+                               values(%s,%s,%s,%s,%s,%s::jsonb,%s) returning *''',
+                            (owner_id, token_hash, collection['id'], collection['reserved_version'], slug,
+                             json.dumps(metadata), content_hash),
+                        ).fetchone()
+            if payload.collectionId and str(payload.collectionId) != str(intent['collection_id']):
+                raise HTTPException(status_code=409, detail='This upload is already associated with another dataset collection.')
+            dataset_name = str(intent['slug'])
+            target_dir = owner_dataset_path(DATASET_DIR, owner_id, dataset_name)
+            stage_dir = staged_uploads.consuming_path(token, owner_id)
+            with resource_repository.dataset_guard(owner_id, dataset_name) as connection:
+                if not connection.execute('select 1 from "user" where id=%s and not coalesce(banned,false) for share', (owner_id,)).fetchone():
+                    raise HTTPException(status_code=403, detail='This account is disabled.')
+                intent = connection.execute(
+                    'select * from dataset_import_intents where owner_user_id=%s and token_sha256=%s for update',
+                    (owner_id, token_hash),
+                ).fetchone()
+                if intent['status'] == 'completed':
+                    record = resource_repository.get_dataset(owner_id, dataset_name, connection)
+                    if not record:
+                        raise HTTPException(status_code=410, detail='This imported dataset was deleted.')
+                    metadata = record['metadata']
+                else:
+                    metadata = dict(intent['metadata'])
+                    if not target_dir.exists():
+                        if stage_dir.is_dir():
+                            staged = StagedUploadStore._read_manifest(stage_dir)
+                            if staged.get('owner_id') != owner_id or staged.get('token') != token:
+                                raise HTTPException(status_code=404, detail='Pending upload was not found')
+                            extracted_dir = contained_path(stage_dir, 'dataset')
+                        else:
+                            _staged, extracted_dir, stage_dir = staged_uploads.consume(token, owner_id)
+                        if not extracted_dir.is_dir() or not (stage_dir / MANIFEST_NAME).is_file():
+                            raise HTTPException(status_code=410, detail='Pending upload expired. Upload the ZIP again.')
+                        source = json.loads((stage_dir / MANIFEST_NAME).read_bytes())
+                        if encode_manifest(source)[1] != intent['content_sha256'] or encode_manifest(source_manifest(extracted_dir, metadata))[1] != intent['content_sha256']:
+                            raise HTTPException(status_code=409, detail='Pending upload changed after inspection. Upload the ZIP again.')
+                        metadata['yaml_path'] = str(find_dataset_yaml(target_dir) or '')
+                        workflow = dataset_workflow_metadata(metadata, get_catalog())
+                        _write_dataset_metadata(extracted_dir, request, workflow)
+                        write_manifest(extracted_dir, source)
+                        target_dir.parent.mkdir(parents=True, exist_ok=True)
+                        extracted_dir.replace(target_dir)
+                    source_path = target_dir / MANIFEST_NAME
+                    if not source_path.is_file() or hashlib.sha256(source_path.read_bytes()).hexdigest() != intent['content_sha256']:
+                        raise HTTPException(status_code=409, detail='Dataset storage does not match the reserved import.')
+                    metadata['yaml_path'] = str(find_dataset_yaml(target_dir) or '')
+                    record = resource_repository.get_dataset(owner_id, dataset_name, connection)
+                    if record:
+                        if str(record.get('collection_id')) != str(intent['collection_id']) or record.get('content_sha256') != intent['content_sha256']:
+                            raise HTTPException(status_code=409, detail='Dataset destination is already in use.')
+                    else:
+                        collection = {'id': intent['collection_id'], 'reserved_version': intent['version']}
+                        record = resource_repository.insert_dataset_version(owner_id, _request_user_email(request), dataset_name,
+                                      target_dir, metadata, collection, intent['content_sha256'], connection)
+                    connection.execute("update dataset_import_intents set status='completed',dataset_id=%s,updated_at=now() where id=%s",
+                                       (record['id'], intent['id']))
+                    from notification_service import emit
+                    emit(connection, owner_id, f"dataset-import:{intent['id']}", 'import', 'completed', '/dataset')
+            if stage_dir.exists():
+                shutil.rmtree(stage_dir, ignore_errors=True)
+            return {**_dataset_response(dataset_name, metadata), 'id': str(record['id']),
+                    'collectionId': str(intent['collection_id']), 'version': intent['version'], 'contentSha256': intent['content_sha256']}
     except FileNotFoundError as exc:
-        if replacement is not None:
-            replacement.rollback()
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
-        if replacement is not None:
-            replacement.rollback()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception:
-        if replacement is not None:
-            replacement.rollback()
-        raise
 
 
 @app.post("/api/upload-dataset")
@@ -950,6 +984,19 @@ def delete_dataset(dataset_name: str, request: Request):
         if removal is not None:
             removal.rollback()
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/api/datasets/{dataset_name}/impact")
+def dataset_delete_impact(dataset_name: str, request: Request):
+    owner_id = _require_request_user_id(request)
+    try:
+        validate_slug(dataset_name, 'dataset name')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    record = resource_repository.get_dataset(owner_id, dataset_name)
+    if not record:
+        raise HTTPException(status_code=404, detail='Dataset not found')
+    return resource_repository.dataset_usage(owner_id, record['id'], dataset_name)
 
 
 @app.get("/api/tasks")
@@ -1063,7 +1110,10 @@ def clone_task(task_id: str, request: Request):
     if row['status'] in {'queued','running','started','stopping','recovery_pending'}:
         raise PublicError('RUN_IN_USE', 'Stop this run before creating another draft.', status=409)
     draft = resource_repository.create_task(owner_id, _request_user_email(request), row['display_name'])
-    values = {**row, 'params': {**row.get('params', {}), '_execution': row.get('execution') or {'mode': 'auto', 'gpuUuid': None}}}
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    suffix = f" (copy {timestamp} - {str(draft['id']).replace('-', '')[:8]})"
+    values = {**row, 'display_name': str(row['display_name'] or 'cv_run')[:100 - len(suffix)] + suffix,
+              'params': {**row.get('params', {}), '_execution': row.get('execution') or {'mode': 'auto', 'gpuUuid': None}}}
     copied = resource_repository.update_task_draft(owner_id, draft['id'], values)
     return _task_response(copied)
 
@@ -1245,43 +1295,14 @@ async def predict_run(
         raise HTTPException(status_code=404, detail="Run not found")
 
     if compute.enabled():
-        import hashlib
-        from inference_service import _open_verified_image
-        from resource_guard import estimate_training_memory
-        try:
-            _open_verified_image(payload)
-        except InferenceError as exc:
-            raise PublicError('INVALID_IMAGE', str(exc)) from exc
+        from prediction_submission import submit_single
         try:
             selection = compute.execution_selection(json.loads(execution) if execution else {'mode': 'auto'})
         except (ValueError, TypeError, AttributeError) as exc:
             raise PublicError('INVALID_EXECUTION', 'Choose Auto GPU, a GPU, or CPU.') from exc
-        key = request.headers.get('idempotency-key')
-        if not key or len(key) > 128:
-            raise PublicError('IDEMPOTENCY_REQUIRED', 'A valid request key is required.')
-        job_id = uuid.uuid4()
-        directory = compute.job_directory(job_id)
-        directory.mkdir(parents=True, exist_ok=False)
-        try:
-            (directory / 'input').write_bytes(payload)
-            row = await asyncio.to_thread(compute.create_job, owner_id, record['id'], 'predict',
-                   {'project_name': project_name, 'model_type': model_type, 'task_type': task_type, 'threshold': threshold,
-                    'input_sha256': hashlib.sha256(payload).hexdigest(), 'input_name': Path(file.filename or 'image').name[:255], 'input_bytes': len(payload)},
-                   selection, idempotency_key=key, job_id=job_id,
-                   estimated_vram_mb=estimate_training_memory(model_type, config.get('extra_args', {}), 1))
-            if str(row['id']) != str(job_id):
-                shutil.rmtree(directory)
-            return JSONResponse(json.loads(json.dumps(compute.public_job(row), default=str)), status_code=202)
-        except Exception:
-            # A lost commit acknowledgement must not delete input for a durably queued job.
-            try:
-                with resource_repository._connect() as c:
-                    persisted = c.execute('select id from compute_jobs where id=%s', (job_id,)).fetchone()
-                if not persisted:
-                    shutil.rmtree(directory, ignore_errors=True)
-            except Exception:
-                pass
-            raise
+        row = await submit_single(owner_id, record, config, payload, file.filename or 'image', selection,
+                                  threshold, request.headers.get('idempotency-key', ''))
+        return JSONResponse(json.loads(json.dumps(compute.public_job(row), default=str)), status_code=202)
 
     try:
         # Runs off the event loop: loading a checkpoint and the forward pass are
@@ -1304,6 +1325,37 @@ async def predict_run(
         raise HTTPException(status_code=500, detail=f"Prediction failed: {exc}") from exc
 
     return {"status": "success", "runSlug": project_name, "taskType": task_type, **result}
+
+
+@app.post('/api/runs/{project_name}/predict-batch', status_code=202)
+async def predict_batch(project_name: str, request: Request, files: list[UploadFile] = File(...),
+                        threshold: float | None = Form(None), execution: str | None = Form(None)):
+    from batch_upload import submit_batch
+    owner_id = _require_request_user_id(request)
+    try:
+        record = _run_record_for_predict(project_name, request)
+        if not record:
+            raise PublicError('COMPUTE_DISABLED', 'Compute workers are not enabled.', status=503)
+        check_rate_limit(owner_id)
+        try:
+            selection = json.loads(execution) if execution else {'mode': 'auto'}
+            if not isinstance(selection, dict):
+                raise ValueError('Invalid execution selection')
+        except (TypeError, ValueError) as exc:
+            raise PublicError('INVALID_EXECUTION', 'Choose Auto GPU, a GPU, or CPU.') from exc
+        row = await submit_batch(owner_id, record, files, selection, threshold, request.headers.get('idempotency-key', ''))
+        return JSONResponse(json.loads(json.dumps(compute.public_job(row), default=str)), status_code=202)
+    except RateLimitExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    except PublicError:
+        raise
+    except (ValueError, zipfile.BadZipFile) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{project_name}/files")
+def download_run_file_query(project_name: str, request: Request, path: str):
+    return download_run_file(project_name, path, request)
 
 
 @app.get("/api/runs/{project_name}/files/{file_path:path}")
@@ -1333,11 +1385,6 @@ def _assert_legacy_user_cleanup_supported(user_id: str):
                 f'select 1 from {table} where owner_user_id=%s limit 1', (user_id,)
             ).fetchone():
                 raise HTTPException(status_code=409, detail='This account has data from the previous Annotation system. Preserve or remove that data separately before changing its resources.')
-        for table in ('dataset_collections', 'dataset_import_intents', 'dataset_indexes', 'evaluations', 'model_endpoints', 'storage_accounts'):
-            if c.execute('select to_regclass(%s) as name', (table,)).fetchone()['name'] and c.execute(
-                f'select 1 from {table} where owner_user_id=%s limit 1', (user_id,)
-            ).fetchone():
-                raise HTTPException(status_code=409, detail='This account has data from a newer AILAB feature. Use a version that supports those resources before changing its resources.')
 
 
 @app.post("/api/admin/users/{user_id}/transfer-resources")
@@ -1360,10 +1407,20 @@ def admin_transfer_user_resources(user_id: str, payload: TransferResourcesReques
 def admin_delete_user_resources(user_id: str, request: Request):
     _require_admin(request)
     _assert_legacy_user_cleanup_supported(user_id)
+    with resource_repository._connect() as c:
+        try:
+            resource_repository.assert_no_pending_imports(c, user_id)
+            resource_repository.assert_no_storage_account(c, user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if c.execute("select 1 from dataset_indexes where owner_user_id=%s and status in ('queued','running')", (user_id,)).fetchone():
+            raise PublicError('DATASET_IN_USE', 'Wait for dataset indexing to finish before deleting this user.', status=409)
     if compute.enabled():
         with resource_repository._connect() as c:
             if c.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (user_id, ['queued', *compute.ACTIVE])).fetchone():
                 raise PublicError('RUN_IN_USE', 'Cancel active Train and Test jobs before deleting this user.', status=409)
+            if c.execute("select 1 from evaluations where owner_user_id=%s and status='awaiting_queue'", (user_id,)).fetchone():
+                raise PublicError('RUN_IN_USE', 'Cancel pending evaluations before deleting this user.', status=409)
     from label_studio_client import BridgeError
     from label_studio_jobs import delete_account_data
     try:
@@ -1478,7 +1535,7 @@ def compare_dataset_runs(dataset_slug: str, run_ids: str, request: Request):
         "status": "success",
         "datasetSlug": dataset_slug,
         "runs": runs,
-        "insights": compare_insights(runs),
+        "insights": [],
         **summarise_comparison(runs),
     }
 

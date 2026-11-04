@@ -66,6 +66,11 @@ create table if not exists compute_jobs (
   heartbeat_at timestamptz,
   cleaned_at timestamptz
 );
+alter table compute_jobs drop constraint if exists compute_jobs_kind_check;
+alter table compute_jobs add constraint compute_jobs_kind_check check (kind in ('train','predict','evaluate','batch_predict'));
+alter table compute_jobs add column if not exists dataset_version_id uuid references datasets(id) on delete restrict;
+alter table compute_jobs add column if not exists progress_current integer not null default 0;
+alter table compute_jobs add column if not exists progress_total integer not null default 0;
 create unique index if not exists compute_gpu_exclusive on compute_jobs(assigned_gpu_uuid)
   where assigned_gpu_uuid is not null and status in ('dispatching','running','stopping','recovery_pending');
 create unique index if not exists compute_cpu_exclusive on compute_jobs(node_id)

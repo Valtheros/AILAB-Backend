@@ -140,6 +140,17 @@ def _semantic_class_names(config: dict, num_classes: int) -> list[str]:
     return names[:num_classes]
 
 
+def _semantic_classes_verified(config: dict, num_classes: int) -> bool:
+    metadata = (config or {}).get('dataset_metadata')
+    declared = metadata.get('classes') if isinstance(metadata, dict) else None
+    if not isinstance(declared, list) or len(declared) != num_classes - 1:
+        return False
+    if not all(isinstance(name, str) for name in declared):
+        return False
+    names = [name.strip() for name in declared]
+    return all(names) and len(set(names)) == len(names) and all(name.casefold() != 'background' for name in names)
+
+
 def _load_deeplabv3plus(run_dir: Path, device: str | None = None) -> dict[str, Any]:
     torch = _require_torch()
     path = _checkpoint_path(run_dir)
@@ -171,6 +182,7 @@ def _load_deeplabv3plus(run_dir: Path, device: str | None = None) -> dict[str, A
         "kind": "semantic",
         "model": model,
         "classes": _semantic_class_names(config, num_classes),
+        "class_schema_verified": _semantic_classes_verified(config, num_classes),
         "num_classes": num_classes,
         "image_size": image_size,
         "device": str(device),
@@ -236,7 +248,7 @@ def _png_data_uri(image) -> str:
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _predict_semantic(entry: dict[str, Any], image, _threshold: float) -> dict[str, Any]:
+def _predict_semantic(entry: dict[str, Any], image, _threshold: float, mask_sink=None) -> dict[str, Any]:
     torch = _require_torch()
     import numpy as np
     import torchvision.transforms.functional as F
@@ -272,17 +284,20 @@ def _predict_semantic(entry: dict[str, Any], image, _threshold: float) -> dict[s
         legend.append({"name": name, "color": _hex(colour), "percent": round(count / total * 100, 2)})
 
     legend.sort(key=lambda item: item["percent"], reverse=True)
-    return {
-        "segmentation": {
+    segmentation = {
             "kind": "semantic",
             "overlay": _png_data_uri(Image.fromarray(overlay, mode="RGBA")),
             "legend": legend,
-        },
+    }
+    if mask_sink is not None:
+        segmentation['maskFile'] = mask_sink('semantic', Image.fromarray(class_map, mode='L'))
+    return {
+        "segmentation": segmentation,
         "count": len(legend),
     }
 
 
-def _predict_instance(entry: dict[str, Any], image, threshold: float) -> dict[str, Any]:
+def _predict_instance(entry: dict[str, Any], image, threshold: float, mask_sink=None) -> dict[str, Any]:
     torch = _require_torch()
     import numpy as np
     import torchvision.transforms.functional as F
@@ -318,13 +333,16 @@ def _predict_instance(entry: dict[str, Any], image, threshold: float) -> dict[st
         draw.rectangle(box, outline=(*colour, 255), width=2)
         draw.text((box[0] + 2, box[1] + 2), f"{name} {round(float(score) * 100)}%", fill=(255, 255, 255, 255))
 
-        instances.append({
+        instance = {
             "className": name,
             "confidence": round(float(score), 6),
             "percent": round(float(score) * 100, 2),
             "box": [round(float(v), 1) for v in box],
             "color": _hex(colour),
-        })
+        }
+        if mask_sink is not None:
+            instance['maskFile'] = mask_sink(str(index), Image.fromarray(binary.astype(np.uint8) * 255, mode='L'))
+        instances.append(instance)
         counts[name] = counts.get(name, 0) + 1
 
     return {
@@ -343,7 +361,7 @@ def predict_segmentation(
     payload: bytes,
     model_type: str,
     score_threshold: Any = None,
-    *, device: str | None = None,
+    *, device: str | None = None, mask_sink=None,
 ) -> dict[str, Any]:
     """Return a colour overlay (and legend) for one uploaded image."""
     started = time.perf_counter()
@@ -355,9 +373,9 @@ def predict_segmentation(
     model_ready = time.perf_counter()
 
     if entry["kind"] == "semantic":
-        payload_out = _predict_semantic(entry, image, threshold)
+        payload_out = _predict_semantic(entry, image, threshold, mask_sink=mask_sink)
     else:
-        payload_out = _predict_instance(entry, image, threshold)
+        payload_out = _predict_instance(entry, image, threshold, mask_sink=mask_sink)
 
     finished = time.perf_counter()
     return {

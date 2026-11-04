@@ -16,6 +16,6 @@ COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
-ENV PYTHONPATH=/app/worker:/app
+ENV PYTHONPATH=/app:/app/worker
 
 CMD ["python", "-m", "compute_worker"]

@@ -1,3 +1,4 @@
+import json
 import unittest
 import tempfile
 from pathlib import Path
@@ -101,6 +102,35 @@ class QueueDurabilityTests(unittest.TestCase):
             self.assertEqual(jobs.accept_preview('owner', 'preview'), result)
             register.assert_not_called()
 
+    def test_accept_rejects_changed_preview_before_moving_or_registering(self):
+        from dataset_versioning import source_manifest, write_manifest
+
+        operation_id = 'preview'
+        context = MagicMock()
+        context.__enter__.return_value.execute.return_value.fetchone.return_value = {
+            'id': operation_id, 'preview_only': True, 'result': {'datasetName': 'dataset'},
+            'status': 'completed', 'version': 1, 'project_id': 'project',
+        }
+        guard = MagicMock()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            preview = root / '.label-studio-previews' / operation_id
+            preview.mkdir(parents=True)
+            (preview / 'image.png').write_bytes(b'original')
+            metadata = {'classes': ['object'], 'formats': [], 'tasks': []}
+            digest = write_manifest(preview, source_manifest(preview, metadata))
+            (preview / '.ailab_dataset.json').write_text(json.dumps({
+                'label_studio_operation': operation_id, 'label_schema': {}, 'content_sha256': digest}))
+            (preview / 'image.png').write_bytes(b'changed')
+            with patch.object(jobs, 'DATASET_DIR', root), patch.object(jobs.registry, '_connect', return_value=context), \
+                 patch.object(jobs.registry, 'dataset_guard', return_value=guard), \
+                 patch.object(jobs, 'inspect_dataset', return_value=metadata), \
+                 patch.object(jobs, 'validate_dataset_for_upload'), patch.object(jobs.registry, 'upsert_dataset') as register:
+                with self.assertRaisesRegex(ValueError, 'Dataset changed'):
+                    jobs.accept_preview('owner', operation_id)
+            register.assert_not_called()
+            self.assertEqual((preview / 'image.png').read_bytes(), b'changed')
+
     def test_job_identity_is_committed_before_redis_enqueue(self):
         events = []
         connection = MagicMock()
@@ -134,6 +164,7 @@ class QueueDurabilityTests(unittest.TestCase):
         connection = context.__enter__.return_value
         connection.execute.return_value.fetchall.return_value = [{
             'id': 'operation', 'status': 'running', 'rq_job_id': None, 'attempt': 3, 'cancel_requested': False,
+            'owner_user_id': 'owner', 'preview_only': True,
         }]
         connection.execute.return_value.fetchone.return_value = {'acquired': True}
         with patch.object(jobs.registry, '_connect', return_value=context), patch.object(jobs, 'Redis'), patch.object(jobs, 'enqueue') as enqueue:

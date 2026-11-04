@@ -2,10 +2,31 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import contextmanager
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
 from .trainer_utils import IMAGE_EXTENSIONS, read_yaml, runs_root
+
+
+@contextmanager
+def _without_untrusted_label_cache():
+    from ultralytics.data import dataset
+
+    load, save = dataset.load_dataset_cache_file, dataset.save_dataset_cache_file
+
+    def rebuild(*_args, **_kwargs):
+        raise FileNotFoundError('Dataset cache is disabled.')
+
+    def do_not_save(_prefix, _path, cache, version):
+        cache['version'] = version
+
+    # Ultralytics label caches contain pickle and dataset uploads are untrusted.
+    dataset.load_dataset_cache_file, dataset.save_dataset_cache_file = rebuild, do_not_save
+    try:
+        yield
+    finally:
+        dataset.load_dataset_cache_file, dataset.save_dataset_cache_file = load, save
 
 
 def _format_epoch_log(trainer) -> str:
@@ -129,15 +150,16 @@ def _evaluate_yolo_test_split(best_weights: Path, data_yaml: str, results_dir: s
 
     logger(log_path, "[YOLOTrainer] Evaluating best.pt on the held-out test split...")
     model = YOLO(str(best_weights))
-    metrics = model.val(
-        data=data_yaml,
-        split="test",
-        project=str(results_dir),
-        name="testeval",
-        exist_ok=True,
-        verbose=False,
-        plots=False,
-    )
+    with _without_untrusted_label_cache():
+        metrics = model.val(
+            data=data_yaml,
+            split="test",
+            project=str(results_dir),
+            name="testeval",
+            exist_ok=True,
+            verbose=False,
+            plots=False,
+        )
     box = getattr(metrics, "box", None)
     classes = _class_names(cfg)
     result = {
@@ -203,16 +225,17 @@ class YOLOTrainer(BaseTrainer):
             self._write_log(log_path, _format_epoch_log(trainer))
 
         model.add_callback("on_fit_epoch_end", log_epoch)
-        results = model.train(
-            data=data_yaml,
-            epochs=epochs,
-            batch=batch_size,
-            project=str(runs_root()),
-            name=project_name,
-            exist_ok=True,
-            task=config.get("task", "detect"),
-            **extra_args,
-        )
+        with _without_untrusted_label_cache():
+            results = model.train(
+                data=data_yaml,
+                epochs=epochs,
+                batch=batch_size,
+                project=str(runs_root()),
+                name=project_name,
+                exist_ok=True,
+                task=config.get("task", "detect"),
+                **extra_args,
+            )
 
         fallback_dir = runs_root() / project_name
         results_dir = str(results.save_dir) if results and hasattr(results, "save_dir") else str(fallback_dir)
@@ -231,7 +254,7 @@ class YOLOTrainer(BaseTrainer):
         # training loop, never inside it, and a failure here must not fail an
         # otherwise-completed run.
         best_weights = Path(results_dir) / "weights" / "best.pt"
-        if best_weights.is_file():
+        if best_weights.is_file() and not config.get('compute_job_id'):
             try:
                 _evaluate_yolo_test_split(best_weights, data_yaml, results_dir, self._write_log, log_path)
             except Exception as exc:
