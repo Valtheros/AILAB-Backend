@@ -74,6 +74,8 @@ def enqueue(operation_id):
 
 def create(owner, project_id, kind, upload_path=None, *, preview_only=False, operation_id=None):
     with registry._connect() as c:
+        if not c.execute('select 1 from "user" where id=%s and not coalesce(banned,false) for update', (owner,)).fetchone():
+            raise ValueError('This account is disabled.')
         project = c.execute('select * from label_studio_projects where owner_user_id=%s and id=%s and deleted_at is null for update', (owner, project_id)).fetchone()
         if not project:
             raise FileNotFoundError('Project not found.')
@@ -98,6 +100,8 @@ def create(owner, project_id, kind, upload_path=None, *, preview_only=False, ope
 
 def retry(owner, operation_id):
     with registry._connect() as c:
+        if not c.execute('select 1 from "user" where id=%s and not coalesce(banned,false) for update', (owner,)).fetchone():
+            raise ValueError('This account is disabled.')
         reference = c.execute('select project_id from label_studio_operations where id=%s and owner_user_id=%s', (operation_id, owner)).fetchone()
         if not reference:
             raise FileNotFoundError('Operation not found.')
@@ -122,6 +126,32 @@ def cancel(owner, operation_id):
     with registry._connect() as c:
         c.execute("update label_studio_operations set cancel_requested=true,status=case when status='queued' then 'cancelled' else status end,updated_at=now() where id=%s and owner_user_id=%s and status in ('queued','running')", (operation_id, owner))
     return operation(owner, operation_id)
+
+
+def delete_account_data(owner):
+    with registry._connect() as c:
+        if not c.execute('select 1 from "user" where id=%s and coalesce(banned,false) for update', (owner,)).fetchone():
+            raise ValueError('Disable this account before deleting its data.')
+        c.execute('select id from label_studio_projects where owner_user_id=%s for update', (owner,)).fetchall()
+        rows = c.execute('select * from label_studio_operations where owner_user_id=%s for update', (owner,)).fetchall()
+        if any(row['status'] in ('queued', 'running') for row in rows):
+            raise ValueError('Cancel or finish active Label Studio operations before deleting this account.')
+        account = c.execute('select 1 from label_studio_accounts where owner_user_id=%s for update', (owner,)).fetchone()
+        c.execute('update label_studio_projects set deleted_at=coalesce(deleted_at,now()) where owner_user_id=%s', (owner,))
+    if not account:
+        return
+    bridge(owner, 'delete-account')
+    for row in rows:
+        if row['upload_path']:
+            contained_path(DATASET_DIR / '.label-studio-uploads', row['upload_path']).unlink(missing_ok=True)
+        for directory in (WORK_DIR, DATASET_DIR / '.label-studio-previews'):
+            path = contained_path(directory, str(row['id']))
+            if path.exists():
+                shutil.rmtree(path)
+    with registry._connect() as c:
+        c.execute('delete from label_studio_operations where owner_user_id=%s', (owner,))
+        c.execute('delete from label_studio_projects where owner_user_id=%s', (owner,))
+        c.execute('delete from label_studio_accounts where owner_user_id=%s', (owner,))
 
 
 def progress(operation_id, processed, total, skipped=0):

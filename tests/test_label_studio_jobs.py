@@ -7,6 +7,57 @@ import label_studio_jobs as jobs
 
 
 class QueueDurabilityTests(unittest.TestCase):
+    def test_disabled_account_cannot_create_or_retry_operations(self):
+        context = MagicMock()
+        context.__enter__.return_value.execute.return_value.fetchone.return_value = None
+        with patch.object(jobs.registry, '_connect', return_value=context), patch.object(jobs, 'enqueue') as enqueue:
+            with self.assertRaisesRegex(ValueError, 'disabled'):
+                jobs.create('owner', 'project', 'import')
+            with self.assertRaisesRegex(ValueError, 'disabled'):
+                jobs.retry('owner', 'operation')
+            enqueue.assert_not_called()
+
+    def test_account_cleanup_requires_disabled_account(self):
+        context = MagicMock()
+        context.__enter__.return_value.execute.return_value.fetchone.return_value = None
+        with patch.object(jobs.registry, '_connect', return_value=context), patch.object(jobs, 'bridge') as bridge:
+            with self.assertRaisesRegex(ValueError, 'Disable this account'):
+                jobs.delete_account_data('owner')
+            bridge.assert_not_called()
+
+    def test_account_cleanup_refuses_active_operations(self):
+        context = MagicMock()
+        connection = context.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = {'exists': 1}
+        connection.execute.return_value.fetchall.side_effect = [[], [{'status': 'running'}]]
+        with patch.object(jobs.registry, '_connect', return_value=context), patch.object(jobs, 'bridge') as bridge:
+            with self.assertRaisesRegex(ValueError, 'active Label Studio'):
+                jobs.delete_account_data('owner')
+            bridge.assert_not_called()
+
+    def test_account_cleanup_removes_only_owned_artifacts(self):
+        context = MagicMock()
+        connection = context.__enter__.return_value
+        operation_id = 'f743540c-57df-4732-bf60-a92037566002'
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            upload = root / '.label-studio-uploads' / 'owned.zip'
+            upload.parent.mkdir()
+            upload.touch()
+            preview = root / '.label-studio-previews' / operation_id
+            preview.mkdir(parents=True)
+            other = root / '.label-studio-previews' / 'other'
+            other.mkdir()
+            connection.execute.return_value.fetchall.side_effect = [[], [{'id': operation_id, 'status': 'completed', 'upload_path': str(upload)}]]
+            connection.execute.return_value.fetchone.return_value = {'exists': 1}
+            with patch.object(jobs, 'DATASET_DIR', root), patch.object(jobs, 'WORK_DIR', root / '.label-studio-work'), patch.object(jobs.registry, '_connect', return_value=context), patch.object(jobs, 'bridge') as bridge:
+                jobs.delete_account_data('owner')
+            bridge.assert_called_once_with('owner', 'delete-account')
+            self.assertFalse(upload.exists())
+            self.assertFalse(preview.exists())
+            self.assertTrue(other.exists())
+            self.assertTrue(all(call.args[1] == ('owner',) for call in connection.execute.call_args_list if call.args[0].startswith('delete from label_studio_')))
+
     def test_validation_error_is_visible_but_server_details_are_private(self):
         message = 'Image 403 is unfinished. Submit its annotation or exclude it before publishing.'
         self.assertEqual(jobs.operation_error(jobs.BridgeError(message, 400)), message)

@@ -1326,9 +1326,25 @@ def admin_user_resource_impact(user_id: str, request: Request):
     return resource_repository.user_impact(user_id)
 
 
+def _assert_legacy_user_cleanup_supported(user_id: str):
+    with resource_repository._connect() as c:
+        for table in ('annotation_projects', 'annotation_operations'):
+            if c.execute('select to_regclass(%s) as name', (table,)).fetchone()['name'] and c.execute(
+                f'select 1 from {table} where owner_user_id=%s limit 1', (user_id,)
+            ).fetchone():
+                raise HTTPException(status_code=409, detail='This account has data from the previous Annotation system. Preserve or remove that data separately before changing its resources.')
+        for table in ('dataset_collections', 'dataset_import_intents', 'dataset_indexes', 'evaluations', 'model_endpoints', 'storage_accounts'):
+            if c.execute('select to_regclass(%s) as name', (table,)).fetchone()['name'] and c.execute(
+                f'select 1 from {table} where owner_user_id=%s limit 1', (user_id,)
+            ).fetchone():
+                raise HTTPException(status_code=409, detail='This account has data from a newer AILAB feature. Use a version that supports those resources before changing its resources.')
+
+
 @app.post("/api/admin/users/{user_id}/transfer-resources")
 def admin_transfer_user_resources(user_id: str, payload: TransferResourcesRequest, request: Request):
     _require_admin(request)
+    _assert_legacy_user_cleanup_supported(user_id)
+    _assert_legacy_user_cleanup_supported(payload.targetUserId)
     impact = resource_repository.user_impact(user_id)
     if impact["activeJobs"]:
         raise HTTPException(status_code=409, detail="Stop active training jobs before transferring ownership")
@@ -1343,10 +1359,19 @@ def admin_transfer_user_resources(user_id: str, payload: TransferResourcesReques
 @app.delete("/api/admin/users/{user_id}/resources")
 def admin_delete_user_resources(user_id: str, request: Request):
     _require_admin(request)
+    _assert_legacy_user_cleanup_supported(user_id)
     if compute.enabled():
         with resource_repository._connect() as c:
             if c.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (user_id, ['queued', *compute.ACTIVE])).fetchone():
                 raise PublicError('RUN_IN_USE', 'Cancel active Train and Test jobs before deleting this user.', status=409)
+    from label_studio_client import BridgeError
+    from label_studio_jobs import delete_account_data
+    try:
+        delete_account_data(user_id)
+    except BridgeError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     datasets, runs = resource_repository.delete_user_resource_records(user_id)
     errors: list[str] = []
     for run in runs:
