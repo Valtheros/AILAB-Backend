@@ -12,9 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies before copying source so Docker can cache the layer.
-COPY requirements.txt .
+COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+ENV PYTHONPATH=/app/worker:/app
 
-CMD ["rq", "worker", "--url", "redis://redis:6379", "cv_training"]
+CMD ["python", "-m", "compute_worker"]

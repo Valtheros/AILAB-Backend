@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import detection_inference as di
-from inference_service import InferenceError
+from inference_service import InferenceError, _checkpoint_path
 
 try:  # torch is present in the built API image, not necessarily on a dev host.
     import torch  # noqa: F401
@@ -58,7 +58,7 @@ class _FakeYolo:
     def __init__(self, result):
         self._result = result
 
-    def predict(self, source, conf, verbose):  # noqa: ARG002 - mirrors ultralytics
+    def predict(self, source, conf, verbose, device='cpu'):  # noqa: ARG002 - mirrors ultralytics
         return [self._result]
 
 
@@ -93,7 +93,8 @@ class CheckpointPathTests(unittest.TestCase):
             run = Path(d)
             (run / "best.pt").write_bytes(b"x")
             (run / "last.pt").write_bytes(b"x")
-            self.assertEqual(di._rcnn_checkpoint_path(run).name, "best.pt")
+            self.assertIs(di._checkpoint_path, _checkpoint_path)
+            self.assertEqual(di._checkpoint_path(run).name, "best.pt")
 
 
 class YoloParseTests(unittest.TestCase):

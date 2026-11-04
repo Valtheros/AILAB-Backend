@@ -258,6 +258,12 @@ def train_classifier(config: dict, family: str, log_path: Path | None, logger) -
     num_classes = len(train_dataset.classes)
     if num_classes < 2:
         raise ValueError("Image classification requires at least two class folders.")
+    schema = config.get("dataset_metadata", {}).get("label_schema", {})
+    if schema.get("origin") == "label_studio" and schema.get("task") == "image_classification":
+        names = schema.get("classes", [])
+        if len(names) != num_classes:
+            raise ValueError("Published class mapping does not match the training folders.")
+        train_dataset.classes = list(names)
 
     architecture = str(args.get("architecture") or config.get("model_name"))
     pretrained = bool(args.get("pretrained", True))

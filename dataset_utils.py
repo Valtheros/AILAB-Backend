@@ -541,7 +541,7 @@ def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> 
                         )
             except Exception as exc:
                 stats["errors"].append(f"Could not inspect semantic pair {image_path.name}: {exc}")
-    if stats["roboflow_png_masks"]:
+    if stats["mask_files"]:
         stats["classes"] = _roboflow_semantic_classes(dataset_dir)
     return stats
 
@@ -1363,6 +1363,7 @@ def _export_identity(dataset_dir: Path, model_type: str, extra_args: dict[str, A
     cache_material = {
         "source_fingerprint": source_fingerprint,
         "model_type": model_type,
+        "layout_version": 2,
     }
     fingerprint = hashlib.sha256(json.dumps(cache_material, sort_keys=True).encode("utf-8")).hexdigest()[:20]
     return source_fingerprint, dataset_dir / EXPORTS_DIR_NAME / model_type / fingerprint, fingerprint
@@ -1704,6 +1705,12 @@ def _cached_generated_export(
         staging_root.mkdir(parents=True, exist_ok=False)
         try:
             warnings = writer(staging_root)
+            if export_format == 'yolo_detection':
+                yaml_path = staging_root / 'data.yaml'
+                config = read_yaml_limited(yaml_path)
+                if config.get('path') == str(staging_root):
+                    config['path'] = str(export_root)
+                    yaml_path.write_text(yaml.safe_dump(config), encoding='utf-8')
             _write_export_manifest(staging_root, model_type, export_format, source_fingerprint, fingerprint, warnings)
             replace_directory(staging_root, export_root)
         finally:

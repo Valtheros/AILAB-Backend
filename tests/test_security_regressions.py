@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 import sys
 import types
+import importlib
 
 
 PNG_1X1 = base64.b64decode(
@@ -15,6 +16,11 @@ PNG_1X1 = base64.b64decode(
 
 
 def _install_optional_dependency_stubs() -> None:
+    for name in ('fastapi', 'pydantic', 'redis', 'rq', 'rq.command', 'rq.job', 'PIL'):
+        try:
+            importlib.import_module(name)
+        except ModuleNotFoundError:
+            pass
     if "fastapi" not in sys.modules:
         class HTTPException(Exception):
             def __init__(self, status_code: int, detail: str = ""):
@@ -27,6 +33,9 @@ def _install_optional_dependency_stubs() -> None:
                 pass
 
             def add_middleware(self, *_args, **_kwargs):
+                pass
+
+            def include_router(self, *_args, **_kwargs):
                 pass
 
             def middleware(self, *_args, **_kwargs):
@@ -59,6 +68,7 @@ def _install_optional_dependency_stubs() -> None:
             JSONResponse=lambda *args, **kwargs: None,
             StreamingResponse=object,
         )
+        sys.modules.setdefault("label_studio_api", types.SimpleNamespace(router=object(), internal_router=object()))
     if "pydantic" not in sys.modules:
         sys.modules["pydantic"] = types.SimpleNamespace(BaseModel=object, Field=lambda default=None, **_kwargs: default)
     if "redis" not in sys.modules:

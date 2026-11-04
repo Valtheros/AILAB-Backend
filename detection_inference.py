@@ -33,6 +33,7 @@ from inference_service import (
     InferenceError,
     InferenceUnavailable,
     MODEL_CACHE_SIZE,
+    _checkpoint_path,
     _open_verified_image,
     _require_torch,
 )
@@ -77,17 +78,6 @@ def _yolo_checkpoint_path(run_dir: Path) -> Path:
     )
 
 
-def _rcnn_checkpoint_path(run_dir: Path) -> Path:
-    for name in ("best.pt", "last.pt"):
-        candidate = run_dir / name
-        if candidate.is_file():
-            return candidate
-    raise InferenceError(
-        "This run has no saved model file (best.pt). It may have failed before "
-        "the first epoch finished."
-    )
-
-
 def _build_faster_rcnn(config: dict, num_classes: int):
     """Recreate the trained Faster R-CNN head. Mirrors detection_common."""
     import torchvision
@@ -125,7 +115,7 @@ def _cache_put(key: tuple, entry: dict[str, Any]) -> None:
             _model_cache.popitem(last=False)
 
 
-def _load_yolo(run_dir: Path) -> dict[str, Any]:
+def _load_yolo(run_dir: Path, device: str | None = None) -> dict[str, Any]:
     _require_torch()  # ultralytics needs torch; surface the same clear error.
     try:
         from ultralytics import YOLO
@@ -137,7 +127,7 @@ def _load_yolo(run_dir: Path) -> dict[str, Any]:
 
     path = _yolo_checkpoint_path(run_dir)
     stat = path.stat()
-    key = ("yolo", str(path), stat.st_mtime_ns, stat.st_size)
+    key = ("yolo", str(path), stat.st_mtime_ns, stat.st_size, device)
     cached = _cache_get(key)
     if cached is not None:
         return cached
@@ -152,7 +142,7 @@ def _load_yolo(run_dir: Path) -> dict[str, Any]:
         "kind": "yolo",
         "model": model,
         "classes": classes,
-        "device": "cpu",
+        "device": device or "cpu",
         "architecture": Path(path).parent.parent.name or "yolo",
         "checkpoint": path.name,
     }
@@ -160,11 +150,11 @@ def _load_yolo(run_dir: Path) -> dict[str, Any]:
     return entry
 
 
-def _load_faster_rcnn(run_dir: Path) -> dict[str, Any]:
+def _load_faster_rcnn(run_dir: Path, device: str | None = None) -> dict[str, Any]:
     torch = _require_torch()
-    path = _rcnn_checkpoint_path(run_dir)
+    path = _checkpoint_path(run_dir)
     stat = path.stat()
-    key = ("faster_rcnn", str(path), stat.st_mtime_ns, stat.st_size)
+    key = ("faster_rcnn", str(path), stat.st_mtime_ns, stat.st_size, device)
     cached = _cache_get(key)
     if cached is not None:
         return cached
@@ -186,7 +176,7 @@ def _load_faster_rcnn(run_dir: Path) -> dict[str, Any]:
             "The saved weights do not match the recorded architecture "
             f"({len(missing)} missing / {len(unexpected)} unexpected parameters)."
         )
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
     model.to(device)
     model.eval()
     entry = {
@@ -201,12 +191,12 @@ def _load_faster_rcnn(run_dir: Path) -> dict[str, Any]:
     return entry
 
 
-def load_detector(run_dir: Path, model_type: str) -> dict[str, Any]:
+def load_detector(run_dir: Path, model_type: str, device: str | None = None) -> dict[str, Any]:
     kind = (model_type or "").lower()
     if kind == "yolo":
-        return _load_yolo(run_dir)
+        return _load_yolo(run_dir, device=device)
     if kind == "faster_rcnn":
-        return _load_faster_rcnn(run_dir)
+        return _load_faster_rcnn(run_dir, device=device)
     raise InferenceError(f"Model testing does not support detection model '{model_type}'.")
 
 
@@ -215,7 +205,7 @@ def _predict_yolo(entry: dict[str, Any], image, threshold: float) -> list[dict[s
 
     # Ultralytics accepts an RGB ndarray and returns boxes in the input image's
     # own pixel space, which is exactly the original size we pass here.
-    results = entry["model"].predict(source=np.asarray(image), conf=threshold, verbose=False)
+    results = entry["model"].predict(source=np.asarray(image), conf=threshold, verbose=False, device=entry.get('device', 'cpu'))
     if not results:
         return []
     boxes = results[0].boxes
@@ -270,6 +260,7 @@ def predict_detection(
     payload: bytes,
     model_type: str,
     score_threshold: Any = DEFAULT_SCORE_THRESHOLD,
+    *, device: str | None = None,
 ) -> dict[str, Any]:
     """Return every detected box (above threshold) for one uploaded image."""
     started = time.perf_counter()
@@ -277,7 +268,7 @@ def predict_detection(
     image = _open_verified_image(payload)
     original_size = list(image.size)
 
-    entry = load_detector(run_dir, model_type)
+    entry = load_detector(run_dir, model_type, device=device) if device else load_detector(run_dir, model_type)
     model_ready = time.perf_counter()
 
     if entry["kind"] == "yolo":

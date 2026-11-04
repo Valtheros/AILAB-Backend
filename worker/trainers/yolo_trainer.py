@@ -194,7 +194,12 @@ class YOLOTrainer(BaseTrainer):
 
         model = YOLO(f"{model_name}.pt")
 
+        logged_epochs = set()
         def log_epoch(trainer) -> None:
+            epoch = int(getattr(trainer, 'epoch', 0)) + 1
+            if epoch > epochs or epoch in logged_epochs:
+                return
+            logged_epochs.add(epoch)
             self._write_log(log_path, _format_epoch_log(trainer))
 
         model.add_callback("on_fit_epoch_end", log_epoch)
