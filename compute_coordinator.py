@@ -19,6 +19,7 @@ from settings import REDIS_URL
 log = logging.getLogger(__name__)
 NODE = os.getenv('COMPUTE_NODE_ID', 'local')
 last_notification_cleanup = 0.0
+last_storage_recovery = 0.0
 
 
 def inventory():
@@ -123,10 +124,22 @@ def cleanup_results():
 
 
 def tick(redis):
-    global last_notification_cleanup
+    global last_notification_cleanup, last_storage_recovery
     inventory()
     recover_dispatches()
     cleanup_results()
+    if time.monotonic() - last_storage_recovery >= 30:
+        from storage_service import recover_requests, recover_compute_reservations
+        try:
+            from storage_service import enabled as storage_enabled
+            if storage_enabled():
+                from storage_transfer import recover as recover_transfers
+                recover_transfers()
+            recover_requests()
+            recover_compute_reservations()
+        except Exception:
+            log.exception('Storage recovery will retry; retained allowances are not reusable')
+        last_storage_recovery = time.monotonic()
     if time.monotonic() - last_notification_cleanup >= 3600:
         with registry._connect() as c:
             c.execute("delete from notifications where created_at < now()-interval '90 days'")

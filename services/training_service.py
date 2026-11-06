@@ -22,6 +22,7 @@ except ImportError:  # Lightweight unit-test stubs do not expose rq.exceptions.
 
 from dataset_utils import compatible_models_for_metadata, inspect_dataset, prepare_dataset_for_model, read_yaml_limited
 from dataset_storage import registered_storage_path
+import storage_service
 from model_catalog import get_model
 from security_utils import contained_path, validate_slug
 from settings import DATASET_DIR, REDIS_URL, RUNS_DIR, ensure_runtime_dirs
@@ -246,6 +247,7 @@ class TrainingService:
         planned_job_id = uuid.uuid4().hex
         reserved_project_dir = False
         run_record: dict[str, Any] | None = None
+        storage_lease = storage_service.RequestLease(owner_id, 6 * 1024**3).open() if storage_service.enabled() else None
         try:
             with resource_repository.dataset_guard(owner_id, selected_name) as connection:
                 dataset_record = resource_repository.get_dataset(owner_id, selected_name, connection)
@@ -253,6 +255,9 @@ class TrainingService:
                 if resource_repository.enabled and not dataset_record:
                     raise FileNotFoundError(f"Dataset '{selected_name}' is not registered. Run the resource backfill first.")
                 dataset_record = dataset_record or {"id": selected_name, "slug": selected_name}
+                if storage_lease:
+                    storage_service.prepare(owner_id, storage_lease.key, 'dataset',
+                                            dataset_path.relative_to(self.dataset_dir), connection=connection)
                 # Published semantic masks reserve zero for background.
                 label_schema = dataset_record.get("metadata", {}).get("label_schema", {})
                 if model_type == "deeplabv3plus" and label_schema.get("origin") == "label_studio":
@@ -298,6 +303,9 @@ class TrainingService:
                     )
                 project_dir.mkdir(parents=False, exist_ok=False)
                 reserved_project_dir = True
+                if storage_lease:
+                    storage_service.prepare(owner_id, storage_lease.key, 'runs',
+                                            project_dir.relative_to(self.runs_dir), connection=connection)
                 job_config["run_id"] = str(run_record.get("id"))
                 job_config["dataset_id"] = str(dataset_record.get("id"))
                 if compute.enabled():
@@ -318,6 +326,9 @@ class TrainingService:
             if reserved_project_dir and not committed:
                 shutil.rmtree(project_dir, ignore_errors=True)
             raise
+        finally:
+            if storage_lease:
+                storage_lease.close()
 
         if compute.enabled():
             return planned_job_id

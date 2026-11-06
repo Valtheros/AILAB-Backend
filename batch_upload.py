@@ -17,6 +17,9 @@ from compute_repository import create_job, execution_selection, job_directory, r
 from resource_guard import estimate_training_memory
 from security_utils import contained_path
 from settings import RUNS_DIR
+import storage_service
+from storage_uploads import current_lease
+from starlette.concurrency import run_in_threadpool
 
 
 async def stage_batch(files, directory: Path) -> tuple[list[dict], str, int]:
@@ -58,7 +61,8 @@ async def stage_batch(files, directory: Path) -> tuple[list[dict], str, int]:
                 entry['error'] = 'Image exceeds the 10 MiB limit.' if too_large else 'Unsupported image format.'
             entries.append(entry)
     if archive:
-        entries = await asyncio.to_thread(extract_batch_zip, directory / 'input.zip', directory)
+        from starlette.concurrency import run_in_threadpool
+        entries = await run_in_threadpool(extract_batch_zip, directory / 'input.zip', directory)
         (directory / 'input.zip').unlink(missing_ok=True)
     (directory / 'input-manifest.json').write_text(json.dumps({'images': entries}, ensure_ascii=False), encoding='utf-8')
     return entries, digest.hexdigest(), total
@@ -82,7 +86,13 @@ async def submit_batch(owner_id: str, run: dict, files, selection: dict, thresho
         raise PublicError('MODEL_CONFIGURATION_MISSING', 'The model configuration is unavailable.', status=409)
     job_id = uuid.uuid4()
     directory = job_directory(job_id)
-    directory.mkdir(parents=True, exist_ok=False)
+    if storage_service.enabled():
+        size = min(MAX_BATCH_BYTES, sum(file.size if file.size is not None else MAX_BATCH_BYTES for file in files))
+        if len(files) == 1 and (files[0].filename or '').lower().endswith('.zip'):
+            size += MAX_BATCH_BYTES
+        await run_in_threadpool(current_lease(owner_id).additional, 'batch', size + 1024**2,
+                                namespace='runs', path=directory.relative_to(RUNS_DIR))
+    directory.mkdir(parents=True, exist_ok=storage_service.enabled())
     submission_attempted = False
     try:
         try:

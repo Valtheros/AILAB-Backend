@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -147,6 +148,126 @@ class FilesystemProjectQuotaTests(unittest.TestCase):
             assign_empty_directory(link, 11004)
         self.assertEqual(directory_project(legacy), (0, False))
 
+    def test_operator_binds_owner_and_tags_only_empty_directories(self):
+        from storage_operator import QuotaOperator
+
+        operator = QuotaOperator(self.mount, Path(_LOOP_DEVICE))
+        request = {'projectId': 12001, 'owner': 'alice'}
+        initial = operator.dispatch({'operation': 'provision', **request})
+        self.assertGreater(initial['hardLimitBytes'], 0)
+        self.assertEqual(initial, operator.dispatch({'operation': 'provision', **request}))
+        with self.assertRaisesRegex(ValueError, 'different owner'):
+            operator.dispatch({'operation': 'provision', **request, 'owner': 'bob'})
+        operator.dispatch({'operation': 'limit', **request, 'limitBytes': 2 * 1024 * 1024})
+        (self.mount / 'storage').mkdir(exist_ok=True)
+        prepared = {'operation': 'prepare', **request, 'namespace': 'storage', 'path': 'owners/alice'}
+        operator.dispatch(prepared)
+        owner = self.mount / 'storage/owners/alice'
+        self.assertEqual(directory_project(owner), (12001, True))
+        _write_file(owner / 'saved', 1024 * 1024)
+        operator.dispatch(prepared)
+        with self.assertRaises(OSError) as error:
+            _write_file(owner / 'too-large', 2 * 1024 * 1024)
+        self.assertIn(error.exception.errno, {errno.EDQUOT, errno.ENOSPC})
+        self.assertEqual((owner / 'saved').stat().st_size, 1024 * 1024)
+
+        other = {'projectId': 12002, 'owner': 'bob'}
+        operator.dispatch({'operation': 'provision', **other})
+        operator.dispatch({'operation': 'limit', **other, 'limitBytes': 2 * 1024 * 1024})
+        with self.assertRaisesRegex(ValueError, 'different owner'):
+            operator.dispatch({**prepared, **other})
+        untagged = self.mount / 'storage/legacy'
+        untagged.mkdir()
+        (untagged / 'keep').write_bytes(b'unchanged')
+        with self.assertRaisesRegex(ValueError, 'backfill'):
+            operator.dispatch({**prepared, 'path': 'legacy'})
+        self.assertEqual((untagged / 'keep').read_bytes(), b'unchanged')
+
+    def test_operator_cleanup_only_removes_owned_request_temp_files(self):
+        from storage_operator import QuotaOperator, owner_digest
+
+        operator = QuotaOperator(self.mount, Path(_LOOP_DEVICE))
+        identity = {'projectId': 12003, 'owner': 'cleanup-owner'}
+        operator.dispatch({'operation': 'provision', **identity})
+        operator.dispatch({'operation': 'limit', **identity, 'limitBytes': 2 * 1024 * 1024})
+        (self.mount / 'storage').mkdir(exist_ok=True)
+        parent = f'.uploads/{owner_digest(identity["owner"])[:32]}'
+        request_id = 'a' * 32
+        for path in (parent, parent + '/' + request_id):
+            operator.dispatch({'operation': 'prepare', **identity, 'namespace': 'storage', 'path': path})
+        temporary = self.mount / 'storage' / parent / request_id
+        (temporary / 'file').write_bytes(b'discard')
+        preserved = self.mount / 'original-image'
+        preserved.write_bytes(b'preserve')
+        (temporary / 'link').symlink_to(preserved)
+        request = {'operation': 'cleanup-upload', **identity, 'namespace': 'storage', 'requestId': request_id}
+        operator.dispatch(request)
+        self.assertFalse(temporary.exists())
+        self.assertEqual(preserved.read_bytes(), b'preserve')
+        operator.dispatch(request)
+        for invalid in ({'namespace': 'runs'}, {'requestId': '../original-image'}, {'owner': 'different-owner'}):
+            with self.assertRaises(ValueError):
+                operator.dispatch({**request, **invalid})
+
+    def test_offline_backfill_preserves_content_and_is_repeatable(self):
+        from storage_inventory import scan
+        from scripts.storage_backfill import tag_records, verify_inventory
+        from storage_operator import QuotaOperator
+        from storage_project_quota import _attributes
+
+        root = self.mount / 'backfill'
+        root.mkdir()
+        for name in ('dataset', 'runs', 'storage', 'label-studio'):
+            (root / name).mkdir()
+        data = root / 'dataset/legacy'
+        data.mkdir()
+        _write_file(data / 'image', 65536)
+        runs = root / 'runs/legacy'
+        runs.mkdir()
+        os.link(data / 'image', runs / 'image-copy')
+        roots = {'dataset/legacy': 'legacy-owner', 'runs/legacy': 'legacy-owner'}
+        plan = scan(root, roots, attributes=_attributes)
+        self.assertEqual(plan['issues'], [])
+        operator = QuotaOperator(root, Path(_LOOP_DEVICE))
+        identity = {'projectId': 14001, 'owner': 'legacy-owner'}
+        operator.dispatch({'operation': 'provision', **identity})
+        operator.dispatch({'operation': 'limit', **identity, 'limitBytes': 4 * 1024**2})
+        for _ in range(2):
+            tag_records(root, plan['files'], {'legacy-owner': 14001})
+            verified = verify_inventory(root, plan, roots)
+            self.assertTrue(all(row['project'] == 14001 for row in verified['files'] if row['owner']))
+        self.assertEqual((data / 'image').read_bytes(), b'x' * 65536)
+        tag_records(root, plan['files'], {'legacy-owner': 14001}, restore=True)
+        verified = verify_inventory(root, plan, roots)
+        self.assertTrue(all(row['project'] == 0 for row in verified['files']))
+        (data / 'image').write_bytes(b'changed')
+        with self.assertRaisesRegex(ValueError, 'Files changed'):
+            verify_inventory(root, plan, roots)
+
+    def test_retire_removes_only_its_owner_and_can_be_retried(self):
+        from storage_operator import QuotaOperator
+
+        root = self.mount / 'retire'
+        root.mkdir()
+        for namespace in ('dataset', 'runs', 'storage', 'label-studio'):
+            (root / namespace).mkdir()
+        operator = QuotaOperator(root, Path(_LOOP_DEVICE))
+        alice, bob = {'projectId': 15001, 'owner': 'alice'}, {'projectId': 15002, 'owner': 'bob'}
+        for identity in (alice, bob):
+            operator.dispatch({'operation': 'provision', **identity})
+            operator.dispatch({'operation': 'limit', **identity, 'limitBytes': 4 * 1024**2})
+            for namespace in ('dataset', 'runs', 'storage', 'label-studio'):
+                operator.dispatch({'operation': 'prepare', **identity, 'namespace': namespace, 'path': identity['owner']})
+                (root / namespace / identity['owner'] / 'saved').write_bytes(identity['owner'].encode())
+        for _ in range(2):
+            result = operator.dispatch({'operation': 'retire', **alice})
+            self.assertEqual(result['usedBytes'], result['hardLimitBytes'])
+            for namespace in ('dataset', 'runs', 'storage', 'label-studio'):
+                self.assertFalse((root / namespace / 'alice').exists())
+                self.assertEqual((root / namespace / 'bob/saved').read_bytes(), b'bob')
+        with self.assertRaisesRegex(ValueError, 'different owner'):
+            operator.dispatch({'operation': 'retire', **alice, 'owner': 'bob'})
+
     def test_dataset_staging_and_import_rename_stay_within_owner_quota(self):
         from dataset_storage import owner_dataset_root
         from staged_uploads import StagedUploadStore
@@ -169,6 +290,70 @@ class FilesystemProjectQuotaTests(unittest.TestCase):
         self.assertEqual((owner / "imported" / "image").stat().st_size, 65536)
         self.assertGreater(project_usage(_LOOP_DEVICE, owner, 11005)[0], 0)
 
+    @unittest.skipUnless(os.environ.get('AILAB_QUOTA_OPERATOR_IMAGE'), 'requires the quota operator image')
+    def test_operator_container_uses_private_socket_without_network_or_quota_bypass(self):
+        from storage_operator_client import StorageOperatorClient, StorageOperatorError
+
+        image = os.environ['AILAB_QUOTA_OPERATOR_IMAGE']
+        name = 'ailab-quota-operator-lab-' + uuid.uuid4().hex[:12]
+        control = self.temp_dir / 'control'
+        control.mkdir()
+        command = ['docker', 'run', '-d', '--name', name, '--network', 'none', '--read-only',
+                   '--cap-drop', 'ALL', '--cap-add', 'SYS_ADMIN', '--cap-add', 'CHOWN',
+                   '--cap-add', 'FOWNER', '--cap-add', 'DAC_OVERRIDE', '--security-opt', 'no-new-privileges',
+                   '--memory', '64m', '--pids-limit', '16', '--cpus', '0.25',
+                   '--device', _LOOP_DEVICE + ':/dev/ailab-data:r',
+                   '--mount', f'type=bind,source={self.mount},target=/userdata',
+                   '--mount', f'type=bind,source={control},target=/storage-control',
+                   image, '--root', '/userdata', '--device', '/dev/ailab-data', '--control', '/storage-control']
+        subprocess.run(command, check=True, capture_output=True)
+        self.addCleanup(lambda: subprocess.run(['docker', 'rm', '-f', name], check=True, capture_output=True))
+        client = StorageOperatorClient(control)
+        for attempt in range(50):
+            try:
+                client.call('capacity', 0, '')
+                break
+            except StorageOperatorError:
+                time.sleep(0.1)
+        else:
+            logs = subprocess.run(['docker', 'logs', name], capture_output=True, text=True)
+            self.fail(logs.stderr)
+        client.call('provision', 13001, 'container-owner')
+        client.call('limit', 13001, 'container-owner', limitBytes=2 * 1024 * 1024)
+        (self.mount / 'runs').mkdir(exist_ok=True)
+        client.call('prepare', 13001, 'container-owner', namespace='runs', path='container-test')
+        self.assertEqual(directory_project(self.mount / 'runs/container-test'), (13001, True))
+        result = subprocess.run(['docker', 'exec', '--user', '1001:0', name, 'python', '-B', '-c',
+            "from storage_operator_client import StorageOperatorClient; assert StorageOperatorClient().call('capacity',0,'')['freeBytes'] > 0"],
+            capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        status = subprocess.run(['docker', 'exec', name, 'python', '-B', '-c',
+            "from pathlib import Path; c=int(next(s for s in Path('/proc/self/status').read_text().splitlines() if s.startswith('CapEff:')).split()[1],16); assert not c & (1 << 24)"],
+            capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+
+    @unittest.skipUnless(os.environ.get('AILAB_QUOTA_BACKEND_IMAGE'), 'requires disposable database and backend image')
+    def test_transfer_with_real_database_and_kernel_quota(self):
+        root = self.mount / 'application-test'
+        root.mkdir()
+        (root / '.ailab-disposable-test').write_text('ailab-disposable-test-v1')
+        for name in ('runs', 'dataset', 'storage', 'tmp', 'app'):
+            (root / name).mkdir()
+        source = Path(__file__).resolve().parents[1]
+        command = ['docker', 'run', '--rm', '--network', 'container:ailab-storage-lab-postgres',
+                   '--cap-add', 'SYS_ADMIN', '--cap-drop', 'SYS_RESOURCE', '--device', '/dev/loop0:/dev/loop0:r',
+                   '--memory', '1g', '--mount', f'type=bind,source={root},target={root}',
+                   '--mount', f'type=bind,source={source},target=/app,readonly']
+        for key, value in {'COMPUTE_TESTS': '1', 'AILAB_REAL_QUOTA_RUNTIME': '1',
+                'DATABASE_URL': 'postgresql://ailab_test:disposable-storage-test@localhost/ailab_compute_test_pg',
+                'PYTHONDONTWRITEBYTECODE': '1', 'AILAB_TEST_ROOT': str(root), 'TMPDIR': str(root / 'tmp'),
+                'RUNS_DIR': str(root / 'runs'), 'DATASET_DIR': str(root / 'dataset'),
+                'STORAGE_DIR': str(root / 'storage'), 'APP_BASE_DIR': str(root / 'app')}.items():
+            command.extend(['-e', key + '=' + value])
+        command.extend([os.environ['AILAB_QUOTA_BACKEND_IMAGE'], 'python', '-B', '-m', 'unittest',
+            'tests.test_storage_reservations_integration.StorageReservationsIntegrationTests.test_transfer_on_real_ext4_assigns_every_copy_and_reclaims_source_usage', '-v'])
+        subprocess.run(command, check=True)
+
     @unittest.skipUnless(os.environ.get('COMPUTE_TESTS') == '1', 'requires isolated PostgreSQL test stack')
     def test_kernel_usage_and_database_reservations_are_checked_together(self):
         from resource_repository import resource_repository as registry
@@ -188,29 +373,34 @@ class FilesystemProjectQuotaTests(unittest.TestCase):
         self.addCleanup(cleanup_database)
         anchors = self.mount / 'anchors'
         anchors.mkdir()
-        measure = ProjectQuotaMeasurement(_LOOP_DEVICE, anchors, self.mount)
-        ledger = StorageReservations(registry._connect, measure, free_reserve_bytes=8 * 1024 * 1024)
+        from storage_operator import QuotaOperator
+        operator = QuotaOperator(self.mount, Path(_LOOP_DEVICE))
+
+        class DirectClient:
+            def call(self, operation, project_id, subject, **values):
+                return operator.dispatch({'operation': operation, 'projectId': project_id, 'owner': subject, **values})
+
+        ledger = StorageReservations(registry._connect, DirectClient(), free_reserve_bytes=8 * 1024 * 1024)
         account = ledger.prepare_account(owner)
         project_id = account['project_id']
-        anchor = anchors / str(project_id)
-        anchor.mkdir()
+        anchor = self.mount / '.quota' / str(project_id)
         data = self.mount / 'account-data'
         data.mkdir()
+        ledger.set_limit(owner, 8 * 1024 * 1024)
+        ledger.reserve(owner, 'setup:1', 'upload', 65536)
         assign_empty_directory(anchor, project_id)
         assign_empty_directory(data, project_id)
-        set_project_limit(_LOOP_DEVICE, anchor, project_id, 8 * 1024 * 1024)
-        with registry._connect() as connection:
-            connection.execute("update storage_accounts set state='ready',limit_bytes=%s where owner_user_id=%s",
-                               (8 * 1024 * 1024, owner))
+        ledger.release(owner, 'setup:1')
 
+        measure = ProjectQuotaMeasurement(_LOOP_DEVICE, self.mount / '.quota', self.mount)
         used, hard_limit, free = measure(project_id)
         filesystem = os.statvfs(self.mount)
-        self.assertEqual(hard_limit, 8 * 1024 * 1024)
+        self.assertEqual(hard_limit, used)
         self.assertGreaterEqual(used, 0)
         self.assertEqual(free, filesystem.f_bavail * filesystem.f_frsize)
         with self.assertRaisesRegex(ValueError, 'unrestricted root'):
             ProjectQuotaMeasurement(_LOOP_DEVICE, anchors, data)(project_id)
-        (anchors / str(project_id + 1)).symlink_to(anchor, target_is_directory=True)
+        (self.mount / '.quota' / str(project_id + 1)).symlink_to(anchor, target_is_directory=True)
         with self.assertRaises(OSError):
             measure(project_id + 1)
 
@@ -221,9 +411,7 @@ class FilesystemProjectQuotaTests(unittest.TestCase):
         self.assertEqual(exceeded.exception.code, 'STORAGE_QUOTA_EXCEEDED')
         ledger.release(owner, 'train:1')
         ledger.reserve(owner, 'upload:2', 'upload', 5 * 1024 * 1024)
-        with registry._connect() as connection:
-            connection.execute('update storage_accounts set limit_bytes=%s where owner_user_id=%s',
-                               (9 * 1024 * 1024, owner))
+        set_project_limit(_LOOP_DEVICE, anchor, project_id, 9 * 1024 * 1024)
         with self.assertRaises(StorageReservationError) as mismatched:
             ledger.reserve(owner, 'upload:3', 'upload', 1024)
         self.assertEqual(mismatched.exception.code, 'STORAGE_UNAVAILABLE')

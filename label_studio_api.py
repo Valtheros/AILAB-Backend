@@ -5,6 +5,9 @@ import uuid
 import os
 import tempfile
 import hmac
+import anyio
+import fcntl
+import stat
 from pathlib import Path
 from typing import Literal
 
@@ -12,14 +15,15 @@ from fastapi import APIRouter, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 
 from label_studio_client import BridgeError, bridge, public_url
 import label_studio_jobs as jobs
 from resource_repository import resource_repository as registry
 from security_utils import MAX_UPLOAD_BYTES, contained_path
 from settings import DATASET_DIR
-from api_errors import error_info
+from api_errors import PublicError, error_info
+from storage_service import RequestLease, check_storage_error, enabled, owner_key, prepare, ledger
 
 
 class Route(APIRoute):
@@ -28,6 +32,8 @@ class Route(APIRoute):
         async def handle(request):
             try:
                 return await original(request)
+            except PublicError as exc:
+                return JSONResponse({'detail': str(exc), **error_info(exc), 'requestId': request.state.request_id}, status_code=exc.status)
             except BridgeError as exc:
                 return JSONResponse({'detail': str(exc), **error_info(exc), 'requestId': request.state.request_id}, status_code=exc.status)
             except FileNotFoundError as exc:
@@ -41,6 +47,60 @@ class Route(APIRoute):
 
 router = APIRouter(prefix='/api/label-studio', route_class=Route)
 internal_router = APIRouter(prefix='/internal/label-studio', route_class=Route)
+
+
+class LabelStorageInput(BaseModel):
+    requiredBytes: StrictInt = Field(default=1, ge=1, le=5 * 1024**3)
+    project: StrictInt | None = Field(default=None, ge=1)
+    externalId: uuid.UUID | None = None
+    name: str = Field(default='', max_length=1000)
+    kind: Literal['image_classification', 'object_detection', 'semantic_segmentation', 'instance_segmentation'] = 'object_detection'
+
+
+@internal_router.post('/storage/{request_id}/{action}')
+def label_storage(request_id: uuid.UUID, action: Literal['reserve', 'release'], payload: LabelStorageInput, request: Request):
+    user = bridge_owner(request)
+    if not enabled():
+        raise PublicError('STORAGE_UNAVAILABLE', 'Storage enforcement is not enabled.', status=503)
+    # Label Studio holds this lock until every upload/output handle is closed.
+    lease_path = Path(os.environ.get('STORAGE_LEASE_DIR', '/storage-leases')) / f'label-{request_id.hex}'
+    try:
+        fd = os.open(lease_path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise PublicError('STORAGE_UNAVAILABLE', 'A live upload lease is required.', status=503) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise PublicError('STORAGE_UNAVAILABLE', 'Invalid upload lease.', status=503)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            raise PublicError('STORAGE_UNAVAILABLE', 'The upload process is no longer running.', status=503)
+        key = f'http:label:{request_id.hex}'
+        if action == 'release':
+            from storage_service import release
+            release(user['id'], key)
+            return {'released': True}
+        if payload.project is None or payload.externalId is None:
+            raise HTTPException(400, 'An owned Label Studio project is required.')
+        with registry._connect() as c:
+            c.execute('''insert into label_studio_projects(id,owner_user_id,ls_project_id,name,kind)
+                values(%s,%s,%s,%s,%s) on conflict do nothing''',
+                (payload.externalId, user['id'], payload.project, payload.name, payload.kind))
+            owned = c.execute('''select 1 from label_studio_projects where id=%s and owner_user_id=%s
+                and ls_project_id=%s and deleted_at is null''', (payload.externalId, user['id'], payload.project)).fetchone()
+            if not owned:
+                raise HTTPException(404, 'Project not found.')
+        ledger.reserve(user['id'], key, 'label_upload', payload.requiredBytes)
+        relative = Path('.uploads') / owner_key(user['id']) / request_id.hex
+        prepare(user['id'], key, 'label-studio', relative.parent)
+        prepare(user['id'], key, 'label-studio', relative)
+        prepare(user['id'], key, 'label-studio', f'media/upload/{payload.project}')
+        return {'directory': relative.as_posix()}
+    finally:
+        os.close(fd)
 
 
 def sync_project(subject, remote_id):
@@ -160,28 +220,43 @@ async def upload(project_id: uuid.UUID, request: Request):
     await run_in_threadpool(project_for, user['id'], project_id)
     if request.headers.get('content-type', '').split(';')[0] not in {'application/zip', 'application/octet-stream'}:
         raise HTTPException(415, 'Send the ZIP as the request body.')
-    if int(request.headers.get('content-length', '0')) > MAX_UPLOAD_BYTES:
+    length = request.headers.get('content-length', '')
+    if length and (not length.isascii() or not length.isdigit() or len(length) > 12):
+        raise HTTPException(400, 'Invalid upload length.')
+    if length and int(length) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, 'ZIP upload exceeds 2 GB.')
     root = contained_path(DATASET_DIR, '.label-studio-uploads')
-    root.mkdir(parents=True, exist_ok=True)
-    jobs.enough_disk(root, 0)
-    descriptor, filename = tempfile.mkstemp(prefix='.upload-', suffix='.zip', dir=root)
-    path = Path(filename)
+    lease, path = None, None
     try:
+        if enabled():
+            with anyio.CancelScope(shield=True):
+                lease = await run_in_threadpool(RequestLease(user['id'], (int(length) if length else MAX_UPLOAD_BYTES) + 1024**2).open)
+            root = root / owner_key(user['id'])
+            await run_in_threadpool(prepare, user['id'], lease.key, 'dataset', root.relative_to(DATASET_DIR))
+        root.mkdir(parents=True, exist_ok=True)
+        jobs.enough_disk(root, 0)
+        descriptor, filename = tempfile.mkstemp(prefix='.upload-', suffix='.zip', dir=root)
+        path = Path(filename)
         total = 0
         with os.fdopen(descriptor, 'wb') as output:
             async for chunk in request.stream():
                 total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
+                if total > (int(length) if length else MAX_UPLOAD_BYTES):
                     raise HTTPException(413, 'ZIP upload exceeds 2 GB.')
                 jobs.enough_disk(root, len(chunk))
                 await run_in_threadpool(output.write, chunk)
         if not total:
             raise ValueError('The ZIP is empty.')
         return {'operation': await run_in_threadpool(jobs.create, user['id'], project_id, 'import', path)}
-    except BaseException:
-        path.unlink(missing_ok=True)
+    except BaseException as exc:
+        if path:
+            path.unlink(missing_ok=True)
+        check_storage_error(exc)
         raise
+    finally:
+        if lease:
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(lease.close)
 
 
 @router.get('/operations/{operation_id}')

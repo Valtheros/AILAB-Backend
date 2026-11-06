@@ -1,16 +1,24 @@
 import json
+import errno
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 from psycopg.errors import QueryCanceled
+from storage_reservations import StorageReservationError
 
 import compute_executor
 import compute_worker
 
 
 class WorkerFailureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Load native registrations before patch.dict restores sys.modules.
+        __import__('torch')
+
     def test_startup_heartbeat_retries_statement_timeout_before_preflight(self):
         lease = MagicMock()
         lease.execute.return_value.fetchone.return_value = {'ok': True}
@@ -153,6 +161,44 @@ class WorkerFailureTests(unittest.TestCase):
 
     def test_duplicate_delivery_never_finalizes_other_job(self):
         self.assertEqual(self.setup_failure(duplicate=True), {'duplicate': True})
+
+    def test_storage_reservation_failure_finishes_without_starting_a_model(self):
+        with patch.object(compute_worker.storage_service, 'begin_compute',
+                          side_effect=StorageReservationError('STORAGE_QUOTA_EXCEEDED', 'Storage is full.')):
+            self.assertEqual(self.setup_failure()['error_code'], 'STORAGE_QUOTA_EXCEEDED')
+
+    def test_failed_storage_release_is_retained_without_restarting_a_finished_worker(self):
+        with patch.object(compute_worker.storage_service, 'finish_compute', side_effect=OSError('operator offline')):
+            self.assertEqual(self.setup_failure()['status'], 'failed')
+
+    def test_outcome_pipe_works_when_no_report_file_can_be_written(self):
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+        try:
+            with tempfile.TemporaryDirectory() as root, \
+                 patch.dict(os.environ, {'COMPUTE_OUTCOME_FD': str(write_fd)}), \
+                 patch.object(Path, 'write_bytes', side_effect=OSError(errno.EDQUOT, 'Full')):
+                compute_executor.report_outcome(Path(root) / 'result.json', {'status': 'failed', 'error_code': 'STORAGE_QUOTA_EXCEEDED'})
+            write_fd = None
+            result = json.loads(os.read(read_fd, 4096))
+            self.assertEqual(result['error_code'], 'STORAGE_QUOTA_EXCEEDED')
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
+
+    def test_report_is_bounded_to_one_atomic_pipe_write(self):
+        read_fd, write_fd = os.pipe2(os.O_NONBLOCK)
+        try:
+            with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {'COMPUTE_OUTCOME_FD': str(write_fd)}):
+                compute_executor.report_outcome(Path(root) / 'result.json', {'status': 'failed', 'error_message': 'x' * 10000})
+            write_fd = None
+            report = os.read(read_fd, 8192)
+            self.assertLessEqual(len(report), 4096)
+            self.assertEqual(json.loads(report)['status'], 'failed')
+        finally:
+            os.close(read_fd)
+            if write_fd is not None:
+                os.close(write_fd)
 
     def test_executor_reports_oom_without_public_traceback(self):
         connection = Mock()

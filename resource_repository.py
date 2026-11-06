@@ -529,7 +529,20 @@ class ResourceRepository:
         ).fetchone():
             raise ValueError('Storage quota cleanup or transfer is not available for this account yet.')
 
-    def transfer_user_resources(self, source_user_id: str, target_user_id: str) -> dict[str, int]:
+    @staticmethod
+    def assert_storage_cleanup_allowed(connection, user_id: str) -> None:
+        if os.getenv('STORAGE_ENFORCEMENT', '').lower() == 'true':
+            from storage_reservations import StorageReservations
+            StorageReservations.assert_can_retire(connection, user_id)
+        else:
+            ResourceRepository.assert_no_storage_account(connection, user_id)
+
+    def transfer_user_resources(self, source_user_id: str, target_user_id: str, *, _storage_transfer=None) -> dict[str, int]:
+        if source_user_id == target_user_id:
+            raise ValueError("Source and target users must be different")
+        if os.getenv('STORAGE_ENFORCEMENT', '').lower() == 'true' and _storage_transfer is None:
+            from storage_transfer import Transfer
+            return Transfer(source_user_id, target_user_id).execute()
         from compute_repository import enabled, ACTIVE
         if enabled():
             with self._connect() as c:
@@ -549,8 +562,9 @@ class ResourceRepository:
                 if connection.execute("select 1 from dataset_indexes where owner_user_id=%s and status in ('queued','running')", (source_user_id,)).fetchone():
                     raise ValueError('Wait for dataset indexing to finish before transferring resources.')
                 self.assert_no_pending_imports(connection, source_user_id)
-                self.assert_no_storage_account(connection, source_user_id)
-                self.assert_no_storage_account(connection, target_user_id)
+                if _storage_transfer is None:
+                    self.assert_no_storage_account(connection, source_user_id)
+                    self.assert_no_storage_account(connection, target_user_id)
                 target = connection.execute('select id, email from "user" where id = %s', (target_user_id,)).fetchone()
                 if not target:
                     raise FileNotFoundError("Transfer target user was not found")
@@ -570,10 +584,12 @@ class ResourceRepository:
                 ).fetchone()
                 if active:
                     raise ValueError(f"Stop active training run '{active['run_slug']}' before transferring ownership")
+                if _storage_transfer is not None:
+                    _storage_transfer.copy(connection)
                 for row in datasets:
                     source = registered_storage_path(DATASET_DIR, row["storage_path"])
                     destination = owner_dataset_path(DATASET_DIR, target_user_id, row["slug"])
-                    if row["status"] != "deleted" and source != destination:
+                    if _storage_transfer is None and row["status"] != "deleted" and source != destination:
                         if not source.is_dir():
                             raise FileNotFoundError(f"Dataset storage for '{row['slug']}' was not found")
                         if destination.exists():
@@ -600,6 +616,7 @@ class ResourceRepository:
                     connection.execute('update compute_jobs set owner_user_id=%s,idempotency_key=null where owner_user_id=%s', (target_user_id, source_user_id))
                 connection.execute('update evaluations set owner_user_id=%s,idempotency_key=null where owner_user_id=%s', (target_user_id, source_user_id))
                 connection.execute('update dataset_indexes set owner_user_id=%s where owner_user_id=%s', (target_user_id, source_user_id))
+                connection.execute('update notifications set owner_user_id=%s where owner_user_id=%s', (target_user_id, source_user_id))
                 connection.execute('''update model_api_keys set revoked_at=coalesce(revoked_at,now())
                     where endpoint_id in (select id from model_endpoints where owner_user_id=%s)''', (source_user_id,))
                 connection.execute('update model_endpoints set owner_user_id=%s,enabled=false,updated_at=now() where owner_user_id=%s',
@@ -615,6 +632,8 @@ class ResourceRepository:
                         (membership["workspace_id"], target_user_id, membership["role"]),
                     )
                 connection.execute("delete from workspace_members where user_id = %s", (source_user_id,))
+                if _storage_transfer is not None:
+                    _storage_transfer.committed(connection)
         except Exception:
             for source, destination in reversed(moves):
                 if destination.exists() and not source.exists():
@@ -663,7 +682,7 @@ class ResourceRepository:
             if connection.execute("select 1 from dataset_indexes where owner_user_id=%s and status in ('queued','running')", (user_id,)).fetchone():
                 raise ValueError('Wait for dataset indexing to finish before deleting this user.')
             self.assert_no_pending_imports(connection, user_id)
-            self.assert_no_storage_account(connection, user_id)
+            self.assert_storage_cleanup_allowed(connection, user_id)
             connection.execute('''update model_api_keys set revoked_at=coalesce(revoked_at,now())
                 where endpoint_id in (select id from model_endpoints where owner_user_id=%s)''', (user_id,))
             connection.execute('update model_endpoints set enabled=false,updated_at=now() where owner_user_id=%s', (user_id,))
@@ -680,6 +699,9 @@ class ResourceRepository:
         return datasets, runs
 
     def finalize_user_resource_delete(self, user_id: str) -> None:
+        if os.getenv('STORAGE_ENFORCEMENT', '').lower() == 'true':
+            from storage_service import ledger
+            ledger.retire(user_id)
         with self._connect() as connection:
             connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
             self.assert_no_storage_account(connection, user_id)

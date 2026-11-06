@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import sys
@@ -15,17 +16,37 @@ from settings import DATASET_DIR, RUNS_DIR
 from worker.error_utils import concise_error
 
 
+def report_outcome(output, outcome):
+    data = json.dumps(outcome, ensure_ascii=False).encode('utf-8')
+    if len(data) > 4096:
+        data = json.dumps({'status': 'failed', 'error_code': 'COMPUTE_FAILED',
+                           'error_message': 'The worker result summary exceeded its size limit.'}).encode('utf-8')
+    report_fd = os.environ.get('COMPUTE_OUTCOME_FD')
+    if report_fd is not None:
+        try:
+            os.write(int(report_fd), data)
+        finally:
+            os.close(int(report_fd))
+    try:
+        temporary = output.with_suffix('.tmp')
+        temporary.write_bytes(data)
+        temporary.replace(output)
+    except OSError:
+        if report_fd is None:
+            raise
+
+
 def run(job_id, token):
     directory = job_directory(job_id)
-    directory.mkdir(parents=True, exist_ok=True)
+    with registry._connect() as c:
+        row = c.execute("select * from compute_jobs where id=%s and dispatch_token=%s and status='running'",
+                        (job_id, token)).fetchone()
+    if not row:
+        return
     output = directory / f'{token}.json'
     outcome = {'status': 'failed'}
     try:
-        with registry._connect() as c:
-            row = c.execute("select * from compute_jobs where id=%s and dispatch_token=%s and status='running'",
-                            (job_id, token)).fetchone()
-        if not row:
-            return
+        directory.mkdir(parents=True, exist_ok=True)
         device = os.environ['COMPUTE_EXEC_DEVICE']
         import torch
         if device == 'cuda:0' and (not torch.cuda.is_available() or torch.cuda.device_count() != 1):
@@ -80,15 +101,20 @@ def run(job_id, token):
                 outcome['dataset_verified'] = dataset_verified
     except Exception as exc:
         import traceback
-        (directory / 'error.log').write_text(traceback.format_exc()[-65536:], encoding='utf-8')
+        try:
+            (directory / 'error.log').write_text(traceback.format_exc()[-65536:], encoding='utf-8')
+        except OSError:
+            pass
         text = concise_error(exc)
-        code = 'GPU_OOM' if 'out of memory' in str(exc).lower() else 'CHECKPOINT_CHANGED' if getattr(exc, 'code', None) == 'CHECKPOINT_CHANGED' else 'COMPUTE_FAILED'
+        storage_full = isinstance(exc, OSError) and exc.errno in {errno.EDQUOT, errno.ENOSPC}
+        code = ('STORAGE_QUOTA_EXCEEDED' if storage_full else 'GPU_OOM' if 'out of memory' in str(exc).lower()
+                else 'CHECKPOINT_CHANGED' if getattr(exc, 'code', None) == 'CHECKPOINT_CHANGED' else 'COMPUTE_FAILED')
+        if storage_full:
+            text = 'The job ran out of storage allowance. Free space or ask an administrator to increase your quota, then retry.'
         outcome = {'status': 'failed', 'error_code': code,
                    'error_message': text}
     finally:
-        temporary = output.with_suffix('.tmp')
-        temporary.write_text(json.dumps(outcome), encoding='utf-8')
-        temporary.replace(output)
+        report_outcome(output, outcome)
 
 
 if __name__ == '__main__':

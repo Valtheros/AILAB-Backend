@@ -66,7 +66,7 @@ def submit():
     image = io.BytesIO()
     Image.new('RGB', (32, 32), 'red').save(image, format='PNG')
     session = {'x-internal-token': os.environ['BACKEND_INTERNAL_TOKEN'], 'x-user-id': metadata['owner']}
-    with patch.object(model_api_service, 'STORAGE_ENFORCEMENT_IMPLEMENTED', True), TestClient(app) as client:
+    with patch.object(model_api_service, 'enabled', return_value=True), TestClient(app) as client:
         endpoint = client.post('/api/model-endpoints', headers=session, json={'runSlug': metadata['runSlug']})
         if endpoint.status_code != 201:
             raise RuntimeError(f'Endpoint setup failed: {endpoint.status_code} {endpoint.text}')

@@ -27,6 +27,7 @@ from resource_repository import resource_repository as registry
 from security_utils import contained_path, safe_extract_zip
 from settings import DATASET_DIR, REDIS_URL
 from api_errors import error_info
+from storage_service import RequestLease, check_storage_error, enabled, prepare, write_lease
 
 logger = logging.getLogger(__name__)
 QUEUE = 'label_studio'
@@ -185,6 +186,7 @@ def import_images(op, project, stage):
                     raise ValueError('Image exceeds 25 million pixels.')
                 ImageOps.exif_transpose(source).convert('RGB').save(normalized, format='PNG')
         except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+            check_storage_error(exc)
             skipped += 1
             if len(errors) < 100:
                 errors.append({'file': str(path.relative_to(root)), 'reason': str(exc)[:160]})
@@ -278,6 +280,13 @@ def publish(op, project, stage):
 
 
 def accept_preview(owner, operation_id, discard=False):
+    if discard:
+        return _accept_preview(owner, operation_id, True, None)
+    with write_lease(owner, 32 * 1024**2) as lease:
+        return _accept_preview(owner, operation_id, discard, lease)
+
+
+def _accept_preview(owner, operation_id, discard, lease):
     with registry._connect() as c:
         op = c.execute('select * from label_studio_operations where id=%s and owner_user_id=%s for update', (operation_id, owner)).fetchone()
         if not op or not op['preview_only']:
@@ -293,6 +302,8 @@ def accept_preview(owner, operation_id, discard=False):
             return {'discarded': True}
         slug = op['result']['datasetName']
         target = owner_dataset_path(DATASET_DIR, owner, slug)
+        if lease:
+            prepare(owner, lease.key, 'dataset', target.parent.relative_to(DATASET_DIR))
         with registry.dataset_guard(owner, slug) as dc:
             path = target if target.exists() else source
             if not path.exists():
@@ -348,11 +359,18 @@ def _run(operation_id):
         op = dict(row)
         project = c.execute('select * from label_studio_projects where id=%s and owner_user_id=%s and deleted_at is null', (op['project_id'], op['owner_user_id'])).fetchone()
     stage = contained_path(WORK_DIR, str(op['id']))
-    shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True)
+    lease = None
     try:
         if not project:
             raise FileNotFoundError('Project was removed.')
+        if enabled():
+            lease = RequestLease(op['owner_user_id'], 6 * 1024**3).open()
+        shutil.rmtree(stage, ignore_errors=True)
+        if lease:
+            prepare(op['owner_user_id'], lease.key, 'dataset', stage.relative_to(DATASET_DIR))
+            target_parent = owner_dataset_path(DATASET_DIR, op['owner_user_id'], 'pending').parent
+            prepare(op['owner_user_id'], lease.key, 'dataset', target_parent.relative_to(DATASET_DIR))
+        stage.mkdir(parents=True, exist_ok=lease is not None)
         result = import_images(op, project, stage) if op['kind'] == 'import' else publish(op, project, stage)
         with registry._connect() as c:
             c.execute("update label_studio_operations set status='completed',result=%s::jsonb,updated_at=now() where id=%s", (json.dumps(result), operation_id))
@@ -367,6 +385,10 @@ def _run(operation_id):
             c.execute("update label_studio_operations set status='cancelled',error=%s,updated_at=now() where id=%s", (str(exc), operation_id))
     except Exception as exc:
         logger.exception('Label Studio operation %s failed', operation_id)
+        try:
+            check_storage_error(exc)
+        except ValueError as storage_error:
+            exc = storage_error
         message = operation_error(exc)
         info = error_info(exc, message)
         with registry._connect() as c:
@@ -377,6 +399,8 @@ def _run(operation_id):
                  'preview' if op['preview_only'] else 'import', 'failed', target)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+        if lease:
+            lease.close()
 
 
 def recover():
@@ -443,6 +467,7 @@ if __name__ == '__main__':
         recover()
     else:
         next_cleanup = 0
+        next_reconciliation = 0
         while True:
             try:
                 recover()
@@ -454,6 +479,10 @@ if __name__ == '__main__':
                     cleanup()
                     cleanup_indexes()
                     next_cleanup = time.monotonic() + 3600
+                if time.monotonic() >= next_reconciliation:
+                    from storage_reconciliation import reconcile
+                    reconcile()
+                    next_reconciliation = time.monotonic() + 300
             except Exception:
                 logger.exception('Label Studio queue unavailable; retrying.')
             time.sleep(5)

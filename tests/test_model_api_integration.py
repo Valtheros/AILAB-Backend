@@ -21,7 +21,8 @@ class ModelAPIIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         import model_api_service
-        cls.quota_gate = patch.object(model_api_service, 'STORAGE_ENFORCEMENT_IMPLEMENTED', True)
+        # API scope tests isolate the gate; real quota coverage has its own kernel tests.
+        cls.quota_gate = patch.object(model_api_service, 'enabled', return_value=True)
         cls.quota_gate.start()
         cls.addClassCleanup(cls.quota_gate.stop)
         from resource_repository import resource_repository

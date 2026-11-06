@@ -15,12 +15,9 @@ from resource_repository import resource_repository as registry
 from security_utils import contained_path
 from settings import REDIS_URL, RUNS_DIR
 
-# Public submissions must remain disabled until all upload and worker paths enforce storage quotas.
-STORAGE_ENFORCEMENT_IMPLEMENTED = False
-
-
 def enabled():
-    return STORAGE_ENFORCEMENT_IMPLEMENTED and os.getenv('MODEL_API_ENABLED', 'false').lower() == 'true'
+    from storage_service import enabled as storage_enabled
+    return storage_enabled() and os.getenv('MODEL_API_ENABLED', 'false').lower() == 'true'
 
 
 def checkpoint(run_slug: str, model_type: str):

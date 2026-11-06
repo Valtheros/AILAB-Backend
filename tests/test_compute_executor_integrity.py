@@ -13,6 +13,22 @@ import compute_executor
 
 
 class ComputeExecutorIntegrityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        __import__('torch')
+
+    def test_unclaimed_executor_does_not_create_or_overwrite_any_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / 'unclaimed'
+            connection = MagicMock()
+            connection.__enter__.return_value.execute.return_value.fetchone.return_value = None
+            with patch.object(compute_executor, 'job_directory', return_value=directory), \
+                 patch.object(compute_executor.registry, '_connect', return_value=connection), \
+                 patch.object(compute_executor, 'report_outcome') as report:
+                compute_executor.run(str(uuid.uuid4()), str(uuid.uuid4()))
+            self.assertFalse(directory.exists())
+            report.assert_not_called()
+
     def test_changed_checkpoint_fails_job_after_prediction(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

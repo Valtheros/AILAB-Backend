@@ -19,6 +19,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -77,6 +78,7 @@ from model_public_api import router as model_public_router
 from dataset_version_api import router as dataset_version_router
 import model_api_service
 from api_errors import PublicError, error_info
+from storage_uploads import StorageUploadMiddleware
 
 
 app = FastAPI(title="No-Code Computer Vision Training Backend")
@@ -84,6 +86,8 @@ app = FastAPI(title="No-Code Computer Vision Training Backend")
 from label_studio_api import router as label_studio_router, internal_router as label_studio_internal_router
 app.include_router(label_studio_router)
 app.include_router(label_studio_internal_router)
+from storage_api import router as storage_router
+app.include_router(storage_router)
 app.include_router(compute_router)
 app.include_router(evaluation_router)
 app.include_router(notification_router)
@@ -99,8 +103,9 @@ async def public_error(request: Request, exc: PublicError):
 
 @app.exception_handler(StarletteHTTPException)
 async def http_error(request: Request, exc: StarletteHTTPException):
-    code = {401: 'UNAUTHORIZED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 409: 'CONFLICT',
+    code = {401: 'UNAUTHORIZED', 403: 'FORBIDDEN', 404: 'NOT_FOUND', 409: 'CONFLICT', 413: 'UPLOAD_TOO_LARGE',
             429: 'RATE_LIMITED', 503: 'SERVICE_UNAVAILABLE'}.get(exc.status_code, 'VALIDATION_ERROR')
+    code = getattr(exc, 'code', code)
     detail = exc.detail
     if exc.status_code >= 500:
         logging.getLogger(__name__).error('API HTTP failure %s: %s', request.state.request_id, detail)
@@ -124,6 +129,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_middleware(StorageUploadMiddleware)
 
 
 PUBLIC_API_PATHS = {"/api/model-catalog", "/api/resource-profile"}
@@ -479,13 +486,33 @@ async def _inspect_uploaded_zip(request: Request, file: UploadFile) -> dict[str,
     dataset_name = safe_dataset_name(file.filename)
     owner_id = _require_request_user_id(request)
     owner_root = owner_dataset_root(DATASET_DIR, owner_id)
+    lease = getattr(request.state, 'storage_upload_lease', None)
+    if lease:
+        from security_utils import MAX_ARCHIVE_ENTRIES, MAX_ARCHIVE_UNCOMPRESSED_BYTES
+        def reserve_extraction():
+            try:
+                with zipfile.ZipFile(file.file) as archive:
+                    entries = archive.infolist()
+                    expanded = sum(entry.file_size for entry in entries)
+                    if len(entries) > MAX_ARCHIVE_ENTRIES or expanded > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                        raise HTTPException(413, 'ZIP expands beyond the supported size or file count.')
+                    lease.additional('extract', expanded + len(entries) * 8192 + 1024**2,
+                                     namespace='dataset', path=owner_root.relative_to(DATASET_DIR))
+            except zipfile.BadZipFile:
+                raise HTTPException(400, 'Invalid ZIP file')
+        await run_in_threadpool(reserve_extraction)
     staging_dir = staging_directory(owner_root)
     temp_zip_path: Path | None = None
     try:
-        temp_zip_path = await save_upload_to_temp(file, owner_root)
-        extract_dir, metadata = await asyncio.to_thread(_extract_and_validate_upload, temp_zip_path, staging_dir)
+        if lease:
+            await file.seek(0)
+            source = file.file
+        else:
+            temp_zip_path = await save_upload_to_temp(file, owner_root)
+            source = temp_zip_path
+        extract_dir, metadata = await run_in_threadpool(_extract_and_validate_upload, source, staging_dir)
         profile = _dataset_profile(metadata)
-        staged = await asyncio.to_thread(
+        staged = await run_in_threadpool(
             staged_uploads.create,
             owner_id,
             dataset_name,
@@ -500,6 +527,8 @@ async def _inspect_uploaded_zip(request: Request, file: UploadFile) -> dict[str,
         }
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid ZIP file")
+    except PublicError:
+        raise
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
@@ -840,6 +869,12 @@ async def inspect_dataset_upload(request: Request, file: UploadFile = File(...))
 
 @app.post("/api/datasets/import")
 def import_dataset(payload: StagedImportRequest, request: Request):
+    from storage_service import write_lease
+    with write_lease(_require_request_user_id(request), 32 * 1024**2):
+        return _import_dataset(payload, request)
+
+
+def _import_dataset(payload: StagedImportRequest, request: Request):
     owner_id = _require_request_user_id(request)
     token = payload.uploadToken
     if not token or any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_' for character in token):
@@ -1397,6 +1432,8 @@ def admin_transfer_user_resources(user_id: str, payload: TransferResourcesReques
         raise HTTPException(status_code=409, detail="Stop active training jobs before transferring ownership")
     try:
         return {"status": "success", **resource_repository.transfer_user_resources(user_id, payload.targetUserId)}
+    except PublicError:
+        raise
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1410,7 +1447,7 @@ def admin_delete_user_resources(user_id: str, request: Request):
     with resource_repository._connect() as c:
         try:
             resource_repository.assert_no_pending_imports(c, user_id)
-            resource_repository.assert_no_storage_account(c, user_id)
+            resource_repository.assert_storage_cleanup_allowed(c, user_id)
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if c.execute("select 1 from dataset_indexes where owner_user_id=%s and status in ('queued','running')", (user_id,)).fetchone():

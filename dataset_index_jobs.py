@@ -18,6 +18,7 @@ from dataset_storage import registered_storage_path
 from resource_repository import resource_repository as registry
 from security_utils import contained_path
 from settings import DATASET_DIR, REDIS_URL
+from storage_service import check_storage_error, prepare
 
 log = logging.getLogger(__name__)
 QUEUE = 'dataset_index'
@@ -116,10 +117,15 @@ def _run(dataset_id, generation):
             return
         dataset = connection.execute("select * from datasets where id=%s and owner_user_id=%s and status='active'",
                                      (dataset_id, row['owner_user_id'])).fetchone()
+    lease = None
     try:
         if not dataset:
             raise ValueError('Dataset is no longer available.')
         root = registered_storage_path(DATASET_DIR, dataset['storage_path'])
+        from storage_service import RequestLease, enabled
+        if enabled():
+            lease = RequestLease(row['owner_user_id'], 2 * 1024**3).open()
+            prepare(row['owner_user_id'], lease.key, 'dataset', root.relative_to(DATASET_DIR))
         verify_source(root, dataset['content_sha256'])
         generation_id = str(uuid.UUID(str(generation)))
         cache = contained_path(root, '.ailab_index', generation_id)
@@ -143,6 +149,7 @@ def _run(dataset_id, generation):
                 if len(annotation.encode('utf-8')) > 10 * 1024 * 1024:
                     raise ValueError('Image annotations are too large.')
             except (OSError, ValueError, SyntaxError) as exc:
+                check_storage_error(exc)
                 log.warning('Skipping unusable dataset image %s: %s', image.name, exc)
                 thumbnail.unlink(missing_ok=True)
                 mask.unlink(missing_ok=True)
@@ -170,10 +177,13 @@ def _run(dataset_id, generation):
             log.warning('Dataset cache cleanup will retry: %s', dataset_id, exc_info=True)
     except Exception as exc:
         log.exception('Dataset indexing failed for %s', dataset_id)
-        message = str(exc)[:300] if isinstance(exc, (ValueError, FileNotFoundError)) else 'Could not prepare dataset details. Please retry.'
+        message = str(exc)[:300] if isinstance(exc, (ValueError, FileNotFoundError, PublicError)) else 'Could not prepare dataset details. Please retry.'
         with registry._connect() as connection:
             connection.execute('''update dataset_indexes set status='failed',error_message=%s,updated_at=now()
                 where dataset_version_id=%s and working_generation=%s''', (message, dataset_id, generation))
+    finally:
+        if lease:
+            lease.close()
 
 
 def _flush(dataset_id, generation, processed, skipped, pending):

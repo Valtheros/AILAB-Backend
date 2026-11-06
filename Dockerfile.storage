@@ -1,0 +1,4 @@
+FROM python:3.11-slim
+WORKDIR /operator
+COPY storage_operator.py storage_operator_client.py storage_project_quota.py ./
+ENTRYPOINT ["python", "-B", "-m", "storage_operator"]

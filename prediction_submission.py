@@ -12,6 +12,10 @@ from batch_inputs import safe_image_name
 import compute_repository as compute
 from inference_service import InferenceError, _open_verified_image
 from resource_guard import estimate_training_memory
+import storage_service
+from storage_uploads import current_lease
+from starlette.concurrency import run_in_threadpool
+from settings import RUNS_DIR
 
 
 async def submit_single(owner_id, run, config, payload, filename, selection, threshold, key, *, principal=None):
@@ -29,7 +33,10 @@ async def submit_single(owner_id, run, config, payload, filename, selection, thr
     selection = compute.execution_selection(selection)
     job_id = uuid.uuid4()
     directory = compute.job_directory(job_id)
-    directory.mkdir(parents=True, exist_ok=False)
+    if storage_service.enabled():
+        await run_in_threadpool(current_lease(owner_id).additional, 'prediction', len(payload) + 1024**2,
+                                namespace='runs', path=directory.relative_to(RUNS_DIR))
+    directory.mkdir(parents=True, exist_ok=storage_service.enabled())
     data = {'project_name': run['run_slug'], 'model_type': run['model_type'], 'task_type': run['task_type'],
             'threshold': threshold, 'input_sha256': hashlib.sha256(payload).hexdigest(),
             'input_name': safe_image_name(filename), 'input_bytes': len(payload)}

@@ -19,6 +19,8 @@ from compute_memory import worker_cgroup
 from compute_repository import claim_job, finish_job, job_directory, queue_name, registry
 from compute_policy import JOB_TIMEOUTS
 from settings import REDIS_URL
+import storage_service
+from storage_reservations import StorageReservationError
 
 log = logging.getLogger(__name__)
 NODE = os.getenv('COMPUTE_NODE_ID', 'local')
@@ -87,6 +89,7 @@ def execute(job_id, token):
     outcome = {'status': 'failed', 'error_code': 'WORKER_INTERRUPTED', 'error_message': 'The worker was interrupted. Train again to create a new run.'}
     last_db_success = time.monotonic()
     db_lost = False
+    outcome_read = outcome_write = None
     watchdog_stop = threading.Event()
 
     def database_watchdog():
@@ -115,7 +118,13 @@ def execute(job_id, token):
         last_db_success = time.monotonic()
         directory = job_directory(job_id)
         try:
+            storage_service.begin_compute(row)
             directory.mkdir(parents=True, exist_ok=True)
+            temporary_dir = directory / 'tmp'
+            temporary_dir.mkdir(exist_ok=True)
+        except StorageReservationError as exc:
+            outcome = {'status': 'failed', 'error_code': exc.code, 'error_message': str(exc)}
+            return outcome
         except OSError:
             log.exception('Could not create compute job directory')
             outcome = {'status': 'failed', 'error_code': 'WORKER_STORAGE_ERROR',
@@ -129,9 +138,14 @@ def execute(job_id, token):
             if not gpu_clear() or memory.free < required:
                 outcome = {'status': 'failed', 'error_code': 'GPU_UNAVAILABLE', 'error_message': 'The GPU changed after reservation. Retry after checking its load.'}
                 return outcome
+        outcome_read, outcome_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
         env = {**os.environ, 'COMPUTE_EXEC_DEVICE': 'cuda:0' if GPU else 'cpu',
+               'TMPDIR': str(temporary_dir), 'COMPUTE_OUTCOME_FD': str(outcome_write),
                'OMP_NUM_THREADS': str(row['worker_cpus']), 'MKL_NUM_THREADS': str(row['worker_cpus'])}
-        CHILD = subprocess.Popen([sys.executable, '-m', 'compute_executor', job_id, token], env=env, cwd=directory, start_new_session=True)
+        CHILD = subprocess.Popen([sys.executable, '-m', 'compute_executor', job_id, token], env=env, cwd=directory,
+                                 start_new_session=True, pass_fds=(outcome_write,))
+        os.close(outcome_write)
+        outcome_write = None
         deadline = time.monotonic() + JOB_TIMEOUTS[row['kind']]
         while CHILD.poll() is None:
             try:
@@ -153,7 +167,13 @@ def execute(job_id, token):
             # Short polls keep cancellation responsive without exceeding the five-second heartbeat interval.
             time.sleep(1)
         forced_stop = outcome['status'] == 'cancelled' or outcome.get('error_code') == 'COMPUTE_TIMEOUT'
-        if (directory / f'{token}.json').is_file() and not db_lost and not forced_stop:
+        try:
+            report = os.read(outcome_read, 4096)
+        except BlockingIOError:
+            report = b''
+        if report and not db_lost and not forced_stop:
+            outcome = json.loads(report)
+        elif (directory / f'{token}.json').is_file() and not db_lost and not forced_stop:
             outcome = json.loads((directory / f'{token}.json').read_text())
         elif CHILD.returncode == -9 and not forced_stop:
             outcome = {'status': 'failed', 'error_code': 'WORKER_KILLED', 'error_message': 'The process was killed, possibly by the RAM limit. Reduce the configuration and train again.'}
@@ -183,10 +203,17 @@ def execute(job_id, token):
                         # A full disk must not prevent the authoritative DB status update.
                         log.warning('Could not write release proof for %s', job_id, exc_info=True)
                 finish_job(job_id, token, **outcome)
+                try:
+                    storage_service.finish_compute(row)
+                except Exception:
+                    log.exception('Storage allowance retained for terminal-job reconciliation: %s', job_id)
         except Exception:
             log.exception('Could not confirm compute release; restarting for lease recovery')
             os._exit(1)
         finally:
+            for fd in (outcome_read, outcome_write):
+                if fd is not None:
+                    os.close(fd)
             watchdog_stop.set()
             watchdog.join(timeout=1)
 

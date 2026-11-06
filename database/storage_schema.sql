@@ -25,3 +25,23 @@ create table if not exists storage_reservations (
 
 create index if not exists storage_reservations_active_owner
   on storage_reservations(owner_user_id) where released_at is null;
+
+-- This is an accounted upper bound on the kernel limit, not the user's plan quota.
+alter table storage_accounts add column if not exists enforced_limit_bytes bigint
+  not null default 65536 check (enforced_limit_bytes >= 1024 and enforced_limit_bytes % 1024 = 0);
+alter table storage_accounts add column if not exists breakdown jsonb not null default '{}';
+alter table storage_accounts add column if not exists reconciled_at timestamptz;
+
+create table if not exists storage_transfers (
+  id uuid primary key,
+  source_user_id text not null references "user"(id) on delete cascade,
+  target_user_id text not null references "user"(id) on delete cascade,
+  lease_id text not null check (lease_id ~ '^[a-f0-9]{32}$'),
+  state text not null check (state in ('copying','committed','completed','rolled_back')),
+  plan jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  check (source_user_id <> target_user_id)
+);
+create index if not exists storage_transfers_pending on storage_transfers(state)
+  where state in ('copying','committed');
