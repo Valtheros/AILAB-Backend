@@ -187,6 +187,7 @@ def build_run_comparison(
         "runId": str(task_row.get("id")),
         "runSlug": task_row.get("run_slug"),
         "displayName": task_row.get("display_name") or task_row.get("run_slug"),
+        "createdAt": task_row.get("created_at"),
         "taskType": task_type,
         "modelType": task_row.get("model_type") or config.get("model_type"),
         "architecture": architecture,

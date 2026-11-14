@@ -18,6 +18,7 @@ from rq import Queue, Worker
 from rq.job import Job
 
 from dataset_storage import owner_dataset_path
+from dataset_versioning import MANIFEST_NAME, sha256_stream, source_manifest, verify_source, write_manifest
 from dataset_utils import inspect_dataset, validate_dataset_for_upload, dataset_workflow_metadata, safe_dataset_name
 from label_studio_client import BridgeError, bridge
 from label_studio_export import SnapshotExporter
@@ -26,6 +27,7 @@ from resource_repository import resource_repository as registry
 from security_utils import contained_path, safe_extract_zip
 from settings import DATASET_DIR, REDIS_URL
 from api_errors import error_info
+from storage_service import RequestLease, check_storage_error, enabled, prepare, write_lease
 
 logger = logging.getLogger(__name__)
 QUEUE = 'label_studio'
@@ -184,12 +186,13 @@ def import_images(op, project, stage):
                     raise ValueError('Image exceeds 25 million pixels.')
                 ImageOps.exif_transpose(source).convert('RGB').save(normalized, format='PNG')
         except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+            check_storage_error(exc)
             skipped += 1
             if len(errors) < 100:
                 errors.append({'file': str(path.relative_to(root)), 'reason': str(exc)[:160]})
             continue
         with normalized.open('rb') as f:
-            sha = hashlib.file_digest(f, 'sha256').hexdigest()
+            sha = sha256_stream(f)
         result = bridge(op['owner_user_id'], 'image-upload', {
             'project': project['ls_project_id'], 'sha256': sha, 'filename': str(path.relative_to(root)),
         }, content=normalized)
@@ -241,8 +244,10 @@ def publish(op, project, stage):
     validate_dataset_for_upload(output, metadata)
     metadata['label_schema'] = schema
     metadata['label_studio_operation'] = str(op['id'])
+    content_hash = write_manifest(output, source_manifest(output, metadata))
     manifest = {'created_by': owner, 'label_schema': schema, 'source_label_studio_project': project['ls_project_id'],
                 'snapshot': op['snapshot_id'], 'label_studio_operation': str(op['id']), 'version': op['version'], 'revision': config.get('revision'),
+                'content_sha256': content_hash,
                 'split': {'ratios': config['ratios'], 'seed': config['seed']},
                 'workflow': dataset_workflow_metadata(metadata, get_catalog())}
     (output / '.ailab_dataset.json').write_text(json.dumps(manifest))
@@ -260,6 +265,7 @@ def publish(op, project, stage):
             prior = json.loads((target / '.ailab_dataset.json').read_text())
             if prior.get('label_studio_operation') != str(op['id']):
                 raise FileExistsError('Dataset destination already exists.')
+            verify_source(target, content_hash)
             metadata = inspect_dataset(target)
             validate_dataset_for_upload(target, metadata)
             metadata.update(label_schema=schema, label_studio_operation=str(op['id']))
@@ -267,11 +273,20 @@ def publish(op, project, stage):
             target.parent.mkdir(parents=True, exist_ok=True)
             output.replace(target)
         record = registry.upsert_dataset(owner, None, slug, target, metadata, c)
+        record = registry.attach_label_studio_version(owner, project['id'], project['name'], op['version'],
+                                                       record['id'], target, content_hash, c)
         c.execute('update label_studio_projects set published_version=greatest(published_version,%s),published_revision=%s where id=%s', (op['version'], config.get('revision'), project['id']))
     return {'datasetId': str(record['id']), 'datasetName': slug, 'version': op['version']}
 
 
 def accept_preview(owner, operation_id, discard=False):
+    if discard:
+        return _accept_preview(owner, operation_id, True, None)
+    with write_lease(owner, 32 * 1024**2) as lease:
+        return _accept_preview(owner, operation_id, discard, lease)
+
+
+def _accept_preview(owner, operation_id, discard, lease):
     with registry._connect() as c:
         op = c.execute('select * from label_studio_operations where id=%s and owner_user_id=%s for update', (operation_id, owner)).fetchone()
         if not op or not op['preview_only']:
@@ -287,6 +302,8 @@ def accept_preview(owner, operation_id, discard=False):
             return {'discarded': True}
         slug = op['result']['datasetName']
         target = owner_dataset_path(DATASET_DIR, owner, slug)
+        if lease:
+            prepare(owner, lease.key, 'dataset', target.parent.relative_to(DATASET_DIR))
         with registry.dataset_guard(owner, slug) as dc:
             path = target if target.exists() else source
             if not path.exists():
@@ -297,13 +314,30 @@ def accept_preview(owner, operation_id, discard=False):
             metadata = inspect_dataset(path)
             validate_dataset_for_upload(path, metadata)
             metadata.update(label_schema=manifest['label_schema'], label_studio_operation=str(op['id']))
+            source_path = path / MANIFEST_NAME
+            if not source_path.is_file():
+                manifest['content_sha256'] = write_manifest(path, source_manifest(path, metadata))
+            else:
+                content = hashlib.sha256(source_path.read_bytes()).hexdigest()
+                if manifest.get('content_sha256') and manifest['content_sha256'] != content:
+                    raise ValueError('Dataset preview content does not match its recorded version.')
+                manifest['content_sha256'] = content
+                verify_source(path, content)
             if path == source:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 source.replace(target)
             record = registry.upsert_dataset(owner, None, slug, target, metadata, dc)
+            project = dc.execute('select id,name from label_studio_projects where id=%s and owner_user_id=%s',
+                                 (op['project_id'], owner)).fetchone()
+            if not project:
+                raise FileNotFoundError('Label Studio project not found.')
+            record = registry.attach_label_studio_version(owner, project['id'], project['name'], op['version'],
+                                                           record['id'], target, manifest['content_sha256'], dc)
         result = {**op['result'], 'accepted': True, 'datasetId': str(record['id'])}
         c.execute('update label_studio_projects set published_version=greatest(published_version,%s),published_revision=%s where id=%s', (op['version'], manifest.get('revision'), op['project_id']))
         c.execute('update label_studio_operations set result=%s::jsonb,updated_at=now() where id=%s', (json.dumps(result), op['id']))
+        from notification_service import emit
+        emit(c, owner, f"label-import:{op['id']}", 'import', 'completed', '/dataset')
         return result
 
 
@@ -325,14 +359,25 @@ def _run(operation_id):
         op = dict(row)
         project = c.execute('select * from label_studio_projects where id=%s and owner_user_id=%s and deleted_at is null', (op['project_id'], op['owner_user_id'])).fetchone()
     stage = contained_path(WORK_DIR, str(op['id']))
-    shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True)
+    lease = None
     try:
         if not project:
             raise FileNotFoundError('Project was removed.')
+        if enabled():
+            lease = RequestLease(op['owner_user_id'], 6 * 1024**3).open()
+        shutil.rmtree(stage, ignore_errors=True)
+        if lease:
+            prepare(op['owner_user_id'], lease.key, 'dataset', stage.relative_to(DATASET_DIR))
+            target_parent = owner_dataset_path(DATASET_DIR, op['owner_user_id'], 'pending').parent
+            prepare(op['owner_user_id'], lease.key, 'dataset', target_parent.relative_to(DATASET_DIR))
+        stage.mkdir(parents=True, exist_ok=lease is not None)
         result = import_images(op, project, stage) if op['kind'] == 'import' else publish(op, project, stage)
         with registry._connect() as c:
             c.execute("update label_studio_operations set status='completed',result=%s::jsonb,updated_at=now() where id=%s", (json.dumps(result), operation_id))
+            from notification_service import emit
+            target = f"/annotate?project={project['ls_project_id']}&transfer={op['id']}" if op['preview_only'] else '/dataset'
+            emit(c, op['owner_user_id'], f"label-operation:{op['id']}:completed",
+                 'preview' if op['preview_only'] else 'import', 'completed', target)
         if op['upload_path']:
             Path(op['upload_path']).unlink(missing_ok=True)
     except InterruptedError as exc:
@@ -340,12 +385,22 @@ def _run(operation_id):
             c.execute("update label_studio_operations set status='cancelled',error=%s,updated_at=now() where id=%s", (str(exc), operation_id))
     except Exception as exc:
         logger.exception('Label Studio operation %s failed', operation_id)
+        try:
+            check_storage_error(exc)
+        except ValueError as storage_error:
+            exc = storage_error
         message = operation_error(exc)
         info = error_info(exc, message)
         with registry._connect() as c:
             c.execute("update label_studio_operations set status='failed',error=%s,error_code=%s,error_details=%s::jsonb,updated_at=now() where id=%s", (message, info['code'], json.dumps(info['details']), operation_id))
+            from notification_service import emit
+            target = f"/annotate?project={project['ls_project_id']}&transfer={op['id']}" if project and op['preview_only'] else '/annotate'
+            emit(c, op['owner_user_id'], f"label-operation:{op['id']}:failed:{op['attempt']}",
+                 'preview' if op['preview_only'] else 'import', 'failed', target)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
+        if lease:
+            lease.close()
 
 
 def recover():
@@ -374,6 +429,9 @@ def recover():
                 continue
             if row['status'] == 'running' and row['attempt'] >= 3 and not row['cancel_requested']:
                 c.execute("update label_studio_operations set status='failed',error='Worker stopped repeatedly. Check memory/storage limits before retrying.',updated_at=now() where id=%s and status='running'", (row['id'],))
+                from notification_service import emit
+                emit(c, row['owner_user_id'], f"label-operation:{row['id']}:failed:{row['attempt']}",
+                     'preview' if row['preview_only'] else 'import', 'failed', '/annotate')
                 continue
             c.execute("update label_studio_operations set status=case when cancel_requested then 'cancelled' else 'queued' end,updated_at=now() where id=%s and status in ('running','queued')", (row['id'],))
         if not row['cancel_requested']:
@@ -409,14 +467,22 @@ if __name__ == '__main__':
         recover()
     else:
         next_cleanup = 0
+        next_reconciliation = 0
         while True:
             try:
                 recover()
+                from dataset_index_jobs import QUEUE as INDEX_QUEUE, cleanup as cleanup_indexes, recover as recover_indexes
+                recover_indexes()
                 redis = Redis.from_url(REDIS_URL)
-                Worker([Queue(QUEUE, connection=redis)], connection=redis).work(burst=True, max_jobs=1, logging_level='WARNING')
+                Worker([Queue(QUEUE, connection=redis), Queue(INDEX_QUEUE, connection=redis)], connection=redis).work(burst=True, max_jobs=1, logging_level='WARNING')
                 if time.monotonic() >= next_cleanup:
                     cleanup()
+                    cleanup_indexes()
                     next_cleanup = time.monotonic() + 3600
+                if time.monotonic() >= next_reconciliation:
+                    from storage_reconciliation import reconcile
+                    reconcile()
+                    next_reconciliation = time.monotonic() + 300
             except Exception:
                 logger.exception('Label Studio queue unavailable; retrying.')
             time.sleep(5)

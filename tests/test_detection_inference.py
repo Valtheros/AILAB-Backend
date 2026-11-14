@@ -59,6 +59,7 @@ class _FakeYolo:
         self._result = result
 
     def predict(self, source, conf, verbose, device='cpu'):  # noqa: ARG002 - mirrors ultralytics
+        self.source = source
         return [self._result]
 
 
@@ -118,6 +119,12 @@ class YoloParseTests(unittest.TestCase):
             "classes": ["cat"],
         }
         self.assertEqual(di._predict_yolo(entry, _tiny_image(), 0.25), [])
+
+    def test_yolo_receives_pil_image_to_preserve_colour_channels(self):
+        model = _FakeYolo(_FakeResult(_FakeBoxes([], [], []), {0: 'cat'}))
+        image = _tiny_image()
+        di._predict_yolo({'model': model, 'classes': ['cat']}, image, .25)
+        self.assertIs(model.source, image)
 
 
 @unittest.skipUnless(HAS_TORCH, "torch not installed")

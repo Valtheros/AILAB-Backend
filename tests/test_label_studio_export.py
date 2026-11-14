@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,24 @@ from label_studio_export import SnapshotExporter
 
 
 class ExportTests(unittest.TestCase):
+    def test_empty_brush_and_negative_image_do_not_create_instances(self):
+        def download(owner, action, payload, target):
+            Image.new('L' if action == 'mask-download' else 'RGB', (16, 12), 0).save(target)
+
+        with tempfile.TemporaryDirectory() as directory, patch('label_studio_export.download', download):
+            root = Path(directory)
+            exporter = SnapshotExporter(root, 'owner', 'snapshot', {'kind': 'instance_segmentation', 'classes': [{'name': 'one'}]})
+            exporter.write_image({'id': 1, 'width': 16, 'height': 12, 'split': 'train', 'result': [
+                {'id': 'object', 'type': 'polygonlabels', 'value': {'polygonlabels': ['one'], 'points': [[10, 10], [80, 10], [80, 80]]}},
+                {'id': 'empty', 'type': 'brushlabels', 'value': {'brushlabels': ['one']}},
+            ]})
+            exporter.write_image({'id': 2, 'width': 16, 'height': 12, 'split': 'train', 'result': []})
+            exporter.finish()
+            data = json.loads((root / 'train' / '_annotations.coco.json').read_text())
+            self.assertEqual(len(data['images']), 2)
+            self.assertEqual(len(data['annotations']), 1)
+            self.assertEqual(data['annotations'][0]['image_id'], 1)
+
     def test_all_four_layouts_pass_dataset_inspection(self):
         def download(owner, action, payload, target):
             Image.new('L' if action == 'mask-download' else 'RGB', (16, 12), 255).save(target)

@@ -13,10 +13,13 @@ from rq.job import Job
 from rq.exceptions import NoSuchJobError
 
 from compute_repository import COMPUTE_ROOT, job_directory, queue_name, reserve_one, registry
+from compute_policy import JOB_TIMEOUTS
 from settings import REDIS_URL
 
 log = logging.getLogger(__name__)
 NODE = os.getenv('COMPUTE_NODE_ID', 'local')
+last_notification_cleanup = 0.0
+last_storage_recovery = 0.0
 
 
 def inventory():
@@ -73,7 +76,7 @@ def deliver(row, redis):
         pass
     Queue(queue_name(row['node_id'], row['assigned_gpu_uuid']), connection=redis).enqueue(
         'compute_worker.execute', str(row['id']), str(row['dispatch_token']),
-        job_id=row['rq_job_id'], job_timeout=86430 if row['kind'] == 'train' else 630,
+        job_id=row['rq_job_id'], job_timeout=JOB_TIMEOUTS[row['kind']] + 30,
         result_ttl=3600, failure_ttl=86400,
     )
 
@@ -87,7 +90,12 @@ def recover_dispatches():
               where j.run_id=t.id and j.kind='train' and j.status='recovery_pending'""")
         c.execute("""update compute_jobs j set status='queued',dispatch_token=null,rq_job_id=null,
               node_id=null,assigned_gpu_uuid=null,worker_id=null,queue_reason='worker_offline'
-              where j.status='dispatching' and j.dispatched_at < now()-interval '60 seconds'
+              where j.status='dispatching' and (
+                j.dispatched_at < now()-interval '60 seconds'
+                or exists(select 1 from gpu_devices g where g.uuid=j.assigned_gpu_uuid
+                    and g.worker_id<>j.worker_id and g.worker_heartbeat>now()-interval '30 seconds')
+                or exists(select 1 from compute_nodes n where j.mode='cpu' and n.id=j.node_id
+                    and n.cpu_worker_id<>j.worker_id and n.cpu_worker_heartbeat>now()-interval '30 seconds'))
               and not exists(select 1 from gpu_devices g where g.uuid=j.assigned_gpu_uuid
                     and g.worker_id=j.worker_id and g.worker_heartbeat>now()-interval '30 seconds')
               and not exists(select 1 from compute_nodes n where j.mode='cpu' and n.id=j.node_id
@@ -97,7 +105,7 @@ def recover_dispatches():
 def cleanup_results():
     with registry._connect() as c:
         rows = c.execute("""select id from compute_jobs where
-             status in ('completed','failed','cancelled') and cleaned_at is null
+             kind in ('predict','batch_predict') and status in ('completed','failed','cancelled') and cleaned_at is null
              and finished_at < now()-interval '24 hours' for update skip locked""").fetchall()
         for row in rows:
             shutil.rmtree(job_directory(row['id']), ignore_errors=False) if job_directory(row['id']).exists() else None
@@ -116,9 +124,28 @@ def cleanup_results():
 
 
 def tick(redis):
+    global last_notification_cleanup, last_storage_recovery
     inventory()
     recover_dispatches()
     cleanup_results()
+    if time.monotonic() - last_storage_recovery >= 30:
+        from storage_service import recover_requests, recover_compute_reservations
+        try:
+            from storage_service import enabled as storage_enabled
+            if storage_enabled():
+                from storage_transfer import recover as recover_transfers
+                recover_transfers()
+            recover_requests()
+            recover_compute_reservations()
+        except Exception:
+            log.exception('Storage recovery will retry; retained allowances are not reusable')
+        last_storage_recovery = time.monotonic()
+    if time.monotonic() - last_notification_cleanup >= 3600:
+        with registry._connect() as c:
+            c.execute("delete from notifications where created_at < now()-interval '90 days'")
+        last_notification_cleanup = time.monotonic()
+    from evaluation_repository import enqueue_pending
+    enqueue_pending()
     # Keep delivery serialized even if an operator accidentally starts two coordinators.
     with registry._connect() as c:
         if not c.execute('select pg_try_advisory_lock(%s) as ok', (registry._lock_key('compute-delivery'),)).fetchone()['ok']:

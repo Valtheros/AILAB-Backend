@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 ACTIVE = ('dispatching', 'running', 'stopping', 'recovery_pending')
 TERMINAL = ('completed', 'failed', 'cancelled')
+JOB_TIMEOUTS = {'train': 86400, 'predict': 600, 'evaluate': 21600, 'batch_predict': 1800}
 
 
 def recent(timestamp, seconds=30):
@@ -78,8 +79,8 @@ def select_resource(job, devices, nodes, active_jobs, quota):
 
 
 def fair_candidates(jobs, quotas, inference_burst):
-    wanted = 'train' if inference_burst >= 3 else 'predict'
+    want_interactive = inference_burst < 3
     epoch = datetime.min.replace(tzinfo=timezone.utc)
-    return sorted(jobs, key=lambda j: (j['kind'] != wanted,
+    return sorted(jobs, key=lambda j: ((j['kind'] == 'predict') != want_interactive,
                   quotas.get(j['owner_user_id'], {}).get('last_dispatched_at') or epoch,
                   j['created_at'], str(j['id'])))

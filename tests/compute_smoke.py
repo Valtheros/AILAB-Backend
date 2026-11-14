@@ -12,6 +12,7 @@ from dataset_storage import owner_dataset_path
 from dataset_utils import inspect_dataset
 from services.training_service import TrainingService
 from settings import DATASET_DIR, RUNS_DIR
+from tests.isolation import require_test_database, require_test_storage
 
 
 def wait(job_id, timeout=600):
@@ -60,8 +61,10 @@ def fixtures():
 
 
 def main():
-    if os.getenv('COMPUTE_TESTS') != '1' or 'ailab_compute_test_pg' not in compute.registry.database_url:
+    if os.getenv('COMPUTE_TESTS') != '1':
         raise RuntimeError('This smoke must not use production storage or database')
+    require_test_database(compute.registry.database_url)
+    require_test_storage('DATASET_DIR', 'RUNS_DIR', 'STORAGE_DIR', 'TMPDIR')
     paths = fixtures()
     service = TrainingService()
     models = [

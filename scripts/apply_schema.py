@@ -7,7 +7,7 @@ import psycopg
 
 def apply(connection):
     root = Path(__file__).resolve().parents[1] / 'database'
-    for name in ('app_schema.sql', 'label_studio_schema.sql', 'compute_schema.sql'):
+    for name in ('app_schema.sql', 'label_studio_schema.sql', 'compute_schema.sql', 'dataset_versions_schema.sql', 'dataset_index_schema.sql', 'evaluations_schema.sql', 'notifications_schema.sql', 'model_api_schema.sql', 'storage_schema.sql'):
         connection.execute((root / name).read_text())
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 from .base_trainer import BaseTrainer
@@ -16,6 +17,20 @@ from .trainer_utils import (
     scheduler_for,
     set_seed,
 )
+
+
+@contextmanager
+def _batch_norm_for_single_image(model, batch_size):
+    from torch.nn.modules.batchnorm import _BatchNorm
+
+    layers = [layer for layer in model.modules() if isinstance(layer, _BatchNorm) and layer.training] if batch_size == 1 else []
+    try:
+        for layer in layers:
+            layer.eval()
+        yield
+    finally:
+        for layer in layers:
+            layer.train()
 
 
 def _segmentation_scores(confusion) -> tuple[float, float, float]:
@@ -144,6 +159,8 @@ class DeepLabV3PlusTrainer(BaseTrainer):
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, num_workers=workers, **worker_options
         )
+        if batch_size == 1 or len(train_dataset) % batch_size == 1:
+            self._write_log(log_path, '[deeplabv3plus] Single-image batches use saved BatchNorm statistics; all training images are retained.')
         val_loader = (
             DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers, **worker_options)
             if val_dataset is not None
@@ -181,9 +198,10 @@ class DeepLabV3PlusTrainer(BaseTrainer):
                 images = images.to(device)
                 masks = masks.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=amp):
-                    logits = model(images)
-                    loss = criterion(logits, masks)
+                with _batch_norm_for_single_image(model, images.shape[0]):
+                    with torch.cuda.amp.autocast(enabled=amp):
+                        logits = model(images)
+                        loss = criterion(logits, masks)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()
@@ -245,7 +263,7 @@ class DeepLabV3PlusTrainer(BaseTrainer):
 
         # Optional one-shot held-out test evaluation on best.pt, after the loop.
         best_path = results_dir / "best.pt"
-        if best_path.is_file():
+        if best_path.is_file() and not config.get('compute_job_id'):
             try:
                 model.load_state_dict(torch.load(best_path, map_location=device)["model"])
                 _evaluate_semantic_test_split(

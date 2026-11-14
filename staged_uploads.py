@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from dataset_storage import owner_dataset_root
 from security_utils import contained_path
 
 
@@ -18,31 +19,62 @@ MAX_STAGED_UPLOADS_PER_USER = 3
 
 class StagedUploadStore:
     def __init__(self, dataset_root: Path):
-        self.root = contained_path(dataset_root, ".staged")
+        self.dataset_root = dataset_root.resolve()
+        self.root = contained_path(self.dataset_root, ".staged")
         self.root.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
 
-    def cleanup(self) -> None:
+    def owner_root(self, owner_id: str) -> Path:
+        return contained_path(owner_dataset_root(self.dataset_root, owner_id), ".staged")
+
+    def _roots(self, owner_id: str | None = None) -> list[Path]:
+        if owner_id is not None:
+            return [self.owner_root(owner_id), self.root]
+        roots = [self.root]
+        owners = contained_path(self.dataset_root, ".owners")
+        if owners.is_dir():
+            for directory in owners.iterdir():
+                if directory.is_dir() and not directory.is_symlink():
+                    roots.append(contained_path(directory, ".staged"))
+        return roots
+
+    @staticmethod
+    def _validate_token(token: str) -> None:
+        if not token or len(token) > 128 or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in token):
+            raise ValueError("Invalid upload token")
+
+    def cleanup(self, owner_id: str | None = None) -> None:
         with self._lock:
             now = time.time()
-            for item in self.root.iterdir():
-                if not item.is_dir():
+            for root in self._roots(owner_id):
+                if not root.is_dir():
                     continue
-                manifest = self._read_manifest(item)
-                if not manifest or float(manifest.get("expires_at", 0)) <= now:
-                    shutil.rmtree(item, ignore_errors=True)
+                for item in root.iterdir():
+                    if not item.is_dir() or item.is_symlink() or item.name.startswith(".consuming-"):
+                        continue
+                    manifest = self._read_manifest(item)
+                    if not manifest or (owner_id is not None and manifest.get("owner_id") != owner_id):
+                        continue
+                    try:
+                        expired = float(manifest["expires_at"]) <= now
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if expired:
+                        shutil.rmtree(item, ignore_errors=True)
 
     def create(self, owner_id: str, dataset_name: str, extracted_dir: Path, profile: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
-            self.cleanup()
+            self.cleanup(owner_id)
             owned = [
-                item for item in self.root.iterdir()
-                if item.is_dir() and self._read_manifest(item).get("owner_id") == owner_id
+                item for root in self._roots(owner_id) if root.is_dir() for item in root.iterdir()
+                if item.is_dir() and not item.is_symlink() and self._read_manifest(item).get("owner_id") == owner_id
             ]
             if len(owned) >= MAX_STAGED_UPLOADS_PER_USER:
                 raise ValueError(f"At most {MAX_STAGED_UPLOADS_PER_USER} pending dataset uploads are allowed per user")
             token = secrets.token_urlsafe(32)
-            stage_dir = contained_path(self.root, token)
+            root = self.owner_root(owner_id)
+            root.mkdir(parents=True, exist_ok=True)
+            stage_dir = contained_path(root, token)
             stage_dir.mkdir(mode=0o700)
             target = contained_path(stage_dir, "dataset")
             extracted_dir.replace(target)
@@ -59,13 +91,16 @@ class StagedUploadStore:
             return manifest
 
     def peek(self, token: str, owner_id: str) -> tuple[dict[str, Any], Path, Path]:
-        if not token or len(token) > 128 or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for character in token):
-            raise ValueError("Invalid upload token")
-        stage_dir = contained_path(self.root, token)
-        manifest = self._read_manifest(stage_dir)
-        if not manifest or manifest.get("token") != token:
-            raise FileNotFoundError("Pending upload was not found")
-        if manifest.get("owner_id") != owner_id:
+        self._validate_token(token)
+        stage_dir = None
+        manifest = {}
+        for root in self._roots(owner_id):
+            candidate = contained_path(root, token)
+            candidate_manifest = self._read_manifest(candidate)
+            if candidate_manifest.get("token") == token and candidate_manifest.get("owner_id") == owner_id:
+                stage_dir, manifest = candidate, candidate_manifest
+                break
+        if stage_dir is None:
             raise FileNotFoundError("Pending upload was not found")
         if float(manifest.get("expires_at", 0)) <= time.time():
             shutil.rmtree(stage_dir, ignore_errors=True)
@@ -80,12 +115,23 @@ class StagedUploadStore:
 
     def consume(self, token: str, owner_id: str) -> tuple[dict[str, Any], Path, Path]:
         manifest, _dataset_dir, stage_dir = self.peek(token, owner_id)
-        consuming_dir = contained_path(self.root, f".consuming-{token}")
+        consuming_dir = contained_path(stage_dir.parent, f".consuming-{token}")
         try:
             stage_dir.replace(consuming_dir)
         except FileNotFoundError as exc:
             raise FileNotFoundError("Pending upload was already used") from exc
         return manifest, contained_path(consuming_dir, "dataset"), consuming_dir
+
+    def consuming_path(self, token: str, owner_id: str) -> Path:
+        self._validate_token(token)
+        roots = self._roots(owner_id)
+        for name in (f".consuming-{token}", token):
+            for root in roots:
+                candidate = contained_path(root, name)
+                manifest = self._read_manifest(candidate)
+                if manifest.get("token") == token and manifest.get("owner_id") == owner_id:
+                    return contained_path(root, f".consuming-{token}")
+        return contained_path(roots[0], f".consuming-{token}")
 
     @staticmethod
     def _read_manifest(stage_dir: Path) -> dict[str, Any]:

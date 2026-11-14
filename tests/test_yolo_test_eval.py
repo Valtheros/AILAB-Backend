@@ -10,7 +10,10 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -21,6 +24,7 @@ from worker.trainers.yolo_trainer import (
     _count_images,
     _f1,
     _resolve_test_dir,
+    YOLOTrainer,
 )
 
 
@@ -118,6 +122,66 @@ class F1Tests(unittest.TestCase):
     def test_missing_file_is_noop(self):
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(_append_f1_column(Path(d) / "nope.csv"), 0)
+
+
+class DeferredEvaluationTests(unittest.TestCase):
+    def test_compute_job_defers_test_evaluation_but_legacy_job_keeps_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'weights').mkdir()
+            (root / 'weights' / 'best.pt').write_bytes(b'checkpoint')
+            model = MagicMock()
+            model.train.return_value = SimpleNamespace(save_dir=root)
+            config = {'data_yaml_path': str(root / 'data.yaml'), 'model_name': 'yolo11n', 'compute_job_id': 'job'}
+            with patch.dict(sys.modules, {'ultralytics': SimpleNamespace(YOLO=lambda *_: model)}), \
+                 patch('worker.trainers.yolo_trainer._without_untrusted_label_cache', return_value=nullcontext()), \
+                 patch('worker.trainers.yolo_trainer._evaluate_yolo_test_split') as evaluate:
+                YOLOTrainer().train(config)
+                evaluate.assert_not_called()
+                YOLOTrainer().train({key: value for key, value in config.items() if key != 'compute_job_id'})
+                evaluate.assert_called_once()
+
+
+class SafeYoloCacheTests(unittest.TestCase):
+    def test_label_cache_is_not_read_or_written_and_hooks_are_restored(self):
+        try:
+            from ultralytics.data import dataset
+        except ImportError:
+            self.skipTest('Ultralytics is only installed in the compute image')
+        from worker.trainers.yolo_trainer import _without_untrusted_label_cache
+
+        original_load, original_save = dataset.load_dataset_cache_file, dataset.save_dataset_cache_file
+        with _without_untrusted_label_cache():
+            with self.assertRaises(FileNotFoundError):
+                dataset.load_dataset_cache_file(Path('untrusted.cache'))
+            memory_cache = {}
+            self.assertIsNone(dataset.save_dataset_cache_file('prefix', Path('untrusted.cache'), memory_cache, '1'))
+            self.assertEqual(memory_cache['version'], '1')
+        self.assertIs(dataset.load_dataset_cache_file, original_load)
+        self.assertIs(dataset.save_dataset_cache_file, original_save)
+
+    def test_real_yolo_dataset_uses_labels_without_touching_uploaded_cache(self):
+        try:
+            from PIL import Image
+            from ultralytics.data import dataset
+        except ImportError:
+            self.skipTest('Ultralytics is only installed in the compute image')
+        from worker.trainers.yolo_trainer import _without_untrusted_label_cache
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            images, labels = root / 'images', root / 'labels'
+            images.mkdir()
+            labels.mkdir()
+            Image.new('RGB', (64, 64)).save(images / 'one.png')
+            (labels / 'one.txt').write_text('0 0.5 0.5 0.5 0.5\n')
+            cache = root / 'labels.cache'
+            cache.write_bytes(b'untrusted cache')
+            with _without_untrusted_label_cache(), patch('ultralytics.data.utils.np.load', side_effect=AssertionError('unsafe cache read')):
+                source = dataset.YOLODataset(img_path=str(images), data={'names': {0: 'object'}},
+                                             task='detect', imgsz=64, augment=False, cache=False)
+            self.assertEqual(len(source.labels), 1)
+            self.assertEqual(cache.read_bytes(), b'untrusted cache')
 
 
 if __name__ == "__main__":
