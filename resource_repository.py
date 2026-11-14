@@ -70,8 +70,10 @@ class ResourceRepository:
             return []
         with self._connect() as connection:
             rows = connection.execute(
-                """select d.*, c.name as collection_name from datasets d
+                """select d.*, c.name as collection_name,
+                          case when i.active_generation is not null and i.skipped = 0 then i.stats end as index_stats from datasets d
                    left join dataset_collections c on c.id = d.collection_id and c.owner_user_id=d.owner_user_id
+                   left join dataset_indexes i on i.dataset_version_id=d.id and i.owner_user_id=d.owner_user_id
                    where d.owner_user_id = %s and d.status = 'active' order by d.created_at desc""",
                 (owner_id,),
             ).fetchall()

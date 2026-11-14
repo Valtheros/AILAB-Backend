@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 import subprocess
 from typing import Any
@@ -479,6 +480,12 @@ def validate_model_params(model_type: str, params: dict[str, Any]) -> dict[str, 
         if spec["type"] == "number":
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"Param '{key}' must be a number")
+            if not math.isfinite(value):
+                raise ValueError(f"Param '{key}' must be finite")
+            if key in {"epochs", "batch_size", "workers", "seed", "image_size", "imgsz", "max_size",
+                       "trainable_backbone_layers", "detections_per_img", "num_classes", "ignore_index",
+                       "encoder_depth", "decoder_channels", "patience"} and int(value) != value:
+                raise ValueError(f"Param '{key}' must be a whole number")
             if "min" in spec and value < spec["min"]:
                 raise ValueError(f"Param '{key}' must be at least {spec['min']}")
             if "max" in spec and value > spec["max"]:
@@ -491,5 +498,13 @@ def validate_model_params(model_type: str, params: dict[str, Any]) -> dict[str, 
                 raise ValueError(f"Param '{key}' must be one of: {', '.join(sorted(choices))}")
         elif spec["type"] == "text" and not isinstance(value, str):
             raise ValueError(f"Param '{key}' must be text")
+        if key == "decoder_atrous_rates" and (not isinstance(value, str) or
+                len(value.split(',')) != 3 or any(not part.strip().isdigit() or int(part.strip()) < 1 for part in value.split(','))):
+            raise ValueError("Param 'decoder_atrous_rates' must contain three positive whole numbers")
         validated[key] = value
+    if model_type in {"faster_rcnn", "mask_rcnn"}:
+        short = params.get("image_size", specs["image_size"]["default"])
+        long = params.get("max_size", specs["max_size"]["default"])
+        if short > long:
+            raise ValueError("Long side cap must be at least the short side")
     return validated

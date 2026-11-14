@@ -54,6 +54,19 @@ class ComputeIntegrationTests(unittest.TestCase):
                 fn('bob', one['id'])
             self.assertEqual(e.exception.status, 404)
 
+    def test_prediction_notification_lookup_is_owner_and_run_scoped(self):
+        import compute_api
+        with compute.registry._connect() as c:
+            c.execute("update training_tasks set run_slug='shared-name' where id in (%s,%s)", (self.runs['alice'], self.runs['bob']))
+        first = self.create('alice', idempotency_key='first')
+        self.create('alice', idempotency_key='later')
+        foreign = self.create('bob', idempotency_key='foreign')
+        with patch.object(compute_api, 'owner', return_value={'id': 'alice'}):
+            exact = compute_api.latest(None, runSlug='shared-name', kind='predict', jobId=first['id'])
+            self.assertEqual(exact['job']['id'], str(first['id']))
+            self.assertIsNone(compute_api.latest(None, runSlug='shared-name', kind='predict', jobId=foreign['id'])['job'])
+            self.assertIsNone(compute_api.latest(None, runSlug='other-run', kind='predict', jobId=first['id'])['job'])
+
     def test_legacy_execution_preserves_cpu_and_resolves_gpu_uuid(self):
         self.assertEqual(compute.execution_selection(params={'device': 'cpu', '_device_selection': 'manual'})['mode'], 'cpu')
         self.assertEqual(compute.execution_selection(params={'device': 'cpu', '_device_selection': 'auto'})['mode'], 'auto')

@@ -22,6 +22,26 @@ from storage_uploads import current_lease
 from starlette.concurrency import run_in_threadpool
 
 
+def _inspect_staged_images(entries, input_dir):
+    from PIL import Image
+    from inference_service import MAX_INFERENCE_IMAGE_PIXELS
+    for index, entry in enumerate(entries):
+        if entry.get('error'):
+            continue
+        path = input_dir / str(index)
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > MAX_INFERENCE_IMAGE_PIXELS:
+                    entry['error'] = f'Image exceeds the {MAX_INFERENCE_IMAGE_PIXELS:,} pixel limit.'
+                else:
+                    image.verify()
+        except Exception:
+            entry['error'] = 'The uploaded file is not a readable image.'
+        if entry.get('error'):
+            path.unlink(missing_ok=True)
+
+
 async def stage_batch(files, directory: Path) -> tuple[list[dict], str, int]:
     if not files or len(files) > MAX_BATCH_IMAGES:
         raise ValueError('Select between 1 and 100 images, or one image ZIP.')
@@ -61,9 +81,9 @@ async def stage_batch(files, directory: Path) -> tuple[list[dict], str, int]:
                 entry['error'] = 'Image exceeds the 10 MiB limit.' if too_large else 'Unsupported image format.'
             entries.append(entry)
     if archive:
-        from starlette.concurrency import run_in_threadpool
         entries = await run_in_threadpool(extract_batch_zip, directory / 'input.zip', directory)
         (directory / 'input.zip').unlink(missing_ok=True)
+    await run_in_threadpool(_inspect_staged_images, entries, input_dir)
     (directory / 'input-manifest.json').write_text(json.dumps({'images': entries}, ensure_ascii=False), encoding='utf-8')
     return entries, digest.hexdigest(), total
 
@@ -116,6 +136,8 @@ async def submit_batch(owner_id: str, run: dict, files, selection: dict, thresho
             detail = str(exc) if str(exc) in messages else 'The batch contains an invalid or unsafe file.'
             status = 413 if detail == 'Batch exceeds the 1 GiB upload limit.' else 400
             raise PublicError('INVALID_BATCH', detail, status=status) from exc
+        if not any(not image.get('error') for image in images):
+            raise PublicError('INVALID_BATCH', 'No usable images were found in this batch.', status=400)
         payload = {'project_name': run['run_slug'], 'model_type': run['model_type'], 'task_type': run['task_type'],
                    'threshold': threshold, 'input_sha256': digest, 'input_name': f'{len(images)} images', 'input_bytes': total}
         if principal:

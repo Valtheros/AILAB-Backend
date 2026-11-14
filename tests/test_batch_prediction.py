@@ -15,6 +15,13 @@ import batch_prediction
 from batch_inputs import extract_batch_zip
 from batch_upload import stage_batch
 from inference_service import InferenceError
+from PIL import Image
+
+
+def image_bytes():
+    output = io.BytesIO()
+    Image.new('RGB', (8, 8), 'red').save(output, format='PNG')
+    return output.getvalue()
 
 
 class Upload:
@@ -47,12 +54,12 @@ class BatchPredictionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             entries, digest, total = asyncio.run(stage_batch([
-                Upload('same.jpg', b'a'), Upload('same.jpg', b'b'), Upload('bad.txt', b'c'),
+                Upload('same.jpg', image_bytes()), Upload('same.jpg', image_bytes()), Upload('bad.txt', b'c'),
             ], root))
-            self.assertEqual(total, 3)
+            self.assertEqual(total, len(image_bytes()) * 2 + 1)
             self.assertEqual(len(digest), 64)
-            self.assertEqual((root / 'inputs' / '0').read_bytes(), b'a')
-            self.assertEqual((root / 'inputs' / '1').read_bytes(), b'b')
+            self.assertEqual((root / 'inputs' / '0').read_bytes(), image_bytes())
+            self.assertEqual((root / 'inputs' / '1').read_bytes(), image_bytes())
             self.assertIn('error', entries[2])
             with self.assertRaises(ValueError):
                 asyncio.run(stage_batch([Upload(f'{i}.jpg', b'x') for i in range(101)], root))
@@ -61,7 +68,7 @@ class BatchPredictionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             directory = root / 'job'
-            asyncio.run(stage_batch([Upload('=name.jpg', b'valid'), Upload('bad.jpg', b'broken')], directory))
+            asyncio.run(stage_batch([Upload('=name.jpg', image_bytes()), Upload('bad.jpg', b'broken')], directory))
             row = {'id': uuid.uuid4(), 'dispatch_token': uuid.uuid4(), 'payload': {
                 'project_name': 'run', 'task_type': 'image_classification', 'model_type': 'resnet', 'threshold': None,
             }}
@@ -86,11 +93,26 @@ class BatchPredictionTests(unittest.TestCase):
             with zipfile.ZipFile(directory / 'results.zip') as archive:
                 self.assertEqual(set(archive.namelist()), {'result.json', 'results.csv'})
 
+    def test_preflight_checks_direct_and_zip_images_before_queueing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch('inference_service.MAX_INFERENCE_IMAGE_PIXELS', 63):
+                entries, _, _ = asyncio.run(stage_batch([Upload('large.png', image_bytes())], root / 'direct'))
+                self.assertIn('pixel limit', entries[0]['error'])
+                self.assertFalse((root / 'direct' / 'inputs' / '0').exists())
+                data = io.BytesIO()
+                with zipfile.ZipFile(data, 'w') as archive:
+                    archive.writestr('image.png', image_bytes())
+                    archive.writestr('broken.png', b'broken')
+                entries, _, _ = asyncio.run(stage_batch([Upload('images.zip', data.getvalue())], root / 'zip'))
+                self.assertIn('pixel limit', entries[0]['error'])
+                self.assertIn('not a readable image', entries[1]['error'])
+
     def test_model_failure_is_not_reported_as_an_image_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             directory = root / 'job'
-            asyncio.run(stage_batch([Upload('valid.jpg', b'valid')], directory))
+            asyncio.run(stage_batch([Upload('valid.jpg', image_bytes())], directory))
             row = {'id': uuid.uuid4(), 'dispatch_token': uuid.uuid4(), 'payload': {
                 'project_name': 'run', 'task_type': 'image_classification', 'model_type': 'resnet', 'threshold': None,
             }}

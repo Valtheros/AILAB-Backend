@@ -51,6 +51,8 @@ MAX_COCO_POLYGON_POINTS = _env_int("AILAB_MAX_COCO_POLYGON_POINTS", 20_000)
 MAX_COCO_MASKS_PER_IMAGE = _env_int("AILAB_MAX_COCO_MASKS_PER_IMAGE", 1_000)
 MAX_COCO_RLE_COUNTS = _env_int("AILAB_MAX_COCO_RLE_COUNTS", 2_000_000)
 MAX_SOURCE_IMAGE_PIXELS = _env_int("AILAB_MAX_SOURCE_IMAGE_PIXELS", 25_000_000)
+MAX_SEMANTIC_CLASS_SCAN_PIXELS = 50_000_000
+MAX_SEMANTIC_CLASS_SCAN_MASKS = 1024
 MAX_COCO_DECODED_MASK_PIXELS_PER_IMAGE = _env_int(
     "AILAB_MAX_COCO_DECODED_MASK_PIXELS_PER_IMAGE", 256_000_000
 )
@@ -108,7 +110,10 @@ def _iter_text_lines_limited(
 
 def _read_json_limited(path: Path, *, max_bytes: int = MAX_COCO_JSON_BYTES, label: str = "COCO annotation file") -> Any:
     _ensure_file_size(path, max_bytes, label)
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"Could not read {label} '{path.name}'. Check that the JSON is valid: {exc}") from exc
 
 
 def read_yaml_limited(path: Path, *, label: str = "dataset YAML") -> Any:
@@ -490,7 +495,14 @@ def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> 
         "errors": [],
         "roboflow_png_masks": False,
         "classes": [],
+        "class_ids": [],
+        "classes_complete": False,
     }
+    class_ids: set[int] = set()
+    scan_pixels = 0
+    scan_masks = 0
+    scan_complete = True
+    declared_classes = _roboflow_semantic_classes(dataset_dir)
     for split in ("train", "val", "test"):
         split_dirs = _semantic_split_dirs(dataset_dir, split)
         if split_dirs is not None:
@@ -541,8 +553,37 @@ def _inspect_semantic_masks(dataset_dir: Path, max_pairs: int | None = None) -> 
                         )
             except Exception as exc:
                 stats["errors"].append(f"Could not inspect semantic pair {image_path.name}: {exc}")
+        if not declared_classes:
+            for _image_path, mask_path in pairs:
+                if mask_path is None or scan_masks >= MAX_SEMANTIC_CLASS_SCAN_MASKS:
+                    scan_complete = False
+                    continue
+                try:
+                    from PIL import Image
+
+                    with Image.open(mask_path) as mask:
+                        pixels = mask.width * mask.height
+                        if (mask.mode not in {"L", "P", "I", "I;16"} or pixels <= 0
+                                or pixels > MAX_SOURCE_IMAGE_PIXELS
+                                or scan_pixels + pixels > MAX_SEMANTIC_CLASS_SCAN_PIXELS):
+                            scan_complete = False
+                            continue
+                        colors = mask.getcolors(maxcolors=256)
+                        if colors is None:
+                            scan_complete = False
+                            continue
+                        if any(not 0 <= int(value) <= 255 for _count, value in colors):
+                            scan_complete = False
+                            continue
+                        class_ids.update(int(value) for _count, value in colors if 0 < int(value) < 255)
+                        scan_pixels += pixels
+                        scan_masks += 1
+                except Exception:
+                    scan_complete = False
     if stats["mask_files"]:
-        stats["classes"] = _roboflow_semantic_classes(dataset_dir)
+        stats["classes"] = declared_classes
+        stats["class_ids"] = sorted(class_ids)
+        stats["classes_complete"] = bool(declared_classes) or scan_complete
     return stats
 
 
@@ -1035,7 +1076,7 @@ def inspect_dataset(dataset_dir: Path, *, sample_files: int | None = None) -> di
         if has_reliable_coco_masks:
             tasks.append("segmentation")
         if not classes and coco_stats["classes"]:
-            classes = coco_stats.get("used_classes") or coco_stats["classes"]
+            classes = coco_stats["classes"]
     if not classes and semantic_stats.get("classes"):
         classes = semantic_stats["classes"]
     if coco_stats["files"] and coco_stats["missing_images"]:

@@ -177,6 +177,13 @@ class TrainingService:
                 f"Dataset '{dataset_path.name}' does not advertise task '{task_type}'. "
                 f"Detected tasks: {metadata['tasks'] or ['none']}."
             )
+        if model_type == "deeplabv3plus":
+            semantic = metadata.get("semantic_masks") or {}
+            if semantic.get("classes_complete") and semantic.get("class_ids"):
+                ignore = int(extra_args.get("ignore_index", 255))
+                highest = max((value for value in semantic["class_ids"] if value != ignore), default=0)
+                if int(extra_args.get("num_classes", 2)) <= highest:
+                    raise ValueError(f"Mask classes must be at least {highest + 1} to include class ID {highest} and background.")
         if model_type == "mask_rcnn":
             coco = metadata.get("coco", {})
             if (

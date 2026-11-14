@@ -417,17 +417,35 @@ def _flatten_single_root_folder(target_dir: Path) -> None:
     single_dir.rmdir()
 
 
-def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
+def _dataset_profile(metadata: dict[str, Any], index_stats: dict[str, Any] | None = None) -> dict[str, Any]:
     metadata = normalize_dataset_metadata(metadata)
     workflow = dataset_workflow_metadata(metadata, get_catalog())
     ready_models = [model for model in workflow.get("compatible_models", []) if model.get("ready")]
     schema = metadata.get("label_schema") or {}
     labels = schema.get("classes") if isinstance(schema, dict) and schema.get("origin") == "label_studio" and schema.get("task") == "image_classification" else None
     display_classes = labels if isinstance(labels, list) and len(labels) == len(metadata["classes"]) and all(isinstance(label, str) and label for label in labels) else metadata["classes"]
+    classes_known = True
+    mask_class_ids = None
+    if "coco_instances" in metadata["formats"] and not {"imagefolder", "yolo_detection"}.intersection(metadata["formats"]):
+        display_classes = (metadata.get("coco") or {}).get("classes") or display_classes
+    elif "semantic_masks" in metadata["formats"] and not display_classes:
+        semantic = metadata.get("semantic_masks") or {}
+        if semantic.get("classes_complete"):
+            display_classes = [f"class ID {value}" for value in semantic.get("class_ids", [])]
+            mask_class_ids = semantic.get("class_ids", [])
+        elif isinstance(index_stats, dict):
+            display_classes = sorted({name for split in index_stats.values() if isinstance(split, dict)
+                                      for name in (split.get("classes") or {}) if name.lower() != "background"})
+            if all(re.fullmatch(r"class ID \d+", name) for name in display_classes):
+                mask_class_ids = sorted(int(name.removeprefix("class ID ")) for name in display_classes)
+        else:
+            classes_known = False
     return {
         "tasks": metadata["tasks"],
         "formats": metadata["formats"],
         "classes": display_classes,
+        "classes_known": classes_known,
+        "mask_class_ids": mask_class_ids,
         "image_count": metadata["image_count"],
         "size_bytes": metadata["size_bytes"],
         "warnings": metadata.get("warnings", []),
@@ -438,7 +456,7 @@ def _dataset_profile(metadata: dict[str, Any]) -> dict[str, Any]:
         "canonical_task": workflow["canonical_task"],
         "canonical_format": workflow["canonical_format"],
         "normalized_formats": workflow["normalized_formats"],
-        "annotation_stats": workflow["annotation_stats"],
+        "annotation_stats": {**workflow["annotation_stats"], "classes": len(display_classes) if classes_known else None},
         "conversion_warnings": workflow.get("conversion_warnings", []),
         "compatible_models": workflow.get("compatible_models", []),
         "ready_models": ready_models,
@@ -596,10 +614,17 @@ def preview_resource_plan(payload: ResourcePlanPreviewRequest, request: Request)
         compute.require_enabled()
     if get_model(payload.model_type) is None:
         raise HTTPException(status_code=400, detail=f"Unsupported model_type: {payload.model_type}")
-    plan = compute.resource_plan(payload.model_type, dict(payload.params or {}), payload.batch_size,
+    params = dict(payload.params or {})
+    if compute.enabled():
+        params.pop('device', None)
+    try:
+        validate_model_params(payload.model_type, {**params, 'batch_size': payload.batch_size})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    plan = compute.resource_plan(payload.model_type, params, payload.batch_size,
            payload.execution.model_dump() if payload.execution else None) if compute.enabled() else validate_resource_plan(
         payload.model_type,
-        params=dict(payload.params or {}),
+        params=params,
         batch_size=payload.batch_size,
     )
     return {"status": "success", "ok": plan["ok"], **_resource_plan_summary(plan)}
@@ -820,10 +845,10 @@ def list_datasets(request: Request):
         if record and metadata != stored_metadata:
             resource_repository.update_dataset_metadata(record["id"], metadata)
         metadata["export_cache"] = export_cache_metadata(item)
-        profile = _dataset_profile(metadata)
+        profile = _dataset_profile(metadata, record.get("index_stats") if record else None)
         label_schema = metadata.get("label_schema") or {}
         label_schema = label_schema if isinstance(label_schema, dict) and label_schema.get("origin") == "label_studio" else None
-        created = time.strftime("%Y-%m-%d", time.localtime(item.stat().st_ctime))
+        created = record["created_at"].isoformat() if record and record.get("created_at") else datetime.fromtimestamp(item.stat().st_ctime, timezone.utc).isoformat()
         datasets.append(
             {
                 "id": str(record.get("id")) if record else item.name,
@@ -834,6 +859,8 @@ def list_datasets(request: Request):
                 "contentSha256": record.get("content_sha256") if record else None,
                 "images": metadata["image_count"],
                 "classes": profile["classes"],
+                "classesKnown": profile["classes_known"],
+                "maskClassIds": profile["mask_class_ids"],
                 "labelSchema": {"origin": "label_studio", "numClasses": label_schema.get("num_classes")} if label_schema else None,
                 "createdAt": created,
                 "size": format_bytes(metadata["size_bytes"]),

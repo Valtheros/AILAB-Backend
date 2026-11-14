@@ -21,6 +21,17 @@ class ModelCatalogValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_model_params("yolo", {"batch_size": -1})
 
+    def test_rejects_invalid_reported_parameters_before_training(self):
+        for model, params in [
+            ("efficientnet", {"dropout": 1.1}), ("yolo", {"mixup": 1.1}),
+            ("faster_rcnn", {"rpn_nms_thresh": 1.1}), ("faster_rcnn", {"max_size": 256}),
+            ("deeplabv3plus", {"encoder_depth": 6}), ("mask_rcnn", {"image_size": -1}),
+            ("mask_rcnn", {"image_size": 800, "max_size": 512}), ("resnet", {"image_size": 64.5}),
+            ("resnet", {"dropout": float('nan')}), ("deeplabv3plus", {"decoder_atrous_rates": "12,0,36"}),
+        ]:
+            with self.subTest(model=model, params=params), self.assertRaises(ValueError):
+                validate_model_params(model, params)
+
 
     def test_catalog_models_expose_dataset_interface_metadata(self):
         catalog = get_catalog()
