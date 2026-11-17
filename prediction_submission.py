@@ -18,7 +18,7 @@ from starlette.concurrency import run_in_threadpool
 from settings import RUNS_DIR
 
 
-async def submit_single(owner_id, run, config, payload, filename, selection, threshold, key, *, principal=None):
+async def submit_single(owner_id, run, config, payload, filename, selection, threshold, key, *, principal=None, app_context=None):
     compute.require_enabled()
     if run['status'] != 'completed':
         raise PublicError('RUN_NOT_COMPLETED', 'Only completed runs can be tested.', status=409)
@@ -42,11 +42,16 @@ async def submit_single(owner_id, run, config, payload, filename, selection, thr
             'input_name': safe_image_name(filename), 'input_bytes': len(payload)}
     if principal:
         data.update(checkpoint_path=principal['checkpoint_path'], checkpoint_sha256=principal['checkpoint_sha256'])
+    if app_context:
+        data.update(checkpoint_path=app_context['checkpoint_path'], checkpoint_sha256=app_context['checkpoint_sha256'],
+                    app_version=app_context['version'], app_path=app_context['path'], app_preview=app_context['preview'],
+                    app_id=str(app_context['app_id']), app_name=app_context['name'])
     try:
         (directory / 'input').write_bytes(payload)
         row = await asyncio.to_thread(compute.create_job, owner_id, run['id'], 'predict', data, selection,
             idempotency_key=key, job_id=job_id, estimated_vram_mb=estimate_training_memory(run['model_type'], config.get('extra_args', {}), 1),
-            model_endpoint_id=principal['endpoint_id'] if principal else None, model_api_key_id=principal['key_id'] if principal else None)
+            model_endpoint_id=principal['endpoint_id'] if principal else None, model_api_key_id=principal['key_id'] if principal else None,
+            app_context=app_context)
         if str(row['id']) != str(job_id):
             shutil.rmtree(directory)
         return row

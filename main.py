@@ -77,6 +77,8 @@ from model_endpoint_api import router as model_endpoint_router
 from model_public_api import router as model_public_router
 from dataset_version_api import router as dataset_version_router
 import model_api_service
+from model_app_api import management_router as model_apps_router, router as shared_apps_router
+import model_app_service
 from api_errors import PublicError, error_info
 from storage_uploads import StorageUploadMiddleware
 
@@ -93,6 +95,8 @@ app.include_router(evaluation_router)
 app.include_router(notification_router)
 app.include_router(model_endpoint_router)
 app.include_router(model_public_router)
+app.include_router(model_apps_router)
+app.include_router(shared_apps_router)
 app.include_router(dataset_version_router)
 
 
@@ -158,6 +162,22 @@ async def require_internal_token(request: Request, call_next):
         provided = request.headers.get("x-internal-token")
         if provided != BACKEND_INTERNAL_TOKEN:
             return JSONResponse({'detail': 'Unauthorized backend request', 'code': 'UNAUTHORIZED', 'details': {}, 'requestId': request.state.request_id}, status_code=401)
+    if path.startswith('/api/apps/') or path.startswith('/api/model-apps'):
+        try:
+            if request.method == 'POST' and re.fullmatch(r'/api/apps/[^/]+/[^/]+/predict', path):
+                request.state.model_app_context = await asyncio.to_thread(model_app_service.upload_context, request)
+            elif path.startswith('/api/apps/'):
+                await asyncio.to_thread(model_app_service.read_limit, request)
+        except PublicError as exc:
+            return JSONResponse({'detail': str(exc), **error_info(exc), 'requestId': request.state.request_id},
+                status_code=exc.status, headers={'Retry-After': str(exc.details.get('retryAfter', 60))} if exc.status == 429 else {})
+        except HTTPException as exc:
+            return JSONResponse({'detail': exc.detail, 'code': 'UNAUTHORIZED' if exc.status_code == 401 else 'ACCOUNT_UNAVAILABLE',
+                                 'requestId': request.state.request_id}, status_code=exc.status_code,
+                                headers={'Cache-Control': 'private, no-store'})
+        response = await call_next(request)
+        response.headers['Cache-Control'] = 'private, no-store'
+        return response
     return await call_next(request)
 
 
@@ -1481,8 +1501,9 @@ def admin_delete_user_resources(user_id: str, request: Request):
             raise PublicError('DATASET_IN_USE', 'Wait for dataset indexing to finish before deleting this user.', status=409)
     if compute.enabled():
         with resource_repository._connect() as c:
-            if c.execute('select 1 from compute_jobs where owner_user_id=%s and status=any(%s)', (user_id, ['queued', *compute.ACTIVE])).fetchone():
-                raise PublicError('RUN_IN_USE', 'Cancel active Train and Test jobs before deleting this user.', status=409)
+            if c.execute('''select 1 from compute_jobs where (owner_user_id=%s or app_requester_user_id=%s)
+                    and status=any(%s)''', (user_id, user_id, ['queued', *compute.ACTIVE])).fetchone():
+                raise PublicError('RUN_IN_USE', 'Cancel active Train, Test and Model App jobs before deleting this user.', status=409)
             if c.execute("select 1 from evaluations where owner_user_id=%s and status='awaiting_queue'", (user_id,)).fetchone():
                 raise PublicError('RUN_IN_USE', 'Cancel pending evaluations before deleting this user.', status=409)
     from label_studio_client import BridgeError

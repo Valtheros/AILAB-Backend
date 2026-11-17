@@ -115,7 +115,7 @@ def validate_target(selection, estimated_vram_mb, c):
 
 def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=0,
                idempotency_key=None, job_id=None, dataset_version_id=None, connection=None,
-               model_endpoint_id=None, model_api_key_id=None):
+               model_endpoint_id=None, model_api_key_id=None, app_context=None):
     require_enabled()
     if kind not in {'train', 'predict', 'evaluate', 'batch_predict'}:
         raise PublicError('INVALID_JOB_KIND', 'The requested job type is not supported.')
@@ -129,6 +129,9 @@ def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=
         quota = c.execute('select accepting_jobs from compute_user_quotas where owner_user_id=%s', (owner_id,)).fetchone()
         if quota and not quota['accepting_jobs']:
             raise PublicError('USER_RESOURCES_DELETING', 'This account is undergoing resource cleanup. Contact an administrator.', status=409)
+        if app_context:
+            from model_app_service import check_admission
+            check_admission(c, app_context, owner_id, run_id, payload)
         if bool(model_endpoint_id) != bool(model_api_key_id):
             raise PublicError('UNAUTHORIZED', 'Invalid API credentials.', status=401)
         if model_endpoint_id:
@@ -146,10 +149,15 @@ def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=
                         or str(previous.get('dataset_version_id') or '') != str(dataset_version_id or '')
                         or str(previous.get('model_api_key_id') or '') != str(model_api_key_id or '')
                         or str(previous.get('model_endpoint_id') or '') != str(model_endpoint_id or '')
+                        or str(previous.get('app_requester_user_id') or '') != str(app_context['requester_id'] if app_context else '')
+                        or str(previous.get('model_app_release_id') or '') != str(app_context['release_id'] if app_context else '')
                         or previous['payload'] != payload or previous['mode'] != selection['mode']
                         or previous['requested_gpu_uuid'] != selection['gpuUuid']):
                     raise PublicError('IDEMPOTENCY_CONFLICT', 'This request key belongs to a different job.', status=409)
                 return dict(previous)
+        if app_context and c.execute('''select count(*) as n from compute_jobs where app_requester_user_id=%s
+                and status=any(%s)''', (app_context['requester_id'], ['queued', *ACTIVE])).fetchone()['n'] >= 3:
+            raise PublicError('APP_VISITOR_QUEUE_LIMIT', 'Wait for an existing app prediction to finish or cancel it.', status=429)
         run = c.execute('select id,status from training_tasks where id=%s and owner_user_id=%s for update', (run_id, owner_id)).fetchone()
         if not run:
             raise PublicError('NOT_FOUND', 'Run not found.', status=404)
@@ -166,10 +174,13 @@ def create_job(owner_id, run_id, kind, payload, selection, *, estimated_vram_mb=
         validate_target(selection, estimated_vram_mb, c)
         c.execute('insert into compute_user_quotas(owner_user_id) values(%s) on conflict do nothing', (owner_id,))
         row = c.execute('''insert into compute_jobs(id,owner_user_id,run_id,kind,mode,requested_gpu_uuid,
-                 payload,estimated_vram_mb,idempotency_key,dataset_version_id,model_endpoint_id,model_api_key_id)
-                 values(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s) returning *''',
+                 payload,estimated_vram_mb,idempotency_key,dataset_version_id,model_endpoint_id,model_api_key_id,
+                 is_model_app,model_app_id,model_app_release_id,app_requester_user_id)
+                 values(%s,%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s) returning *''',
                 (job_id or uuid.uuid4(), owner_id, run_id, kind, selection['mode'], selection['gpuUuid'],
-                 json.dumps(payload), estimated_vram_mb, idempotency_key, dataset_version_id, model_endpoint_id, model_api_key_id)).fetchone()
+                 json.dumps(payload), estimated_vram_mb, idempotency_key, dataset_version_id, model_endpoint_id, model_api_key_id,
+                 bool(app_context), app_context['app_id'] if app_context else None,
+                 app_context['release_id'] if app_context else None, app_context['requester_id'] if app_context else None)).fetchone()
         if kind == 'train':
             c.execute('update training_tasks set compute_job_id=%s,execution=%s::jsonb where id=%s',
                       (row['id'], json.dumps(selection), run_id))
@@ -193,10 +204,13 @@ def public_job(row):
             'expiresAt': row['finished_at'] + timedelta(hours=24) if row.get('finished_at') and row['kind'] in {'predict', 'batch_predict'} else None}
 
 
-def get_job(owner_id, job_id, *, public=True):
+def get_job(owner_id, job_id, *, public=True, requester_id=None):
     with registry._connect() as c:
         row = c.execute('''select j.*,g.name as gpu_name from compute_jobs j left join gpu_devices g
-                       on g.uuid=j.assigned_gpu_uuid where j.id=%s and j.owner_user_id=%s''', (job_id, owner_id)).fetchone()
+                       on g.uuid=j.assigned_gpu_uuid where j.id=%s and j.owner_user_id=%s
+                       and ((%s::text is null and not j.is_model_app) or
+                            (j.is_model_app and j.app_requester_user_id=%s))''',
+                       (job_id, owner_id, requester_id, requester_id)).fetchone()
     if not row:
         raise PublicError('NOT_FOUND', 'Job not found.', status=404)
     return public_job(row) if public else dict(row)
@@ -210,6 +224,8 @@ def assert_run_idle(run_id, c):
         raise PublicError('RUN_IN_USE', 'Cancel the pending evaluation before deleting this run.', status=409)
     if c.execute('select 1 from model_endpoints where run_id=%s and enabled limit 1', (run_id,)).fetchone():
         raise PublicError('MODEL_API_ENABLED', 'Disable this model API before deleting the run.', status=409)
+    if c.execute('select 1 from model_app_releases where run_id=%s limit 1', (run_id,)).fetchone():
+        raise PublicError('MODEL_APP_IN_USE', 'Delete the Model App that references this run before deleting the model.', status=409)
 
 
 @contextmanager
@@ -223,9 +239,11 @@ def run_guard(owner, run_id):
         yield c
 
 
-def cancel_job(owner_id, job_id):
+def cancel_job(owner_id, job_id, *, requester_id=None):
     with registry._connect() as c:
-        row = c.execute('select * from compute_jobs where id=%s and owner_user_id=%s for update', (job_id, owner_id)).fetchone()
+        row = c.execute('''select * from compute_jobs where id=%s and owner_user_id=%s
+            and ((%s::text is null and not is_model_app) or (is_model_app and app_requester_user_id=%s))
+            for update''', (job_id, owner_id, requester_id, requester_id)).fetchone()
         if not row:
             raise PublicError('NOT_FOUND', 'Job not found.', status=404)
         if row['status'] in ('queued', 'dispatching'):
@@ -240,7 +258,7 @@ def cancel_job(owner_id, job_id):
                 c.execute("update training_tasks set status='stopping' where id=%s", (row['run_id'],))
             elif row['kind'] == 'evaluate':
                 c.execute("update evaluations set status='stopping',updated_at=now() where compute_job_id=%s", (job_id,))
-    return get_job(owner_id, job_id)
+    return get_job(owner_id, job_id, requester_id=requester_id)
 
 
 def reserve_one():
@@ -319,8 +337,15 @@ def finish_job(job_id, token, status, *, error_code=None, error_message=None, re
         if status in {'completed', 'failed'}:
             from notification_service import emit
             notice_status = evaluation_status if row['kind'] == 'evaluate' and status == 'completed' else status
-            emit(c, row['owner_user_id'], f"compute:{job_id}:{status}", row['kind'], notice_status,
-                 f"/tasks/{row['run_id']}")
+            if row.get('is_model_app'):
+                if status == 'completed' and row['payload'].get('app_preview') and row['app_requester_user_id'] == row['owner_user_id']:
+                    c.execute('update model_app_releases set tested_at=now() where id=%s', (row['model_app_release_id'],))
+                if row['app_requester_user_id']:
+                    emit(c, row['app_requester_user_id'], f"compute:{job_id}:{status}", row['kind'], notice_status,
+                         f"{row['payload']['app_path']}?job={job_id}")
+            else:
+                emit(c, row['owner_user_id'], f"compute:{job_id}:{status}", row['kind'], notice_status,
+                     f"/tasks/{row['run_id']}")
 
 
 def require_unexpired_result(row):
@@ -330,8 +355,8 @@ def require_unexpired_result(row):
         raise PublicError('RESULT_EXPIRED', 'This result expired. Upload the images again.', status=410)
 
 
-def read_result(owner_id, job_id):
-    row = get_job(owner_id, job_id, public=False)
+def read_result(owner_id, job_id, *, requester_id=None):
+    row = get_job(owner_id, job_id, public=False, requester_id=requester_id)
     require_unexpired_result(row)
     if row['status'] != 'completed' or row['kind'] != 'predict':
         raise PublicError('RESULT_NOT_READY', 'Prediction is not ready.', status=409)

@@ -20,7 +20,7 @@ from storage_service import RequestLease, enabled
 
 _spools = ContextVar('storage_upload_spools', default=None)
 _OVERHEAD = 1024 * 1024
-_UPLOAD_PATHS = re.compile(r'^/api/(?:datasets/inspect-upload|upload-dataset|runs/[^/]+/predict(?:-batch)?|v1/models/[^/]+/predict(?:-batch)?)$')
+_UPLOAD_PATHS = re.compile(r'^/api/(?:datasets/inspect-upload|upload-dataset|runs/[^/]+/predict(?:-batch)?|v1/models/[^/]+/predict(?:-batch)?|apps/[^/]+/[^/]+/predict)$')
 
 
 class QuotaSpool(SpooledTemporaryFile):
@@ -64,7 +64,7 @@ class StorageUploadMiddleware:
         if scope['type'] != 'http' or not enabled() or scope.get('method') != 'POST' or not _UPLOAD_PATHS.fullmatch(scope['path']):
             return await self.app(scope, receive, send)
         request = Request(scope)
-        principal = scope.get('state', {}).get('model_api_principal')
+        principal = scope.get('state', {}).get('model_app_context') or scope.get('state', {}).get('model_api_principal')
         owner_id = principal['owner_user_id'] if principal else request.headers.get('x-user-id')
         lease, context_token, files = None, None, []
         response_started = False

@@ -50,7 +50,7 @@ def latest(request: Request, runSlug: str = Query(max_length=128), kind: Literal
     with compute.registry._connect() as c:
         row = c.execute('''select j.*,g.name as gpu_name from compute_jobs j join training_tasks t on j.run_id=t.id
           left join gpu_devices g on g.uuid=j.assigned_gpu_uuid
-          where j.owner_user_id=%s and t.run_slug=%s and j.kind=%s and j.cleaned_at is null
+          where j.owner_user_id=%s and t.run_slug=%s and j.kind=%s and j.cleaned_at is null and not j.is_model_app
           and (%s::uuid is null or j.id=%s::uuid) order by j.created_at desc limit 1''', (owner(request)['id'], runSlug, kind, jobId, jobId)).fetchone()
     return {'job': compute.public_job(row) if row else None}
 

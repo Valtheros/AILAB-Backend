@@ -498,6 +498,10 @@ class ResourceRepository:
             runs = connection.execute(
                 "select id, run_slug, rq_job_id, status, storage_path from training_tasks where owner_user_id = %s", (user_id,)
             ).fetchall()
+            apps = connection.execute('select count(*) as n from model_apps where owner_user_id=%s', (user_id,)).fetchone()['n']
+            app_jobs = connection.execute('''select id,'Model App prediction' as run_slug,status from compute_jobs
+                where is_model_app and (owner_user_id=%s or app_requester_user_id=%s)
+                and status in ('queued','dispatching','running','stopping','recovery_pending')''', (user_id, user_id)).fetchall()
         paths = {str(row["storage_path"]) for row in [*datasets, *runs] if row.get("storage_path")}
         total_bytes = 0
         for raw_path in paths:
@@ -512,7 +516,8 @@ class ResourceRepository:
             "datasets": len(datasets),
             "deletedDatasets": deleted_datasets,
             "runs": len(runs),
-            "activeJobs": active,
+            "activeJobs": active + [dict(row) for row in app_jobs],
+            "modelApps": apps,
             "totalBytes": total_bytes,
         }
 
@@ -576,6 +581,9 @@ class ResourceRepository:
                 ).fetchone()
                 if conflict:
                     raise ValueError(f"Target user already has dataset '{conflict['slug']}'")
+                if connection.execute('''select 1 from model_apps a join model_apps b on a.slug=b.slug
+                    where a.owner_user_id=%s and b.owner_user_id=%s limit 1''', (source_user_id, target_user_id)).fetchone():
+                    raise ValueError('Target user already has a Model App with the same address. Remove or transfer it separately first.')
                 datasets = connection.execute(
                     "select id, slug, storage_path, status from datasets where owner_user_id = %s for update",
                     (source_user_id,),
@@ -622,6 +630,10 @@ class ResourceRepository:
                 connection.execute('''update model_api_keys set revoked_at=coalesce(revoked_at,now())
                     where endpoint_id in (select id from model_endpoints where owner_user_id=%s)''', (source_user_id,))
                 connection.execute('update model_endpoints set owner_user_id=%s,enabled=false,updated_at=now() where owner_user_id=%s',
+                                   (target_user_id, source_user_id))
+                connection.execute('''update model_app_releases set tested_at=null where app_id in
+                    (select id from model_apps where owner_user_id=%s)''', (source_user_id,))
+                connection.execute('update model_apps set owner_user_id=%s,published=false,updated_at=now() where owner_user_id=%s',
                                    (target_user_id, source_user_id))
                 projects = connection.execute(
                     "update projects set created_by = %s, updated_at = now() where created_by in (%s, (select email from \"user\" where id = %s)) returning id",
@@ -674,6 +686,10 @@ class ResourceRepository:
     def delete_user_resource_records(self, user_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         with self._connect() as connection:
             connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
+            connection.execute('select pg_advisory_xact_lock(%s)', (self._lock_key('app-visitor:' + user_id),))
+            if connection.execute("select 1 from compute_jobs where app_requester_user_id=%s and status in ('queued','dispatching','running','stopping','recovery_pending')", (user_id,)).fetchone():
+                from api_errors import PublicError
+                raise PublicError('RUN_IN_USE', 'Cancel this user\'s active Model App predictions before deleting the account.', status=409)
             if os.getenv('COMPUTE_ENABLED', 'false').lower() == 'true':
                 from api_errors import PublicError
                 if connection.execute("select 1 from compute_jobs where owner_user_id=%s and status in ('queued','dispatching','running','stopping','recovery_pending')", (user_id,)).fetchone():
@@ -688,6 +704,7 @@ class ResourceRepository:
             connection.execute('''update model_api_keys set revoked_at=coalesce(revoked_at,now())
                 where endpoint_id in (select id from model_endpoints where owner_user_id=%s)''', (user_id,))
             connection.execute('update model_endpoints set enabled=false,updated_at=now() where owner_user_id=%s', (user_id,))
+            connection.execute('update model_apps set published=false,updated_at=now() where owner_user_id=%s', (user_id,))
             datasets = [dict(row) for row in connection.execute(
                 "select * from datasets where owner_user_id = %s for update", (user_id,)
             ).fetchall()]
@@ -707,6 +724,7 @@ class ResourceRepository:
         with self._connect() as connection:
             connection.execute("select pg_advisory_xact_lock(%s)", (self._lock_key(f"user-resources:{user_id}"),))
             self.assert_no_storage_account(connection, user_id)
+            connection.execute('delete from model_apps where owner_user_id=%s', (user_id,))
             connection.execute("delete from training_tasks where owner_user_id = %s", (user_id,))
             connection.execute("delete from dataset_import_intents where owner_user_id = %s", (user_id,))
             connection.execute("delete from datasets where owner_user_id = %s", (user_id,))

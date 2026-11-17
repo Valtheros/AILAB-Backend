@@ -127,8 +127,24 @@ class StorageUploadTests(unittest.TestCase):
 
     def test_all_current_multipart_routes_are_covered(self):
         for path in ['/api/upload-dataset', '/api/datasets/inspect-upload', '/api/runs/test/predict',
-                     '/api/runs/test/predict-batch', '/api/v1/models/test/predict', '/api/v1/models/test/predict-batch']:
+                     '/api/runs/test/predict-batch', '/api/v1/models/test/predict', '/api/v1/models/test/predict-batch',
+                     '/api/apps/owner/model/predict']:
             self.assertIsNotNone(_UPLOAD_PATHS.fullmatch(path))
+
+    def test_app_upload_uses_verified_model_owner_not_requester_header(self):
+        async def inner(scope, receive, send):
+            self.assertEqual(scope['state']['storage_upload_lease'].owner, 'model-owner')
+            await JSONResponse({'ok': True})(scope, receive, send)
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            pass
+        scope = {'type': 'http', 'method': 'POST', 'path': '/api/apps/model-owner/test/predict',
+                 'headers': [(b'x-user-id', b'visitor'), (b'content-length', b'0')],
+                 'state': {'model_app_context': {'owner_user_id': 'model-owner'}}}
+        asyncio.run(StorageUploadMiddleware(inner)(scope, receive, send))
+        self.assertEqual(self.leases[0].owner, 'model-owner')
+        self.assertTrue(self.leases[0].closed)
 
     def test_parser_disk_full_keeps_a_readable_http_error(self):
         with QuotaSpool(max_size=1) as file, patch.object(file, 'rollover', side_effect=OSError(errno.EDQUOT, 'full')):
